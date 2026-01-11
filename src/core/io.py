@@ -1,66 +1,167 @@
+"""
+Point Cloud I/O Module
+
+Handles loading and metadata extraction for LiDAR point clouds.
+Supports .las and .laz formats via laspy.
+"""
+
 import laspy
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Union, Optional
+from typing import Dict, Any, Union, List
+from functools import wraps
+
+
+def _ensure_loaded(method):
+    """Decorator to ensure point cloud is loaded before method execution."""
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self.las_data is None:
+            raise RuntimeError(
+                f"Point cloud not loaded. Call load() before {method.__name__}()."
+            )
+        return method(self, *args, **kwargs)
+    return wrapper
+
 
 class PointCloudLoader:
     """
     Handles loading and basic metadata extraction for LiDAR point clouds.
+    
     Supports .las and .laz formats via laspy.
+    LAZ decompression requires lazrs (installed via laspy[lazrs]).
+    
+    Usage:
+        loader = PointCloudLoader("path/to/file.laz")
+        loader.load()
+        metadata = loader.get_metadata()
+        xyz = loader.get_xyz()
     """
     
+    SUPPORTED_EXTENSIONS = {".las", ".laz"}
+    
     def __init__(self, file_path: Union[str, Path]):
-        self.file_path = Path(file_path)
-        self.las_data = None
-        self.header = None
-        self.points = None
-        
-    def load(self) -> None:
         """
-        Loads the LAS/LAZ file into memory.
-        Raises FileNotFoundError if file does not exist.
-        Raises laspy.LaspyException for data errors.
+        Initialize the loader with a file path.
+        
+        Args:
+            file_path: Path to a .las or .laz file.
+        """
+        self.file_path = Path(file_path)
+        self._las_data: laspy.LasData = None
+        self._is_loaded: bool = False
+        
+    @property
+    def las_data(self) -> laspy.LasData:
+        """Access to the underlying laspy LasData object."""
+        return self._las_data
+    
+    @property
+    def header(self) -> laspy.LasHeader:
+        """Access to the LAS header (only after loading)."""
+        return self._las_data.header if self._las_data else None
+    
+    @property
+    def is_loaded(self) -> bool:
+        """Check if the point cloud has been loaded."""
+        return self._is_loaded
+        
+    def load(self) -> "PointCloudLoader":
+        """
+        Load the LAS/LAZ file into memory.
+        
+        Returns:
+            self, for method chaining.
+            
+        Raises:
+            FileNotFoundError: If file does not exist.
+            ValueError: If file extension is not supported.
+            laspy.LaspyException: For data format errors.
         """
         if not self.file_path.exists():
             raise FileNotFoundError(f"File not found: {self.file_path}")
-            
-        # Read the file
-        # lazrs should be installed for fast LAZ support
-        self.las_data = laspy.read(self.file_path)
-        self.header = self.las_data.header
-        self.points = self.las_data.points
         
+        if self.file_path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
+            raise ValueError(
+                f"Unsupported file extension: {self.file_path.suffix}. "
+                f"Supported: {self.SUPPORTED_EXTENSIONS}"
+            )
+            
+        self._las_data = laspy.read(self.file_path)
+        self._is_loaded = True
+        return self  # Enable chaining: loader.load().get_metadata()
+    
+    @_ensure_loaded
     def get_metadata(self) -> Dict[str, Any]:
         """
-        Returns a dictionary containing basic metadata about the loaded point cloud.
-        Ensure load() is called first.
+        Extract basic metadata from the loaded point cloud.
+        
+        Returns:
+            Dictionary with filename, point_count, version, bounds, etc.
         """
-        if self.las_data is None:
-            raise RuntimeError("Point cloud not loaded. Call load() first.")
-            
-        # Calculate bounding box dimensions
-        mins = self.header.mins
-        maxs = self.header.maxs
-        dims = maxs - mins
+        header = self._las_data.header
+        mins = header.mins
+        maxs = header.maxs
         
         return {
             "filename": self.file_path.name,
-            "point_count": self.header.point_count,
-            "version": f"{self.header.major_version}.{self.header.minor_version}",
-            "point_format_id": self.header.point_format.id,
-            "min_coords": mins,
-            "max_coords": maxs,
-            "dimensions": dims,
-            "scales": self.header.scales,
-            "offsets": self.header.offsets
+            "file_size_mb": round(self.file_path.stat().st_size / (1024 * 1024), 2),
+            "point_count": header.point_count,
+            "version": f"{header.major_version}.{header.minor_version}",
+            "point_format_id": header.point_format.id,
+            "min_coords": tuple(mins),
+            "max_coords": tuple(maxs),
+            "dimensions_m": tuple(maxs - mins),
+            "scales": tuple(header.scales),
+            "offsets": tuple(header.offsets),
+            "crs_wkt": header.parse_crs().to_wkt() if header.parse_crs() else None,
         }
 
+    @_ensure_loaded
+    def get_available_dimensions(self) -> List[str]:
+        """
+        List all available point dimensions/attributes in the file.
+        
+        Returns:
+            List of dimension names (e.g., ['X', 'Y', 'Z', 'intensity', 'classification'])
+        """
+        return list(self._las_data.point_format.dimension_names)
+
+    @_ensure_loaded
     def get_xyz(self) -> np.ndarray:
         """
-        Returns the points as a numpy (N, 3) array of float64 coordinates.
-        This applies scales and offsets automatically via laspy.
+        Get point coordinates as a numpy array.
+        
+        Returns:
+            (N, 3) float64 array with scaled X, Y, Z coordinates.
         """
-        if self.las_data is None:
-            raise RuntimeError("Point cloud not loaded. Call load() first.")
+        return np.column_stack((
+            self._las_data.x, 
+            self._las_data.y, 
+            self._las_data.z
+        ))
+    
+    @_ensure_loaded
+    def get_attribute(self, name: str) -> np.ndarray:
+        """
+        Get a specific point attribute by name.
+        
+        Args:
+            name: Attribute name (use get_available_dimensions() to list options).
             
-        return np.column_stack((self.las_data.x, self.las_data.y, self.las_data.z))
+        Returns:
+            1D numpy array with the attribute values.
+            
+        Raises:
+            ValueError: If attribute name is not available.
+        """
+        available = self.get_available_dimensions()
+        if name not in available:
+            raise ValueError(
+                f"Attribute '{name}' not found. Available: {available}"
+            )
+        return np.array(self._las_data[name])
+    
+    def __repr__(self) -> str:
+        status = "loaded" if self._is_loaded else "not loaded"
+        return f"PointCloudLoader('{self.file_path}', {status})"
