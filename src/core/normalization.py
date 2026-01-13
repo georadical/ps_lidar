@@ -11,7 +11,7 @@ inputs correctly, ensuring consistent metric extraction regardless of input type
 import numpy as np
 from dataclasses import dataclass
 from enum import Enum
-from typing import Tuple, Optional
+from typing import Optional
 
 
 class NormalizationStatus(Enum):
@@ -71,6 +71,11 @@ class NormalizationAnalysis:
             "percentile_5": round(self.percentile_5, 3),
             "reasoning": self.reasoning,
         }
+    
+    @property
+    def is_normalized(self) -> bool:
+        """Convenience property to check if cloud is normalized."""
+        return self.status == NormalizationStatus.NORMALIZED
 
 
 class NormalizationAnalyzer:
@@ -87,19 +92,22 @@ class NormalizationAnalyzer:
     Usage:
         analyzer = NormalizationAnalyzer(xyz_array)
         result = analyzer.analyze()
-        if result.status == NormalizationStatus.NORMALIZED:
+        if result.is_normalized:
             print("Cloud is already normalized")
     """
     
-    # Thresholds for classification (in meters)
-    GROUND_TOLERANCE = 2.0          # Max deviation from 0 for ground detection
-    TYPICAL_TREE_HEIGHT_MAX = 60.0  # Maximum expected tree height
-    PERCENTILE_THRESHOLD = 1.5      # 5th percentile threshold for ground
+    # Default thresholds for classification (in meters)
+    DEFAULT_GROUND_TOLERANCE = 2.0          # Max deviation from 0 for ground detection
+    DEFAULT_TREE_HEIGHT_MAX = 60.0          # Maximum expected tree height
+    DEFAULT_PERCENTILE_THRESHOLD = 1.5      # 5th percentile threshold for ground
     
     def __init__(
         self, 
         xyz: np.ndarray,
-        sample_size: Optional[int] = 100000
+        sample_size: Optional[int] = 100000,
+        ground_tolerance: Optional[float] = None,
+        tree_height_max: Optional[float] = None,
+        percentile_threshold: Optional[float] = None,
     ):
         """
         Initialize analyzer with point cloud data.
@@ -108,17 +116,29 @@ class NormalizationAnalyzer:
             xyz: (N, 3) array of X, Y, Z coordinates
             sample_size: If set, randomly sample this many points for faster
                          analysis on large clouds. None = use all points.
+            ground_tolerance: Max Z deviation from 0 to consider as ground (m).
+            tree_height_max: Maximum expected tree/vegetation height (m).
+            percentile_threshold: Threshold for 5th percentile ground check (m).
         """
         if xyz.ndim != 2 or xyz.shape[1] < 3:
             raise ValueError(f"Expected (N, 3) array, got shape {xyz.shape}")
         
+        # Store configurable thresholds
+        self.ground_tolerance = ground_tolerance or self.DEFAULT_GROUND_TOLERANCE
+        self.tree_height_max = tree_height_max or self.DEFAULT_TREE_HEIGHT_MAX
+        self.percentile_threshold = percentile_threshold or self.DEFAULT_PERCENTILE_THRESHOLD
+        
         # Extract Z values, optionally sampling for large clouds
         z_values = xyz[:, 2]
+        self._original_size = len(z_values)
         
         if sample_size is not None and len(z_values) > sample_size:
             rng = np.random.default_rng(seed=42)  # Reproducible
             indices = rng.choice(len(z_values), size=sample_size, replace=False)
             z_values = z_values[indices]
+            self._sampled = True
+        else:
+            self._sampled = False
         
         self.z_values = z_values
         self._stats_computed = False
@@ -127,7 +147,11 @@ class NormalizationAnalyzer:
         self._z_mean = None
         self._z_std = None
         self._percentile_5 = None
-        self._percentile_95 = None
+    
+    def __repr__(self) -> str:
+        status = "analyzed" if self._stats_computed else "pending"
+        sampled = f", sampled={len(self.z_values)}" if self._sampled else ""
+        return f"NormalizationAnalyzer(points={self._original_size}{sampled}, {status})"
     
     def _compute_stats(self) -> None:
         """Compute Z-statistics lazily."""
@@ -139,7 +163,6 @@ class NormalizationAnalyzer:
         self._z_mean = float(np.mean(self.z_values))
         self._z_std = float(np.std(self.z_values))
         self._percentile_5 = float(np.percentile(self.z_values, 5))
-        self._percentile_95 = float(np.percentile(self.z_values, 95))
         self._stats_computed = True
     
     def analyze(self) -> NormalizationAnalysis:
@@ -156,7 +179,7 @@ class NormalizationAnalyzer:
         confidence_factors = []
         
         # Heuristic 1: Check if Z_min is near zero
-        z_min_near_zero = abs(self._z_min) < self.GROUND_TOLERANCE
+        z_min_near_zero = abs(self._z_min) < self.ground_tolerance
         if z_min_near_zero:
             reasons.append(f"Z_min ({self._z_min:.2f}m) is close to 0")
             confidence_factors.append(0.3)
@@ -165,7 +188,7 @@ class NormalizationAnalyzer:
             confidence_factors.append(-0.3)
         
         # Heuristic 2: Check 5th percentile (more robust than min)
-        percentile_near_zero = abs(self._percentile_5) < self.PERCENTILE_THRESHOLD
+        percentile_near_zero = abs(self._percentile_5) < self.percentile_threshold
         if percentile_near_zero:
             reasons.append(f"5th percentile ({self._percentile_5:.2f}m) near ground level")
             confidence_factors.append(0.25)
@@ -174,7 +197,7 @@ class NormalizationAnalyzer:
             confidence_factors.append(-0.25)
         
         # Heuristic 3: Z range consistent with tree heights
-        range_reasonable = z_range < self.TYPICAL_TREE_HEIGHT_MAX
+        range_reasonable = z_range < self.tree_height_max
         if range_reasonable:
             reasons.append(f"Z range ({z_range:.2f}m) consistent with tree heights")
             confidence_factors.append(0.2)
@@ -183,7 +206,7 @@ class NormalizationAnalyzer:
             confidence_factors.append(-0.1)  # Less penalty - could be tall trees
         
         # Heuristic 4: Check for significant negative values
-        negative_fraction = np.mean(self.z_values < -0.5)
+        negative_fraction = float(np.mean(self.z_values < -0.5))
         if negative_fraction < 0.01:
             reasons.append("Minimal negative Z values")
             confidence_factors.append(0.15)
@@ -195,7 +218,7 @@ class NormalizationAnalyzer:
             confidence_factors.append(-0.15)
         
         # Heuristic 5: Check if Z values look like absolute elevation
-        # Absolute elevations are typically > 100m for most land surfaces
+        # Note: This heuristic may give false negatives in coastal/low-lying areas
         likely_absolute = self._z_min > 50 or self._z_max > 500
         if likely_absolute:
             reasons.append(f"Z values ({self._z_min:.0f}-{self._z_max:.0f}m) suggest absolute elevation")
@@ -205,7 +228,6 @@ class NormalizationAnalyzer:
         raw_confidence = sum(confidence_factors)
         
         # Map to 0-1 range with sigmoid-like transformation
-        # Raw confidence ranges roughly from -1.0 to +0.9
         normalized_confidence = 1 / (1 + np.exp(-3 * raw_confidence))
         
         # Determine ground plane detection
@@ -221,7 +243,7 @@ class NormalizationAnalyzer:
         
         return NormalizationAnalysis(
             status=status,
-            confidence=normalized_confidence,
+            confidence=float(normalized_confidence),
             z_min=self._z_min,
             z_max=self._z_max,
             z_range=z_range,
@@ -233,14 +255,20 @@ class NormalizationAnalyzer:
         )
 
 
-def detect_normalization(xyz: np.ndarray) -> NormalizationAnalysis:
+def detect_normalization(
+    xyz: np.ndarray,
+    sample_size: Optional[int] = 100000,
+    **kwargs
+) -> NormalizationAnalysis:
     """
     Convenience function to detect normalization status.
     
     Args:
         xyz: (N, 3) array of point coordinates
+        sample_size: Number of points to sample for analysis (None = all)
+        **kwargs: Additional threshold parameters for NormalizationAnalyzer
         
     Returns:
         NormalizationAnalysis result
     """
-    return NormalizationAnalyzer(xyz).analyze()
+    return NormalizationAnalyzer(xyz, sample_size=sample_size, **kwargs).analyze()
