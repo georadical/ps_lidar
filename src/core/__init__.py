@@ -6,7 +6,12 @@ from .normalization import (
     NormalizationStatus,
     detect_normalization,
 )
-from .ground import classify_ground, get_ground_mask
+from .ground import (
+    GroundFilterResult,
+    classify_ground,
+    get_ground_mask,
+    get_ground_points,
+)
 
 __all__ = [
     "PointCloudLoader",
@@ -14,6 +19,8 @@ __all__ = [
     "NormalizationAnalysis",
     "NormalizationStatus",
     "detect_normalization",
+    "GroundFilterResult",
     "classify_ground",
     "get_ground_mask",
+    "get_ground_points",
 ]
