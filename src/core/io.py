@@ -7,8 +7,9 @@ Supports .las and .laz formats via laspy.
 
 import laspy
 import numpy as np
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Any, Union, List
+from typing import Dict, Any, Union, List, Optional
 from functools import wraps
 
 
@@ -24,6 +25,116 @@ def _ensure_loaded(method):
     return wrapper
 
 
+@dataclass
+class PointCloudSummary:
+    """
+    Comprehensive summary of a loaded point cloud.
+    Inspired by CloudCompare/QGIS property panels.
+    """
+    # File Info
+    filename: str
+    file_path: str
+    file_size_mb: float
+    format_version: str
+    point_format_id: int
+    
+    # Point Info
+    point_count: int
+    
+    # Bounding Box
+    x_min: float
+    x_max: float
+    y_min: float
+    y_max: float
+    z_min: float
+    z_max: float
+    extent_x: float
+    extent_y: float
+    extent_z: float
+    
+    # Normalization
+    is_normalized: bool
+    normalization_confidence: float
+    
+    # Attributes
+    available_dimensions: List[str]
+    has_intensity: bool
+    has_rgb: bool
+    has_classification: bool
+    
+    # CRS
+    crs_name: Optional[str]
+    
+    def print_summary(self) -> None:
+        """Print a formatted summary to console."""
+        norm_icon = "✓" if self.is_normalized else "✗"
+        
+        print(f"{'═'*50}")
+        print(f"  POINT CLOUD SUMMARY")
+        print(f"{'═'*50}")
+        print(f"")
+        print(f"  📁 FILE INFO")
+        print(f"     Name:    {self.filename}")
+        print(f"     Size:    {self.file_size_mb:.2f} MB")
+        print(f"     Format:  LAS {self.format_version} (Point Format {self.point_format_id})")
+        print(f"")
+        print(f"  📊 POINT DATA")
+        print(f"     Count:   {self.point_count:,}")
+        print(f"")
+        print(f"  📐 BOUNDING BOX")
+        print(f"     X:       {self.x_min:.2f} → {self.x_max:.2f}  (Δ {self.extent_x:.2f}m)")
+        print(f"     Y:       {self.y_min:.2f} → {self.y_max:.2f}  (Δ {self.extent_y:.2f}m)")
+        print(f"     Z:       {self.z_min:.2f} → {self.z_max:.2f}  (Δ {self.extent_z:.2f}m)")
+        print(f"")
+        print(f"  🎯 NORMALIZATION")
+        print(f"     Status:  [{norm_icon}] {'Normalized' if self.is_normalized else 'Not Normalized'}")
+        print(f"     Confidence: {self.normalization_confidence:.0%}")
+        print(f"")
+        print(f"  📋 ATTRIBUTES")
+        print(f"     Intensity:      {'✓' if self.has_intensity else '✗'}")
+        print(f"     RGB Color:      {'✓' if self.has_rgb else '✗'}")
+        print(f"     Classification: {'✓' if self.has_classification else '✗'}")
+        print(f"     All: {', '.join(self.available_dimensions[:8])}{'...' if len(self.available_dimensions) > 8 else ''}")
+        print(f"")
+        if self.crs_name:
+            print(f"  🌍 COORDINATE SYSTEM")
+            print(f"     {self.crs_name}")
+            print(f"")
+        print(f"{'═'*50}")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        return {
+            "file": {
+                "name": self.filename,
+                "path": self.file_path,
+                "size_mb": self.file_size_mb,
+                "format_version": self.format_version,
+                "point_format_id": self.point_format_id,
+            },
+            "points": {
+                "count": self.point_count,
+            },
+            "bounds": {
+                "x": [self.x_min, self.x_max],
+                "y": [self.y_min, self.y_max],
+                "z": [self.z_min, self.z_max],
+                "extent": [self.extent_x, self.extent_y, self.extent_z],
+            },
+            "normalization": {
+                "is_normalized": self.is_normalized,
+                "confidence": self.normalization_confidence,
+            },
+            "attributes": {
+                "available": self.available_dimensions,
+                "has_intensity": self.has_intensity,
+                "has_rgb": self.has_rgb,
+                "has_classification": self.has_classification,
+            },
+            "crs": self.crs_name,
+        }
+
+
 class PointCloudLoader:
     """
     Handles loading and basic metadata extraction for LiDAR point clouds.
@@ -34,8 +145,8 @@ class PointCloudLoader:
     Usage:
         loader = PointCloudLoader("path/to/file.laz")
         loader.load()
-        metadata = loader.get_metadata()
-        xyz = loader.get_xyz()
+        summary = loader.get_summary()  # New! Full summary
+        summary.print_summary()         # Pretty print
     """
     
     SUPPORTED_EXTENSIONS = {".las", ".laz"}
@@ -50,6 +161,7 @@ class PointCloudLoader:
         self.file_path = Path(file_path)
         self._las_data: laspy.LasData = None
         self._is_loaded: bool = False
+        self._cached_summary: Optional[PointCloudSummary] = None
         
     @property
     def las_data(self) -> laspy.LasData:
@@ -89,7 +201,8 @@ class PointCloudLoader:
             
         self._las_data = laspy.read(self.file_path)
         self._is_loaded = True
-        return self  # Enable chaining: loader.load().get_metadata()
+        self._cached_summary = None  # Invalidate cache
+        return self
     
     @_ensure_loaded
     def get_metadata(self) -> Dict[str, Any]:
@@ -161,6 +274,75 @@ class PointCloudLoader:
                 f"Attribute '{name}' not found. Available: {available}"
             )
         return np.array(self._las_data[name])
+    
+    @_ensure_loaded
+    def get_summary(self, force_refresh: bool = False) -> PointCloudSummary:
+        """
+        Get a comprehensive summary of the point cloud.
+        
+        Includes file info, point count, bounding box, normalization status,
+        and available attributes. Inspired by CloudCompare/QGIS panels.
+        
+        Args:
+            force_refresh: If True, recalculate normalization (otherwise cached).
+            
+        Returns:
+            PointCloudSummary dataclass with all properties.
+        """
+        if self._cached_summary is not None and not force_refresh:
+            return self._cached_summary
+        
+        # Import here to avoid circular imports
+        from .normalization import detect_normalization
+        
+        header = self._las_data.header
+        mins = header.mins
+        maxs = header.maxs
+        dims = self.get_available_dimensions()
+        
+        # Detect normalization
+        xyz = self.get_xyz()
+        norm_result = detect_normalization(xyz)
+        
+        # Check for common attributes
+        dims_lower = [d.lower() for d in dims]
+        has_rgb = all(c in dims_lower for c in ['red', 'green', 'blue'])
+        
+        # Parse CRS name
+        crs = header.parse_crs()
+        crs_name = None
+        if crs:
+            try:
+                crs_name = crs.name or crs.to_wkt()[:50]
+            except:
+                crs_name = "Unknown CRS"
+        
+        self._cached_summary = PointCloudSummary(
+            filename=self.file_path.name,
+            file_path=str(self.file_path.absolute()),
+            file_size_mb=round(self.file_path.stat().st_size / (1024 * 1024), 2),
+            format_version=f"{header.major_version}.{header.minor_version}",
+            point_format_id=header.point_format.id,
+            point_count=header.point_count,
+            x_min=float(mins[0]),
+            x_max=float(maxs[0]),
+            y_min=float(mins[1]),
+            y_max=float(maxs[1]),
+            z_min=float(mins[2]),
+            z_max=float(maxs[2]),
+            extent_x=float(maxs[0] - mins[0]),
+            extent_y=float(maxs[1] - mins[1]),
+            extent_z=float(maxs[2] - mins[2]),
+            is_normalized=norm_result.is_normalized,
+            normalization_confidence=norm_result.confidence,
+            available_dimensions=dims,
+            has_intensity='intensity' in dims_lower,
+            has_rgb=has_rgb,
+            has_classification='classification' in dims_lower,
+            crs_name=crs_name,
+        )
+        
+        return self._cached_summary
     
     def __repr__(self) -> str:
         status = "loaded" if self._is_loaded else "not loaded"

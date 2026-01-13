@@ -1,5 +1,5 @@
 # Core module - Data I/O and processing primitives
-from .io import PointCloudLoader
+from .io import PointCloudLoader, PointCloudSummary
 from .normalization import (
     NormalizationAnalyzer,
     NormalizationAnalysis,
@@ -15,6 +15,7 @@ from .ground import (
 
 __all__ = [
     "PointCloudLoader",
+    "PointCloudSummary",
     "NormalizationAnalyzer",
     "NormalizationAnalysis",
     "NormalizationStatus",
