@@ -1,5 +1,5 @@
 # Core module - Data I/O and processing primitives
-from .io import PointCloudLoader, PointCloudSummary
+from .io import PointCloudLoader, PointCloudSummary, export_point_cloud
 from .normalization import (
     NormalizationAnalyzer,
     NormalizationAnalysis,
@@ -22,6 +22,11 @@ from .sampling import (
     find_plot_center,
     validate_gps_center,
 )
+from .height import (
+    HeightNormalizationResult,
+    normalize_heights,
+    get_normalized_vegetation,
+)
 
 __all__ = [
     "PointCloudLoader",
@@ -42,5 +47,9 @@ __all__ = [
     "detect_reflective_mats",
     "find_plot_center",
     "validate_gps_center",
+    "HeightNormalizationResult",
+    "normalize_heights",
+    "get_normalized_vegetation",
+    "export_point_cloud",
 ]
 

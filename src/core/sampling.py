@@ -140,24 +140,26 @@ def detect_reflective_mats(
     mat_size: float = 0.6,
     intensity_percentile: float = 99.5,
     cluster_radius: float = 0.2,
-    min_points: int = 10
+    min_points: int = 10,
+    verbose: bool = False,
 ) -> List[ReflectiveMat]:
     """
     Detect reflective mats (checkerboard or circular patterns).
     
-    For checkerboard mats: groups 2 diagonal clusters within mat_size.
-    For circular mats: each cluster is its own mat.
+    For checkerboard mats: groups 2 clusters within mat_size distance.
+    For circular mats: each isolated cluster is its own mat.
     
     Args:
         xyz: (N, 3) numpy array with coordinates.
         intensity: (N,) numpy array with intensity values.
-        mat_size: Maximum distance between clusters of the same mat (default: 0.6m).
+        mat_size: Maximum distance between clusters of same mat (default: 0.6m).
         intensity_percentile: Percentile threshold for high intensity.
         cluster_radius: Radius to group nearby points into a single cluster.
         min_points: Minimum points required per cluster.
+        verbose: If True, print diagnostic information.
         
     Returns:
-        List of ReflectiveMat objects, sorted by distance to cloud centroid.
+        List of ReflectiveMat objects, sorted by distance to mat barycenter.
     """
     # Step 1: Detect individual clusters
     clusters = _detect_intensity_clusters(
@@ -165,29 +167,54 @@ def detect_reflective_mats(
     )
     
     if not clusters:
+        if verbose:
+            print("⚠ No se detectaron clusters de alta intensidad")
         return []
     
-    # Step 2: Group clusters into mats based on proximity
-    used = [False] * len(clusters)
+    if verbose:
+        print(f"Clusters detectados: {len(clusters)}")
+        for i, c in enumerate(clusters):
+            print(f"  [{i}] pos=({c.x:.2f}, {c.y:.2f}), pts={c.n_points}, int={c.mean_intensity:.0f}")
+    
+    # Step 2: Group clusters into mats (maximum 2 per mat for checkerboard)
+    n = len(clusters)
+    used = [False] * n
     mats = []
     
-    for i, c1 in enumerate(clusters):
+    # Build distance matrix between all clusters
+    for i in range(n):
         if used[i]:
             continue
         
-        # Find all clusters within mat_size distance
+        c1 = clusters[i]
         group = [c1]
         used[i] = True
         
-        for j, c2 in enumerate(clusters):
+        # Find exactly ONE other cluster within mat_size (for checkerboard)
+        # This prevents grouping more than 2 clusters per mat
+        best_j = None
+        best_dist = mat_size + 1
+        
+        for j in range(i + 1, n):
             if used[j]:
                 continue
+            c2 = clusters[j]
             dist = np.sqrt((c1.x - c2.x)**2 + (c1.y - c2.y)**2)
-            if dist <= mat_size:
-                group.append(c2)
-                used[j] = True
+            
+            if dist <= mat_size and dist < best_dist:
+                best_j = j
+                best_dist = dist
         
-        # Calculate mat center (midpoint of all cluster centroids)
+        if best_j is not None:
+            group.append(clusters[best_j])
+            used[best_j] = True
+            if verbose:
+                print(f"  Mat: clusters [{i}] + [{best_j}] (dist={best_dist:.3f}m)")
+        else:
+            if verbose:
+                print(f"  Mat: cluster [{i}] solo (circular)")
+        
+        # Calculate mat center
         cx = np.mean([c.x for c in group])
         cy = np.mean([c.y for c in group])
         cz = np.mean([c.z for c in group])
@@ -202,9 +229,19 @@ def detect_reflective_mats(
             total_points=total_pts
         ))
     
-    # Step 3: Sort mats by distance to cloud centroid
-    cloud_cx, cloud_cy = get_centroid(xyz)
-    mats.sort(key=lambda m: (m.center_x - cloud_cx)**2 + (m.center_y - cloud_cy)**2)
+    if verbose:
+        print(f"Mats formados: {len(mats)}")
+        for i, m in enumerate(mats):
+            print(f"  Mat {i+1}: centro=({m.center_x:.2f}, {m.center_y:.2f}), clusters={m.n_clusters}")
+    
+    # Step 3: Sort mats by distance to barycenter of ALL detected mats
+    # The central mat will be closest to this barycenter
+    if len(mats) > 1:
+        barycenter_x = np.mean([m.center_x for m in mats])
+        barycenter_y = np.mean([m.center_y for m in mats])
+        if verbose:
+            print(f"Baricentro de mats: ({barycenter_x:.2f}, {barycenter_y:.2f})")
+        mats.sort(key=lambda m: (m.center_x - barycenter_x)**2 + (m.center_y - barycenter_y)**2)
     
     return mats
 
@@ -213,19 +250,21 @@ def find_plot_center(
     xyz: np.ndarray,
     intensity: Optional[np.ndarray] = None,
     mat_size: float = 0.6,
+    verbose: bool = False,
     **kwargs
 ) -> Tuple[float, float, str]:
     """
     Automatically find the plot center using the best available method.
     
     Priority:
-    1. Center of reflective mat nearest to geometric centroid (if intensity provided)
+    1. Center of reflective mat nearest to barycenter of all mats (if intensity provided)
     2. Geometric centroid of the point cloud (fallback)
     
     Args:
         xyz: (N, 3) numpy array with coordinates.
         intensity: Optional (N,) numpy array with intensity values.
         mat_size: Size of reflective mats in meters (default: 0.6).
+        verbose: If True, print diagnostic information.
         **kwargs: Additional arguments for mat detection.
         
     Returns:
@@ -233,13 +272,20 @@ def find_plot_center(
     """
     centroid_x, centroid_y = get_centroid(xyz)
     
+    if verbose:
+        print(f"Centroide de la nube: ({centroid_x:.2f}, {centroid_y:.2f})")
+    
     if intensity is not None:
-        mats = detect_reflective_mats(xyz, intensity, mat_size=mat_size, **kwargs)
+        mats = detect_reflective_mats(
+            xyz, intensity, mat_size=mat_size, verbose=verbose, **kwargs
+        )
         
         if mats:
-            # First mat is closest to centroid (already sorted)
+            # First mat is closest to barycenter (already sorted)
             best_mat = mats[0]
             method = f"reflective_mat ({best_mat.n_clusters} clusters)"
+            if verbose:
+                print(f"Centro seleccionado: ({best_mat.center_x:.2f}, {best_mat.center_y:.2f})")
             return best_mat.center_x, best_mat.center_y, method
         else:
             warnings.warn(

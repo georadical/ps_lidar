@@ -347,3 +347,72 @@ class PointCloudLoader:
     def __repr__(self) -> str:
         status = "loaded" if self._is_loaded else "not loaded"
         return f"PointCloudLoader('{self.file_path}', {status})"
+
+
+def export_point_cloud(
+    output_path: Union[str, Path],
+    xyz: np.ndarray,
+    intensity: Optional[np.ndarray] = None,
+    classification: Optional[np.ndarray] = None,
+    return_number: Optional[np.ndarray] = None,
+    number_of_returns: Optional[np.ndarray] = None,
+    point_format: int = 0,
+    compress: bool = True,
+) -> Path:
+    """
+    Export a point cloud to LAS/LAZ format.
+    
+    Args:
+        output_path: Path for the output file (.las or .laz).
+        xyz: (N, 3) array of point coordinates.
+        intensity: Optional (N,) array of intensity values.
+        classification: Optional (N,) array of point classifications.
+        return_number: Optional (N,) array of return numbers.
+        number_of_returns: Optional (N,) array of total returns per pulse.
+        point_format: LAS point format ID (0-10). Default 0 for basic XYZ.
+        compress: If True and path ends in .laz, compress output. Default True.
+        
+    Returns:
+        Path to the created file.
+        
+    Example:
+        >>> export_point_cloud("vegetation_norm.laz", veg_normalized)
+        >>> export_point_cloud("with_intensity.laz", xyz, intensity=intensity_array)
+    """
+    output_path = Path(output_path)
+    
+    if xyz.ndim != 2 or xyz.shape[1] < 3:
+        raise ValueError(f"xyz must be (N, 3), got {xyz.shape}")
+    
+    # Create header
+    header = laspy.LasHeader(point_format=point_format, version="1.4")
+    
+    # Set scale and offset for precision
+    # Use offset [0,0,0] to preserve original coordinates
+    header.scales = [0.001, 0.001, 0.001]  # 1mm precision
+    header.offsets = [0.0, 0.0, 0.0]
+    
+    # Create LAS data
+    las = laspy.LasData(header)
+    las.x = xyz[:, 0]
+    las.y = xyz[:, 1]
+    las.z = xyz[:, 2]
+    
+    # Add optional fields
+    if intensity is not None:
+        las.intensity = intensity.astype(np.uint16)
+    
+    if classification is not None:
+        las.classification = classification.astype(np.uint8)
+    
+    if return_number is not None:
+        las.return_number = return_number.astype(np.uint8)
+    
+    if number_of_returns is not None:
+        las.number_of_returns = number_of_returns.astype(np.uint8)
+    
+    # Write file
+    las.write(output_path)
+    
+    return output_path
+
