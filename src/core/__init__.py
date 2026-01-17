@@ -27,6 +27,17 @@ from .height import (
     normalize_heights,
     get_normalized_vegetation,
 )
+from .segmentation import (
+    TreeInfo,
+    TreeSegmentationResult,
+    segment_trees,
+    voxelize_cloud,
+    compute_verticality,
+    extract_stem_stripe,
+    detect_stem_clusters,
+    compute_tree_axes,
+    assign_tree_ids,
+)
 
 __all__ = [
     "PointCloudLoader",
@@ -51,5 +62,13 @@ __all__ = [
     "normalize_heights",
     "get_normalized_vegetation",
     "export_point_cloud",
+    "TreeInfo",
+    "TreeSegmentationResult",
+    "segment_trees",
+    "voxelize_cloud",
+    "compute_verticality",
+    "extract_stem_stripe",
+    "detect_stem_clusters",
+    "compute_tree_axes",
+    "assign_tree_ids",
 ]
-
