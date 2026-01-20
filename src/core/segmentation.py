@@ -469,3 +469,66 @@ def segment_trees(
         unassigned_count=unassigned_count,
         tree_info=tree_info
     )
+
+
+def export_tree_locations(
+    seg_result: TreeSegmentationResult,
+    output_path: str,
+    dbh_values: np.ndarray = None,
+) -> np.ndarray:
+    """
+    Export tree locations as ASCII file for CloudCompare visualization.
+    
+    Inspired by 3DFin's tree_locator, this exports the base location of each tree.
+    CloudCompare can open this directly: File > Open, select as "ASCII cloud".
+    
+    Output format (space-separated):
+        X Y Z tree_id height n_points [dbh]
+    
+    Args:
+        seg_result: TreeSegmentationResult from segment_trees().
+        output_path: Path to output file (.txt or .asc).
+        dbh_values: Optional array of DBH values per tree (in meters).
+    
+    Returns:
+        tree_locations: (n_trees, 5+) array with location data.
+    """
+    from pathlib import Path
+    
+    if not seg_result.tree_info:
+        raise ValueError("No trees in segmentation result")
+    
+    n_trees = len(seg_result.tree_info)
+    has_dbh = dbh_values is not None and len(dbh_values) == n_trees
+    
+    # Build data array
+    n_cols = 7 if has_dbh else 6
+    tree_locations = np.zeros((n_trees, n_cols), dtype=np.float64)
+    
+    for i, info in enumerate(seg_result.tree_info):
+        tree_locations[i, 0] = info.centroid[0]  # X
+        tree_locations[i, 1] = info.centroid[1]  # Y
+        tree_locations[i, 2] = info.height_min   # Z base
+        tree_locations[i, 3] = info.tree_id      # tree_id
+        tree_locations[i, 4] = info.height_max   # height
+        tree_locations[i, 5] = info.n_points     # n_points
+        if has_dbh:
+            tree_locations[i, 6] = dbh_values[i]
+    
+    # Write ASCII file
+    output_path = Path(output_path)
+    
+    # Header for CloudCompare (optional comment line)
+    header = "//X Y Z tree_id height n_points"
+    if has_dbh:
+        header += " dbh"
+    
+    with open(output_path, 'w') as f:
+        f.write(header + "\n")
+        for row in tree_locations:
+            if has_dbh:
+                f.write(f"{row[0]:.6f} {row[1]:.6f} {row[2]:.6f} {int(row[3])} {row[4]:.2f} {int(row[5])} {row[6]:.3f}\n")
+            else:
+                f.write(f"{row[0]:.6f} {row[1]:.6f} {row[2]:.6f} {int(row[3])} {row[4]:.2f} {int(row[5])}\n")
+    
+    return tree_locations

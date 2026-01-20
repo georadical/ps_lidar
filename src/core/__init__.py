@@ -37,6 +37,7 @@ from .segmentation import (
     detect_stem_clusters,
     compute_tree_axes,
     assign_tree_ids,
+    export_tree_locations,
 )
 
 __all__ = [
@@ -71,4 +72,5 @@ __all__ = [
     "detect_stem_clusters",
     "compute_tree_axes",
     "assign_tree_ids",
+    "export_tree_locations",
 ]
