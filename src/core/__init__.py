@@ -39,6 +39,13 @@ from .segmentation import (
     assign_tree_ids,
     export_tree_locations,
 )
+from .filtering import (
+    NoiseFilterResult,
+    filter_noise_sor,
+    filter_noise_radius,
+    UnderstorySeparationResult,
+    separate_understory,
+)
 
 __all__ = [
     "PointCloudLoader",
@@ -73,4 +80,9 @@ __all__ = [
     "compute_tree_axes",
     "assign_tree_ids",
     "export_tree_locations",
+    "NoiseFilterResult",
+    "filter_noise_sor",
+    "filter_noise_radius",
+    "UnderstorySeparationResult",
+    "separate_understory",
 ]
