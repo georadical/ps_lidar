@@ -45,6 +45,15 @@ from .filtering import (
     filter_noise_radius,
     UnderstorySeparationResult,
     separate_understory,
+    UnderstoryClassificationResult,
+    classify_understory,
+    validate_tree_connectivity,
+)
+from .features import (
+    GeometricFeatures,
+    compute_geometric_features,
+    compute_relative_features,
+    compute_all_features,
 )
 
 __all__ = [
@@ -85,4 +94,11 @@ __all__ = [
     "filter_noise_radius",
     "UnderstorySeparationResult",
     "separate_understory",
+    "UnderstoryClassificationResult",
+    "classify_understory",
+    "validate_tree_connectivity",
+    "GeometricFeatures",
+    "compute_geometric_features",
+    "compute_relative_features",
+    "compute_all_features",
 ]

@@ -289,3 +289,274 @@ def separate_understory(
     )
     
     return result, valid_tree_ids
+
+
+@dataclass
+class UnderstoryClassificationResult:
+    """Result of understory classification using geometric features."""
+    is_tree: np.ndarray           # (N,) boolean mask (True = tree)
+    is_understory: np.ndarray     # (N,) boolean mask (True = understory)
+    is_stem: np.ndarray           # (N,) boolean mask (True = likely stem)
+    n_tree: int                   # Points classified as trees
+    n_understory: int             # Points classified as understory
+
+
+def classify_understory(
+    xyz: np.ndarray,
+    verticality: np.ndarray,
+    linearity: np.ndarray,
+    sphericity: np.ndarray,
+    dist_to_ground: np.ndarray,
+    dist_to_top: np.ndarray,
+    verticality_threshold: float = 0.7,
+    linearity_threshold: float = 0.4,
+    sphericity_threshold: float = 0.5,
+    max_understory_height: float = 3.0,
+    verbose: bool = False
+) -> UnderstoryClassificationResult:
+    """
+    Classify points as tree or understory using geometric features.
+    
+    This function uses PCA-based geometric features rather than height alone
+    to distinguish tree structures from understory vegetation.
+    
+    Classification logic:
+    - STEM: High verticality AND high linearity (vertical linear structures)
+    - CANOPY: Connected to stems (handled separately in connectivity validation)
+    - UNDERSTORY: High sphericity + low position + disconnected from stems
+    
+    Parameters
+    ----------
+    xyz : np.ndarray
+        Point cloud coordinates (n, 3).
+    verticality : np.ndarray
+        Verticality feature (0-1) from PCA.
+    linearity : np.ndarray
+        Linearity feature (0-1) from PCA.
+    sphericity : np.ndarray
+        Sphericity feature (0-1) from PCA.
+    dist_to_ground : np.ndarray
+        Distance from point to ground in vertical cylinder.
+    dist_to_top : np.ndarray
+        Distance from point to top in vertical cylinder.
+    verticality_threshold : float
+        Threshold for stem detection (default: 0.7).
+    linearity_threshold : float
+        Threshold for stem detection (default: 0.4).
+    sphericity_threshold : float
+        Threshold for understory detection (default: 0.5).
+    max_understory_height : float
+        Maximum height for understory classification (meters).
+    verbose : bool
+        Print progress information.
+    
+    Returns
+    -------
+    UnderstoryClassificationResult
+        Classification result with masks for tree, understory, and stem points.
+    
+    Notes
+    -----
+    This is the first pass of classification. Points classified as "tree" here
+    should be further validated using connectivity analysis (Phase 3) to ensure
+    they form continuous vertical structures.
+    """
+    n_points = len(xyz)
+    z = xyz[:, 2]
+    
+    if verbose:
+        print(f"Classifying understory: {n_points:,} points")
+        print(f"  Thresholds: verticality>{verticality_threshold}, "
+              f"linearity>{linearity_threshold}, sphericity>{sphericity_threshold}")
+    
+    # Initialize masks
+    is_stem = np.zeros(n_points, dtype=bool)
+    is_understory = np.zeros(n_points, dtype=bool)
+    is_tree = np.zeros(n_points, dtype=bool)
+    
+    # ========================================================================
+    # Step 1: Identify likely STEM points
+    # Stems have high verticality AND high linearity
+    # ========================================================================
+    is_stem = (verticality >= verticality_threshold) & (linearity >= linearity_threshold)
+    
+    if verbose:
+        print(f"  Potential stems: {np.sum(is_stem):,} points ({100*np.mean(is_stem):.1f}%)")
+    
+    # ========================================================================
+    # Step 2: Identify likely UNDERSTORY points
+    # Understory: high sphericity + low proximity to canopy + low height
+    # ========================================================================
+    
+    # Criteria for understory:
+    # - High sphericity (scattered, shrub-like)
+    # - Low position relative to local maximum (far from canopy)
+    # - Not identified as stem
+    relative_height = dist_to_ground / (dist_to_ground + dist_to_top + 1e-6)
+    
+    is_understory = (
+        (sphericity >= sphericity_threshold) &  # Scattered/shrub-like geometry
+        (relative_height < 0.4) &               # In lower 40% of local height range
+        (z < max_understory_height) &           # Below understory height threshold
+        (~is_stem)                              # Not already classified as stem
+    )
+    
+    if verbose:
+        print(f"  Understory: {np.sum(is_understory):,} points ({100*np.mean(is_understory):.1f}%)")
+    
+    # ========================================================================
+    # Step 3: Classify remaining points
+    # Points not understory = tree (stem or canopy)
+    # ========================================================================
+    is_tree = ~is_understory
+    
+    if verbose:
+        print(f"  Tree (including canopy): {np.sum(is_tree):,} points ({100*np.mean(is_tree):.1f}%)")
+    
+    return UnderstoryClassificationResult(
+        is_tree=is_tree,
+        is_understory=is_understory,
+        is_stem=is_stem,
+        n_tree=np.sum(is_tree),
+        n_understory=np.sum(is_understory)
+    )
+
+
+def validate_tree_connectivity(
+    xyz: np.ndarray,
+    is_stem: np.ndarray,
+    horizontal_radius: float = 0.3,
+    vertical_radius: float = 0.8,
+    min_component_size: int = 50,
+    verbose: bool = False
+) -> np.ndarray:
+    """
+    Validate tree points using anisotropic graph connectivity.
+    
+    Points are considered part of a tree if they are connected to verified
+    stem points through a graph where edges have different horizontal and
+    vertical tolerance.
+    
+    Parameters
+    ----------
+    xyz : np.ndarray
+        Point cloud coordinates (n, 3).
+    is_stem : np.ndarray
+        Boolean mask indicating verified stem points.
+    horizontal_radius : float
+        Maximum horizontal distance for edge connection (default: 0.3m).
+        Smaller values prevent merging nearby trees.
+    vertical_radius : float
+        Maximum vertical distance for edge connection (default: 0.8m).
+        Larger values allow gaps in foliage while maintaining connectivity.
+    min_component_size : int
+        Minimum points for a connected component to be valid (default: 50).
+    verbose : bool
+        Print progress information.
+    
+    Returns
+    -------
+    is_valid_tree : np.ndarray
+        Boolean mask indicating points that are connected to stems.
+    
+    Notes
+    -----
+    The algorithm:
+    1. Build a KD-Tree with anisotropic scaling (Z compressed)
+    2. Find connected components starting from stem points
+    3. Points not reachable from stems are classified as disconnected (understory)
+    
+    This is inspired by the Graph Theory approach where edges connect
+    spatially proximate points, and connected components represent objects.
+    """
+    from scipy.spatial import cKDTree
+    from scipy.sparse import lil_matrix
+    from scipy.sparse.csgraph import connected_components
+    
+    n_points = len(xyz)
+    n_stems = np.sum(is_stem)
+    
+    if verbose:
+        print(f"Validating tree connectivity: {n_points:,} points, {n_stems:,} stems")
+        print(f"  Anisotropic radii: horizontal={horizontal_radius}m, vertical={vertical_radius}m")
+    
+    if n_stems == 0:
+        if verbose:
+            print("  Warning: No stem points found, returning all as invalid")
+        return np.zeros(n_points, dtype=bool)
+    
+    # ========================================================================
+    # Step 1: Scale coordinates for anisotropic search
+    # Scale Z so that vertical_radius becomes equivalent to horizontal_radius
+    # ========================================================================
+    z_scale = horizontal_radius / vertical_radius
+    xyz_scaled = xyz.copy()
+    xyz_scaled[:, 2] *= z_scale
+    
+    if verbose:
+        print(f"  Building KD-Tree with Z-scaling factor: {z_scale:.2f}")
+    
+    # Build tree on scaled coordinates
+    tree = cKDTree(xyz_scaled)
+    
+    # ========================================================================
+    # Step 2: Build sparse adjacency graph
+    # ========================================================================
+    if verbose:
+        print(f"  Finding neighbors within radius {horizontal_radius}m (scaled)...")
+    
+    # Query all neighbors within the (now isotropic) radius
+    neighbor_lists = tree.query_ball_point(xyz_scaled, r=horizontal_radius, workers=-1)
+    
+    # Build sparse adjacency matrix
+    adjacency = lil_matrix((n_points, n_points), dtype=bool)
+    
+    for i, neighbors in enumerate(neighbor_lists):
+        for j in neighbors:
+            if i != j:
+                adjacency[i, j] = True
+                adjacency[j, i] = True
+    
+    adjacency = adjacency.tocsr()
+    
+    if verbose:
+        n_edges = adjacency.nnz // 2
+        print(f"  Graph: {n_points:,} nodes, {n_edges:,} edges")
+    
+    # ========================================================================
+    # Step 3: Find connected components
+    # ========================================================================
+    n_components, labels = connected_components(
+        adjacency, 
+        directed=False, 
+        return_labels=True
+    )
+    
+    if verbose:
+        print(f"  Found {n_components:,} connected components")
+    
+    # ========================================================================
+    # Step 4: Identify components that contain stem points
+    # ========================================================================
+    stem_indices = np.where(is_stem)[0]
+    stem_labels = labels[stem_indices]
+    valid_labels = np.unique(stem_labels)
+    
+    # Count points per valid component
+    is_valid_tree = np.isin(labels, valid_labels)
+    
+    # Filter out small components
+    for label in valid_labels:
+        component_mask = labels == label
+        if np.sum(component_mask) < min_component_size:
+            is_valid_tree[component_mask] = False
+    
+    if verbose:
+        n_valid = np.sum(is_valid_tree)
+        n_invalid = n_points - n_valid
+        print(f"  Valid tree points: {n_valid:,} ({100*n_valid/n_points:.1f}%)")
+        print(f"  Disconnected (understory): {n_invalid:,} ({100*n_invalid/n_points:.1f}%)")
+    
+    return is_valid_tree
+
+
