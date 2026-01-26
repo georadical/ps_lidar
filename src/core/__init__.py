@@ -48,12 +48,17 @@ from .filtering import (
     UnderstoryClassificationResult,
     classify_understory,
     validate_tree_connectivity,
+    validate_tree_connectivity_fast,
+    filter_understory_stripe,
 )
 from .features import (
     GeometricFeatures,
     compute_geometric_features,
     compute_relative_features,
     compute_all_features,
+    compute_geometric_features_fast,
+    compute_relative_features_fast,
+    compute_all_features_fast,
 )
 
 __all__ = [
@@ -97,8 +102,13 @@ __all__ = [
     "UnderstoryClassificationResult",
     "classify_understory",
     "validate_tree_connectivity",
+    "validate_tree_connectivity_fast",
+    "filter_understory_stripe",
     "GeometricFeatures",
     "compute_geometric_features",
     "compute_relative_features",
     "compute_all_features",
+    "compute_geometric_features_fast",
+    "compute_relative_features_fast",
+    "compute_all_features_fast",
 ]
