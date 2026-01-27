@@ -308,11 +308,14 @@ def classify_understory(
     sphericity: np.ndarray,
     dist_to_ground: np.ndarray,
     dist_to_top: np.ndarray,
+    local_radius: Optional[np.ndarray] = None,
     verticality_threshold: float = 0.7,
     linearity_threshold: float = 0.4,
-    sphericity_threshold: float = 0.3,  # Lowered for better understory detection
-    max_understory_height: float = 2.0,  # Stricter height limit
-    min_canopy_clearance: float = 3.0,   # Protection for low branches
+    sphericity_threshold: float = 0.3,
+    max_understory_height: float = 2.0,
+    min_canopy_clearance: float = 3.0,
+    min_stem_radius: float = 0.05,
+    use_height_adaptive: bool = True,
     verbose: bool = False
 ) -> UnderstoryClassificationResult:
     """
@@ -320,6 +323,8 @@ def classify_understory(
     
     This function uses PCA-based geometric features rather than height alone
     to distinguish tree structures from understory vegetation.
+    
+    **NEW in v2:** Height-dependent thresholds and diameter-based filtering
     
     Classification logic:
     - STEM: High verticality AND high linearity (vertical linear structures)
@@ -329,6 +334,8 @@ def classify_understory(
     Protection mechanisms:
     - Low branches protected by dist_to_top check (if canopy above, not understory)
     - Stems protected by high linearity requirement
+    - Height-adaptive thresholds: stricter at low heights, relaxed higher up
+    - Diameter filtering: thin stems (understory) vs thick stems (trees)
     
     Parameters
     ----------
@@ -344,16 +351,22 @@ def classify_understory(
         Distance from point to ground in vertical cylinder.
     dist_to_top : np.ndarray
         Distance from point to top in vertical cylinder.
+    local_radius : np.ndarray, optional
+        Estimated local stem radius for each point. If provided, enables diameter-based filtering.
     verticality_threshold : float
-        Threshold for stem detection (default: 0.7).
+        Base threshold for stem detection (default: 0.7). Adjusted by height if use_height_adaptive=True.
     linearity_threshold : float
         Threshold for stem detection (default: 0.4).
     sphericity_threshold : float
-        Threshold for understory detection (default: 0.3).
+        Base threshold for understory detection (default: 0.3). Adjusted by height if use_height_adaptive=True.
     max_understory_height : float
         Maximum height for understory classification (default: 2.0m).
     min_canopy_clearance : float
         If dist_to_top > this value, point is under canopy = NOT understory (default: 3.0m).
+    min_stem_radius : float
+        Minimum radius for tree stems (default: 0.05m). Only used if local_radius provided.
+    use_height_adaptive : bool
+        Use height-dependent thresholds (default: True).
     verbose : bool
         Print progress information.
     
@@ -367,9 +380,49 @@ def classify_understory(
     
     if verbose:
         print(f"Classifying understory: {n_points:,} points")
-        print(f"  Thresholds: verticality>{verticality_threshold}, "
+        print(f"  Base thresholds: verticality>{verticality_threshold}, "
               f"linearity>{linearity_threshold}, sphericity>{sphericity_threshold}")
         print(f"  Protection: max_height<{max_understory_height}m, canopy_clearance>{min_canopy_clearance}m")
+        if use_height_adaptive:
+            print(f"  Height-adaptive thresholds: ENABLED")
+        if local_radius is not None:
+            print(f"  Diameter filtering: ENABLED (min_radius={min_stem_radius}m)")
+    
+    # ========================================================================
+    # Height-dependent threshold adjustment
+    # ========================================================================
+    if use_height_adaptive:
+        # Compute adaptive thresholds based on height
+        # Low heights (0-2m): strict (more likely understory)
+        # Mid heights (2-4m): moderate
+        # High heights (4m+): relaxed (crown region)
+        
+        verticality_thresh_adaptive = np.where(
+            z < 2.0,
+            verticality_threshold + 0.15,  # Stricter: 0.85 if base=0.7
+            np.where(
+                z < 4.0,
+                verticality_threshold + 0.05,  # Moderate: 0.75
+                verticality_threshold - 0.05   # Relaxed: 0.65
+            )
+        )
+        
+        sphericity_thresh_adaptive = np.where(
+            z < 2.0,
+            sphericity_threshold - 0.15,  # Stricter: 0.15 if base=0.3
+            np.where(
+                z < 4.0,
+                sphericity_threshold - 0.05,  # Moderate: 0.25
+                sphericity_threshold + 0.05   # Relaxed: 0.35
+            )
+        )
+        
+        if verbose:
+            print(f"  Adaptive verticality: {verticality_thresh_adaptive.min():.2f} - {verticality_thresh_adaptive.max():.2f}")
+            print(f"  Adaptive sphericity: {sphericity_thresh_adaptive.min():.2f} - {sphericity_thresh_adaptive.max():.2f}")
+    else:
+        verticality_thresh_adaptive = np.full(n_points, verticality_threshold)
+        sphericity_thresh_adaptive = np.full(n_points, sphericity_threshold)
     
     # Initialize masks
     is_stem = np.zeros(n_points, dtype=bool)
@@ -380,7 +433,17 @@ def classify_understory(
     # Step 1: Identify likely STEM points
     # Stems have high verticality AND high linearity
     # ========================================================================
-    is_stem = (verticality >= verticality_threshold) & (linearity >= linearity_threshold)
+    is_stem = (verticality >= verticality_thresh_adaptive) & (linearity >= linearity_threshold)
+    
+    # Diameter-based refinement if radius data available
+    if local_radius is not None:
+        # Thin stems (radius < threshold) are likely understory
+        is_thin_stem = local_radius < min_stem_radius
+        is_stem = is_stem & ~is_thin_stem
+        
+        if verbose:
+            n_thin = np.sum(is_thin_stem & (verticality >= verticality_thresh_adaptive) & (linearity >= linearity_threshold))
+            print(f"  Thin stems filtered: {n_thin:,} points")
     
     if verbose:
         print(f"  Potential stems: {np.sum(is_stem):,} points ({100*np.mean(is_stem):.1f}%)")
@@ -402,12 +465,12 @@ def classify_understory(
     is_under_canopy = dist_to_top > min_canopy_clearance
     
     is_understory = (
-        (sphericity >= sphericity_threshold) &     # Scattered/shrub-like geometry
-        (linearity < linearity_threshold) &        # NOT linear (protects stems/branches)
-        (relative_height < 0.3) &                  # In lower 30% of local height range
-        (z < max_understory_height) &              # Below understory height threshold
-        (~is_under_canopy) &                       # NOT under significant canopy (protects low branches)
-        (~is_stem)                                 # Not already classified as stem
+        (sphericity >= sphericity_thresh_adaptive) &  # Scattered/shrub-like geometry (adaptive)
+        (linearity < linearity_threshold) &           # NOT linear (protects stems/branches)
+        (relative_height < 0.3) &                     # In lower 30% of local height range
+        (z < max_understory_height) &                 # Below understory height threshold
+        (~is_under_canopy) &                          # NOT under significant canopy (protects low branches)
+        (~is_stem)                                    # Not already classified as stem
     )
     
     if verbose:
@@ -431,6 +494,7 @@ def classify_understory(
         n_tree=np.sum(is_tree),
         n_understory=np.sum(is_understory)
     )
+
 
 
 def validate_tree_connectivity(

@@ -612,3 +612,142 @@ def compute_relative_features_fast(
     return dist_to_ground, dist_to_top
 
 
+def estimate_local_radius(
+    xyz: np.ndarray,
+    search_radius: float = 0.15,
+    search_height: float = 0.3,
+    voxel_size: float = 0.1,
+    k_neighbors: int = 20,
+    verbose: bool = False
+) -> np.ndarray:
+    """
+    Estimate local stem radius for each point based on horizontal point distribution.
+    
+    OPTIMIZED: Uses voxel subsampling to speed up query time. Instead of querying
+    every point, we query voxel centers and broadcast results to points within each voxel.
+    
+    Parameters
+    ----------
+    xyz : np.ndarray
+        Point cloud coordinates (n, 3).
+    search_radius : float
+        Horizontal search radius for neighbors (default: 0.15m).
+    search_height : float
+        Vertical search range ±height/2 (default: 0.3m).
+    voxel_size : float
+        Voxel size for subsampling (default: 0.1m).
+    k_neighbors : int
+        Minimum number of neighbors to consider (default: 20).
+    verbose : bool
+        Print progress information.
+    
+    Returns
+    -------
+    np.ndarray
+        Estimated radius for each point (meters).
+    """
+    n_points = len(xyz)
+    
+    if verbose:
+        print(f"Estimating local radius (optimized) for {n_points:,} points...")
+        print(f"  Configuration: search_radius={search_radius}m, voxel_size={voxel_size}m")
+    
+    # ========================================================================
+    # Step 1: Voxelize to reduce number of queries
+    # ========================================================================
+    if verbose:
+        print("  Voxelizing point cloud...")
+        
+    # Compute grid indices
+    grid_indices = np.floor(xyz / voxel_size).astype(np.int32)
+    
+    # Create unique keys
+    # Map 3D indices to unique string or tuple or just use np.unique with axis
+    # Using structured array for performance
+    dtype = [('x', np.int32), ('y', np.int32), ('z', np.int32)]
+    grid_indices_struct = np.empty(n_points, dtype=dtype)
+    grid_indices_struct['x'] = grid_indices[:, 0]
+    grid_indices_struct['y'] = grid_indices[:, 1]
+    grid_indices_struct['z'] = grid_indices[:, 2]
+    
+    # Get unique voxels and inverse mapping (to map back to points)
+    unique_voxels, inverse_indices = np.unique(grid_indices_struct, return_inverse=True)
+    n_voxels = len(unique_voxels)
+    
+    # Compute voxel centroids
+    voxel_centers = np.column_stack([
+        unique_voxels['x'],
+        unique_voxels['y'],
+        unique_voxels['z']
+    ]).astype(np.float32) * voxel_size + (voxel_size / 2)
+    
+    if verbose:
+        print(f"  Voxel grid: {n_voxels:,} voxels ({100*n_voxels/n_points:.1f}% of original)")
+        print("  Building KDTree on original points...")
+        
+    # ========================================================================
+    # Step 2: Query radius for each voxel centroid
+    # ========================================================================
+    # We query the ORIGINAL points tree to get accurate neighbors
+    tree = cKDTree(xyz)
+    
+    voxel_radii = np.zeros(n_voxels, dtype=np.float32)
+    
+    # Query in batches
+    batch_size = 50000
+    n_batches = (n_voxels + batch_size - 1) // batch_size
+    
+    if verbose:
+        print(f"  Computing radius for {n_voxels:,} voxels in {n_batches} batches...")
+        
+    for batch_idx in range(n_batches):
+        start = batch_idx * batch_size
+        end = min((batch_idx + 1) * batch_size, n_voxels)
+        batch_centers = voxel_centers[start:end]
+        
+        # 1. Broad search: find neighbors within search_radius
+        # This returns list of lists
+        neighbor_indices_list = tree.query_ball_point(batch_centers, r=search_radius)
+        
+        batch_radii = np.zeros(len(batch_centers), dtype=np.float32)
+        
+        for i, neighbor_indices in enumerate(neighbor_indices_list):
+            if len(neighbor_indices) < k_neighbors:
+                continue
+                
+            neighbors = xyz[neighbor_indices]
+            center = batch_centers[i]
+            
+            # 2. Strict height filter
+            dz = np.abs(neighbors[:, 2] - center[2])
+            height_mask = dz <= (search_height / 2)
+            
+            valid_neighbors = neighbors[height_mask]
+            
+            if len(valid_neighbors) < k_neighbors:
+                continue
+                
+            # 3. Horizontal distance
+            d_xy = np.linalg.norm(valid_neighbors[:, :2] - center[:2], axis=1)
+            
+            # 4. Estimate radius (90th percentile)
+            batch_radii[i] = np.percentile(d_xy, 90)
+            
+        voxel_radii[start:end] = batch_radii
+        
+        if verbose and (batch_idx + 1) % max(1, n_batches // 5) == 0:
+            print(f"    Progress: {100*(batch_idx+1)/n_batches:.0f}%")
+            
+    # ========================================================================
+    # Step 3: Map back to original points
+    # ========================================================================
+    if verbose:
+        print("  Mapping results to original points...")
+        
+    point_radii = voxel_radii[inverse_indices]
+    
+    if verbose:
+        print(f"  ✓ Radius estimation complete (optimized)")
+        print(f"    Median radius: {np.median(point_radii[point_radii > 0]):.3f}m")
+        
+    return point_radii

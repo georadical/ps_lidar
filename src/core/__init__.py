@@ -59,6 +59,7 @@ from .features import (
     compute_geometric_features_fast,
     compute_relative_features_fast,
     compute_all_features_fast,
+    estimate_local_radius,
 )
 
 __all__ = [
@@ -111,4 +112,5 @@ __all__ = [
     "compute_geometric_features_fast",
     "compute_relative_features_fast",
     "compute_all_features_fast",
+    "estimate_local_radius",
 ]
