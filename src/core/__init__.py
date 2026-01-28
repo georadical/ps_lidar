@@ -50,6 +50,8 @@ from .filtering import (
     validate_tree_connectivity,
     validate_tree_connectivity_fast,
     filter_understory_stripe,
+    IterativePeelingResult,
+    iterative_peeling_understory,
 )
 from .features import (
     GeometricFeatures,
@@ -105,6 +107,8 @@ __all__ = [
     "validate_tree_connectivity",
     "validate_tree_connectivity_fast",
     "filter_understory_stripe",
+    "IterativePeelingResult",
+    "iterative_peeling_understory",
     "GeometricFeatures",
     "compute_geometric_features",
     "compute_relative_features",
