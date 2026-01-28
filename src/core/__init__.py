@@ -50,6 +50,8 @@ from .filtering import (
     validate_tree_connectivity,
     validate_tree_connectivity_fast,
     filter_understory_stripe,
+)
+from .peeling import (
     IterativePeelingResult,
     iterative_peeling_understory,
 )
