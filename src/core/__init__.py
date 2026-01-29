@@ -68,6 +68,18 @@ from .features import (
     compute_all_features_fast,
     estimate_local_radius,
 )
+from .classifier import (
+    ClassifierResult,
+    TrainingData,
+    SliceClassifierResult,
+    prepare_features,
+    train_classifier,
+    classify_understory_ml,
+    slice_classify_understory,
+    save_classifier,
+    load_classifier,
+    load_training_data_from_laz,
+)
 
 __all__ = [
     "PointCloudLoader",
