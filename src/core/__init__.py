@@ -54,6 +54,9 @@ from .filtering import (
 from .peeling import (
     IterativePeelingResult,
     iterative_peeling_understory,
+    SliceFilterResult,
+    slice_filter_understory,
+    postfilter_clusters,
 )
 from .features import (
     GeometricFeatures,
