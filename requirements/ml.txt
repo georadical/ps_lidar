@@ -1,0 +1,3 @@
+# ML workflow dependencies (training bank, model training, evaluation)
+-r core.txt
+pyarrow>=16,<20

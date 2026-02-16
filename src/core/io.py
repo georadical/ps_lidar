@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Any, Union, List, Optional
 from functools import wraps
+import warnings
 
 
 def _ensure_loaded(method):
@@ -380,7 +381,12 @@ def export_point_cloud(
         >>> export_point_cloud("with_intensity.laz", xyz, intensity=intensity_array)
     """
     output_path = Path(output_path)
-    
+
+    if output_path.suffix.lower() not in {".las", ".laz"}:
+        raise ValueError(
+            f"output_path must end with .las or .laz, got '{output_path.suffix}'"
+        )
+
     if xyz.ndim != 2 or xyz.shape[1] < 3:
         raise ValueError(f"xyz must be (N, 3), got {xyz.shape}")
     
@@ -411,8 +417,16 @@ def export_point_cloud(
     if number_of_returns is not None:
         las.number_of_returns = number_of_returns.astype(np.uint8)
     
-    # Write file
-    las.write(output_path)
+    # Write file with explicit compression behavior
+    is_laz = output_path.suffix.lower() == ".laz"
+    if not is_laz and compress:
+        warnings.warn(
+            "compress=True is ignored for .las output. Use a .laz path to write compressed output.",
+            UserWarning,
+            stacklevel=2,
+        )
+
+    las.write(output_path, do_compress=(compress if is_laz else False))
     
     return output_path
 

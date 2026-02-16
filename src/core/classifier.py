@@ -1,19 +1,24 @@
 """
-Machine Learning classifier for understory separation.
+Machine learning utilities for understory separation.
 Uses Random Forest trained on geometric features.
 """
-import numpy as np
+
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, Tuple
-import pickle
 from pathlib import Path
+import pickle
+from typing import Any, Dict, Optional, Sequence, Tuple
+
+import numpy as np
 
 
 @dataclass
 class ClassifierResult:
     """Result of ML classification."""
-    is_tree: np.ndarray           # (N,) boolean mask (True = tree)
-    probabilities: np.ndarray     # (N,) probability of being tree
+
+    is_tree: np.ndarray
+    probabilities: np.ndarray
     n_tree: int
     n_understory: int
 
@@ -21,9 +26,40 @@ class ClassifierResult:
 @dataclass
 class TrainingData:
     """Training data for classifier."""
-    features: np.ndarray          # (N, n_features) feature matrix
-    labels: np.ndarray            # (N,) labels (0=understory, 1=tree)
-    feature_names: list           # Names of features
+
+    features: np.ndarray
+    labels: np.ndarray
+    feature_names: list
+
+
+@dataclass
+class BinaryClassificationMetrics:
+    """Binary classification metrics summary."""
+
+    accuracy: float
+    precision_tree: float
+    recall_tree: float
+    f1_tree: float
+    precision_understory: float
+    recall_understory: float
+    f1_understory: float
+    balanced_accuracy: float
+    support_tree: int
+    support_understory: int
+    confusion_matrix: np.ndarray
+    roc_auc_tree: Optional[float] = None
+
+
+@dataclass
+class SliceClassifierResult:
+    """Result of slice-based ML classification."""
+
+    is_tree: np.ndarray
+    probabilities: np.ndarray
+    n_tree: int
+    n_understory: int
+    n_protected: int
+    n_ml_classified: int
 
 
 def prepare_features(
@@ -33,23 +69,14 @@ def prepare_features(
     dist_to_ground: np.ndarray,
     planarity: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, list]:
-    """
-    Prepare feature matrix for classification.
-    
-    Returns
-    -------
-    features : np.ndarray
-        (N, n_features) feature matrix
-    feature_names : list
-        Names of features in order
-    """
+    """Prepare feature matrix for classification."""
     feature_list = [verticality, linearity, sphericity, dist_to_ground]
-    feature_names = ['verticality', 'linearity', 'sphericity', 'dist_to_ground']
-    
+    feature_names = ["verticality", "linearity", "sphericity", "dist_to_ground"]
+
     if planarity is not None:
         feature_list.append(planarity)
-        feature_names.append('planarity')
-    
+        feature_names.append("planarity")
+
     features = np.column_stack(feature_list)
     return features, feature_names
 
@@ -59,60 +86,43 @@ def train_classifier(
     n_estimators: int = 100,
     max_depth: int = 10,
     random_state: int = 42,
-    verbose: bool = False
+    verbose: bool = False,
 ):
-    """
-    Train Random Forest classifier on labeled data.
-    
-    Parameters
-    ----------
-    training_data : TrainingData
-        Training data with features and labels.
-    n_estimators : int
-        Number of trees in forest.
-    max_depth : int
-        Maximum depth of trees.
-    random_state : int
-        Random seed for reproducibility.
-    verbose : bool
-        Print progress.
-    
-    Returns
-    -------
-    sklearn.ensemble.RandomForestClassifier
-        Trained classifier.
-    """
+    """Train Random Forest classifier on labeled data."""
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.model_selection import cross_val_score
-    
+
     if verbose:
-        print(f"Training Random Forest classifier...")
+        n_tree = int(np.sum(training_data.labels == 1))
+        n_understory = int(np.sum(training_data.labels == 0))
+        print("Training Random Forest classifier...")
         print(f"  Samples: {len(training_data.labels):,}")
         print(f"  Features: {len(training_data.feature_names)}")
-        print(f"  Class balance: tree={np.sum(training_data.labels):,}, understory={np.sum(~training_data.labels.astype(bool)):,}")
-    
+        print(f"  Class balance: tree={n_tree:,}, understory={n_understory:,}")
+
     clf = RandomForestClassifier(
         n_estimators=n_estimators,
         max_depth=max_depth,
         random_state=random_state,
         n_jobs=-1,
-        class_weight='balanced'  # Handle class imbalance
+        class_weight="balanced",
     )
-    
-    # Cross-validation score
+
     if verbose:
         scores = cross_val_score(clf, training_data.features, training_data.labels, cv=5)
-        print(f"  Cross-validation accuracy: {scores.mean():.3f} (+/- {scores.std()*2:.3f})")
-    
-    # Train on full data
+        print(f"  Cross-validation accuracy: {scores.mean():.3f} (+/- {scores.std() * 2:.3f})")
+
     clf.fit(training_data.features, training_data.labels)
-    
+
     if verbose:
-        print(f"  ✓ Training complete")
-        print(f"  Feature importances:")
-        for name, imp in sorted(zip(training_data.feature_names, clf.feature_importances_), key=lambda x: -x[1]):
-            print(f"    {name}: {imp:.3f}")
-    
+        print("  Training complete")
+        print("  Feature importances:")
+        for name, importance in sorted(
+            zip(training_data.feature_names, clf.feature_importances_),
+            key=lambda item: -item[1],
+        ):
+            print(f"    {name}: {importance:.3f}")
+
     return clf
 
 
@@ -120,139 +130,241 @@ def classify_understory_ml(
     features: np.ndarray,
     classifier,
     probability_threshold: float = 0.5,
-    verbose: bool = False
+    verbose: bool = False,
 ) -> ClassifierResult:
-    """
-    Classify points using trained ML model.
-    
-    Parameters
-    ----------
-    features : np.ndarray
-        (N, n_features) feature matrix.
-    classifier : sklearn classifier
-        Trained classifier with predict_proba method.
-    probability_threshold : float
-        Threshold for classification (default 0.5).
-    verbose : bool
-        Print progress.
-    
-    Returns
-    -------
-    ClassifierResult
-        Classification results.
-    """
+    """Classify points using trained ML model."""
     if verbose:
         print(f"Classifying {len(features):,} points...")
-    
-    # Get probabilities
-    probas = classifier.predict_proba(features)
-    tree_proba = probas[:, 1]  # Probability of class 1 (tree)
-    
-    # Apply threshold
-    is_tree = tree_proba >= probability_threshold
-    
-    n_tree = np.sum(is_tree)
-    n_understory = len(is_tree) - n_tree
-    
+
+    probabilities = classifier.predict_proba(features)[:, 1]
+    is_tree = probabilities >= probability_threshold
+
+    n_tree = int(np.sum(is_tree))
+    n_understory = int(len(is_tree) - n_tree)
+
     if verbose:
-        print(f"  Tree: {n_tree:,} ({100*n_tree/len(is_tree):.1f}%)")
-        print(f"  Understory: {n_understory:,} ({100*n_understory/len(is_tree):.1f}%)")
-    
+        print(f"  Tree: {n_tree:,} ({100 * n_tree / len(is_tree):.1f}%)")
+        print(f"  Understory: {n_understory:,} ({100 * n_understory / len(is_tree):.1f}%)")
+
     return ClassifierResult(
         is_tree=is_tree,
-        probabilities=tree_proba,
+        probabilities=probabilities,
         n_tree=n_tree,
-        n_understory=n_understory
+        n_understory=n_understory,
     )
 
 
-def save_classifier(classifier, filepath: str, feature_names: list):
-    """Save trained classifier to file."""
+def save_classifier(classifier, filepath: str | Path, feature_names: list):
+    """Backward-compatible save helper."""
+    return save_classifier_bundle(
+        classifier=classifier,
+        filepath=filepath,
+        feature_names=feature_names,
+        metadata=None,
+    )
+
+
+def save_classifier_bundle(
+    classifier,
+    filepath: str | Path,
+    feature_names: list,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Path:
+    """Save trained classifier bundle to file."""
+    out_path = Path(filepath)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
     data = {
-        'classifier': classifier,
-        'feature_names': feature_names
+        "classifier": classifier,
+        "feature_names": feature_names,
+        "metadata": metadata or {},
     }
-    with open(filepath, 'wb') as f:
-        pickle.dump(data, f)
-    print(f"✓ Classifier saved to {filepath}")
+    with open(out_path, "wb") as file_obj:
+        pickle.dump(data, file_obj)
+
+    print(f"Classifier saved to {out_path}")
+    return out_path
 
 
-def load_classifier(filepath: str):
+def load_classifier(filepath: str | Path, return_metadata: bool = False):
     """Load trained classifier from file."""
-    with open(filepath, 'rb') as f:
-        data = pickle.load(f)
-    return data['classifier'], data['feature_names']
+    with open(filepath, "rb") as file_obj:
+        data = pickle.load(file_obj)
+
+    classifier = data["classifier"]
+    feature_names = data["feature_names"]
+    metadata = data.get("metadata", {})
+
+    if return_metadata:
+        return classifier, feature_names, metadata
+
+    return classifier, feature_names
 
 
 def load_training_data_from_laz(
     filepath: str,
-    label_field: str = 'training_label',
-    verbose: bool = False
+    label_field: str = "training_label",
+    verbose: bool = False,
 ) -> TrainingData:
-    """
-    Load training data from LAZ file with labels.
-    
-    The LAZ file should have:
-    - verticality, linearity, sphericity as extra dimensions
-    - A label field (default: 'training_label') with 0=understory, 1=tree
-    
-    Parameters
-    ----------
-    filepath : str
-        Path to LAZ file with labeled data.
-    label_field : str
-        Name of the label field in LAZ file.
-    verbose : bool
-        Print progress.
-    
-    Returns
-    -------
-    TrainingData
-        Training data ready for classifier.
-    """
+    """Load training data from LAS/LAZ file with labels."""
     import laspy
-    
+
     las = laspy.read(filepath)
-    
-    # Get coordinates for dist_to_ground
-    xyz = np.column_stack([las.x, las.y, las.z])
-    dist_to_ground = xyz[:, 2]  # Z is height above ground (normalized)
-    
-    # Get features
-    verticality = np.array(las.verticality)
-    linearity = np.array(las.linearity)
-    sphericity = np.array(las.sphericity)
-    
-    # Get labels
-    labels = np.array(getattr(las, label_field)).astype(int)
-    
-    # Prepare features
+
+    dist_to_ground = np.asarray(las.z, dtype=np.float32)
+    verticality = np.asarray(las.verticality, dtype=np.float32)
+    linearity = np.asarray(las.linearity, dtype=np.float32)
+    sphericity = np.asarray(las.sphericity, dtype=np.float32)
+
+    labels = np.asarray(getattr(las, label_field), dtype=np.int32)
+
     features, feature_names = prepare_features(
-        verticality, linearity, sphericity, dist_to_ground
+        verticality=verticality,
+        linearity=linearity,
+        sphericity=sphericity,
+        dist_to_ground=dist_to_ground,
     )
-    
+
+    valid_mask = (labels == 0) | (labels == 1)
+    features = features[valid_mask]
+    labels = labels[valid_mask]
+
     if verbose:
         print(f"Loaded training data from {filepath}")
-        print(f"  Points: {len(labels):,}")
-        print(f"  Tree (1): {np.sum(labels == 1):,}")
-        print(f"  Understory (0): {np.sum(labels == 0):,}")
-    
+        print(f"  Points (valid labels): {len(labels):,}")
+        print(f"  Tree (1): {int(np.sum(labels == 1)):,}")
+        print(f"  Understory (0): {int(np.sum(labels == 0)):,}")
+
+    if len(np.unique(labels)) < 2:
+        raise ValueError("Training data must contain both classes (0 and 1)")
+
+    return TrainingData(features=features, labels=labels, feature_names=feature_names)
+
+
+def load_training_data_from_dataframe(
+    dataframe,
+    feature_names: Sequence[str] = ("verticality", "linearity", "sphericity", "dist_to_ground"),
+    label_col: str = "label",
+    drop_invalid_labels: bool = True,
+) -> TrainingData:
+    """Build TrainingData from a DataFrame."""
+    missing_cols = [name for name in (*feature_names, label_col) if name not in dataframe.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required columns: {missing_cols}")
+
+    labels = np.asarray(dataframe[label_col], dtype=np.int32)
+    valid_mask = (labels == 0) | (labels == 1)
+
+    if not np.all(valid_mask):
+        if drop_invalid_labels:
+            dataframe = dataframe.loc[valid_mask]
+            labels = labels[valid_mask]
+        else:
+            raise ValueError("Label column contains values outside {0, 1}")
+
+    features = np.asarray(dataframe.loc[:, feature_names], dtype=np.float32)
+
+    if len(features) == 0:
+        raise ValueError("No valid rows available for training")
+
+    if len(np.unique(labels)) < 2:
+        raise ValueError("Training data must contain both classes (0 and 1)")
+
     return TrainingData(
         features=features,
-        labels=labels,
-        feature_names=feature_names
+        labels=labels.astype(np.int32),
+        feature_names=list(feature_names),
     )
 
 
-@dataclass
-class SliceClassifierResult:
-    """Result of slice-based ML classification."""
-    is_tree: np.ndarray           # (N,) boolean mask (True = tree)
-    probabilities: np.ndarray     # (N,) probability of being tree (1.0 for protected zone)
-    n_tree: int
-    n_understory: int
-    n_protected: int              # Points in upper zone (100% protected)
-    n_ml_classified: int          # Points classified by ML
+def evaluate_classifier(
+    classifier,
+    evaluation_data: TrainingData,
+    probability_threshold: float = 0.5,
+) -> BinaryClassificationMetrics:
+    """Evaluate a trained classifier on labeled data."""
+    from sklearn.metrics import (
+        accuracy_score,
+        balanced_accuracy_score,
+        confusion_matrix,
+        precision_recall_fscore_support,
+        roc_auc_score,
+    )
+
+    labels = evaluation_data.labels.astype(np.int32)
+    probabilities = classifier.predict_proba(evaluation_data.features)[:, 1]
+    predictions = (probabilities >= probability_threshold).astype(np.int32)
+
+    precision, recall, f1, support = precision_recall_fscore_support(
+        labels,
+        predictions,
+        labels=[0, 1],
+        zero_division=0,
+    )
+    cm = confusion_matrix(labels, predictions, labels=[0, 1]).astype(np.int32)
+
+    roc_auc_tree = None
+    if np.unique(labels).size >= 2:
+        roc_auc_tree = float(roc_auc_score(labels, probabilities))
+
+    return BinaryClassificationMetrics(
+        accuracy=float(accuracy_score(labels, predictions)),
+        precision_tree=float(precision[1]),
+        recall_tree=float(recall[1]),
+        f1_tree=float(f1[1]),
+        precision_understory=float(precision[0]),
+        recall_understory=float(recall[0]),
+        f1_understory=float(f1[0]),
+        balanced_accuracy=float(balanced_accuracy_score(labels, predictions)),
+        support_tree=int(support[1]),
+        support_understory=int(support[0]),
+        confusion_matrix=cm,
+        roc_auc_tree=roc_auc_tree,
+    )
+
+
+def train_and_evaluate_classifier(
+    training_data: TrainingData,
+    validation_data: Optional[TrainingData] = None,
+    test_data: Optional[TrainingData] = None,
+    probability_threshold: float = 0.5,
+    n_estimators: int = 200,
+    max_depth: int = 12,
+    random_state: int = 42,
+    verbose: bool = False,
+):
+    """Train classifier and evaluate available splits."""
+    classifier = train_classifier(
+        training_data=training_data,
+        n_estimators=n_estimators,
+        max_depth=max_depth,
+        random_state=random_state,
+        verbose=verbose,
+    )
+
+    metrics: Dict[str, BinaryClassificationMetrics] = {
+        "train": evaluate_classifier(
+            classifier=classifier,
+            evaluation_data=training_data,
+            probability_threshold=probability_threshold,
+        )
+    }
+
+    if validation_data is not None:
+        metrics["val"] = evaluate_classifier(
+            classifier=classifier,
+            evaluation_data=validation_data,
+            probability_threshold=probability_threshold,
+        )
+
+    if test_data is not None:
+        metrics["test"] = evaluate_classifier(
+            classifier=classifier,
+            evaluation_data=test_data,
+            probability_threshold=probability_threshold,
+        )
+
+    return classifier, metrics
 
 
 def slice_classify_understory(
@@ -261,83 +373,48 @@ def slice_classify_understory(
     classifier,
     slice_height: float = 3.5,
     probability_threshold: float = 0.5,
-    verbose: bool = False
+    verbose: bool = False,
 ) -> SliceClassifierResult:
-    """
-    Classify understory using ML, but ONLY on the lower slice.
-    
-    Upper zone (>=slice_height) is 100% protected and never enters ML.
-    Only the lower zone (<slice_height) is classified by ML.
-    
-    Parameters
-    ----------
-    features : np.ndarray
-        (N, n_features) feature matrix for ALL points.
-    dist_to_ground : np.ndarray
-        Height above ground for each point.
-    classifier : sklearn classifier
-        Trained classifier with predict_proba method.
-    slice_height : float
-        Height threshold. Points >= this are protected.
-    probability_threshold : float
-        Threshold for ML classification (default 0.5).
-    verbose : bool
-        Print progress.
-    
-    Returns
-    -------
-    SliceClassifierResult
-        Classification results with protected upper zone.
-    """
+    """Classify understory in lower slice while protecting upper slice."""
     n_points = len(features)
-    
-    # Separate zones
+
     lower_mask = dist_to_ground < slice_height
     upper_mask = ~lower_mask
-    
-    n_lower = np.sum(lower_mask)
-    n_upper = np.sum(upper_mask)
-    
+
+    n_lower = int(np.sum(lower_mask))
+    n_upper = int(np.sum(upper_mask))
+
     if verbose:
         print(f"Slice-based ML classification (threshold: {slice_height}m)...")
         print(f"  Upper zone (protected): {n_upper:,} points")
         print(f"  Lower zone (ML): {n_lower:,} points")
-    
-    # Initialize: upper zone = all tree (protected)
+
     is_tree = np.ones(n_points, dtype=bool)
     probabilities = np.ones(n_points, dtype=np.float32)
-    
-    # Apply ML only to lower zone
+
     if n_lower > 0:
         lower_features = features[lower_mask]
-        
-        # Get probabilities from ML
-        probas = classifier.predict_proba(lower_features)
-        tree_proba = probas[:, 1]  # Probability of class 1 (tree)
-        
-        # Apply threshold
+        tree_proba = classifier.predict_proba(lower_features)[:, 1]
         is_tree_lower = tree_proba >= probability_threshold
-        
-        # Update masks for lower zone
+
         is_tree[lower_mask] = is_tree_lower
         probabilities[lower_mask] = tree_proba
-        
-        n_understory_lower = np.sum(~is_tree_lower)
+
         if verbose:
+            n_understory_lower = int(np.sum(~is_tree_lower))
             print(f"  ML removed {n_understory_lower:,} understory points from lower zone")
-    
-    n_tree = np.sum(is_tree)
-    n_understory = n_points - n_tree
-    
+
+    n_tree = int(np.sum(is_tree))
+    n_understory = int(n_points - n_tree)
+
     if verbose:
         print(f"  Final: Tree={n_tree:,}, Understory={n_understory:,}")
-    
+
     return SliceClassifierResult(
         is_tree=is_tree,
         probabilities=probabilities,
         n_tree=n_tree,
         n_understory=n_understory,
         n_protected=n_upper,
-        n_ml_classified=n_lower
+        n_ml_classified=n_lower,
     )
-

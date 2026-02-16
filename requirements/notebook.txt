@@ -1,0 +1,7 @@
+# Notebook and visualization dependencies
+-r core.txt
+jupyterlab>=4,<5
+ipykernel>=6,<7
+matplotlib>=3.8,<4
+open3d>=0.18,<1
+plotly>=5,<7
