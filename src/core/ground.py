@@ -11,7 +11,9 @@ Reference:
 
 import CSF
 import numpy as np
+import warnings
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Tuple, Optional
 
 
@@ -54,6 +56,7 @@ def classify_ground(
     iterations: int = 500,
     slope_smooth: bool = True,
     export_cloth: bool = False,
+    cloth_nodes_path: Optional[str] = None,
 ) -> GroundFilterResult:
     """
     Classifies points as ground or off-ground using the CSF algorithm.
@@ -78,8 +81,10 @@ def classify_ground(
         iterations: Maximum simulation iterations.
         slope_smooth: If True, applies post-processing to handle steep slopes better.
             Recommended for forest terrain.
-        export_cloth: If True, exports the cloth nodes (DTM approximation).
-            Useful for visualization and interpolation.
+        export_cloth: If True, requests CSF cloth export.
+        cloth_nodes_path: Optional path to read exported cloth nodes from.
+            If omitted, cloth_nodes are not loaded to avoid implicit dependence
+            on process working directory.
         
     Returns:
         GroundFilterResult containing indices and optional cloth nodes.
@@ -111,16 +116,28 @@ def classify_ground(
     # Execute filtering
     csf.do_filtering(ground_indices, off_ground_indices, exportCloth=export_cloth)
     
-    # Get cloth nodes if requested
+    # Get cloth nodes if requested and explicit path is provided
     cloth_nodes = None
     if export_cloth:
-        try:
-            # CSF exports cloth nodes to a file, we need to read it
-            cloth_data = np.loadtxt("cloth_nodes.txt")
-            if cloth_data.size > 0:
-                cloth_nodes = cloth_data.reshape(-1, 3)
-        except (FileNotFoundError, ValueError):
-            pass  # Cloth export may not be available
+        if cloth_nodes_path is None:
+            warnings.warn(
+                "export_cloth=True but cloth_nodes_path is not set; "
+                "cloth_nodes will not be loaded.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            cloth_file = Path(cloth_nodes_path)
+            try:
+                cloth_data = np.loadtxt(cloth_file)
+                if cloth_data.size > 0:
+                    cloth_nodes = cloth_data.reshape(-1, 3)
+            except (FileNotFoundError, ValueError):
+                warnings.warn(
+                    f"Could not load cloth nodes from '{cloth_file}'.",
+                    UserWarning,
+                    stacklevel=2,
+                )
     
     return GroundFilterResult(
         ground_indices=np.array(ground_indices),

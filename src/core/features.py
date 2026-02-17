@@ -14,9 +14,10 @@ Reference: Demantké et al. (2011) - "Dimensionality based scale selection in 3D
 """
 
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Literal, Sequence, Dict, Any
 import numpy as np
 from scipy.spatial import cKDTree
+import time
 
 
 @dataclass
@@ -43,6 +44,40 @@ class GeometricFeatures:
     
     normals: np.ndarray
     """Surface normals (n, 3) - eigenvector of smallest eigenvalue."""
+
+
+def _voxelize_cloud(
+    xyz: np.ndarray,
+    voxel_size: float,
+) -> Tuple[np.ndarray, np.ndarray, int]:
+    """
+    Voxelize points and return voxel centroids plus point-to-voxel mapping.
+
+    Returns
+    -------
+    voxel_centroids : np.ndarray
+        (M, 3) voxel centroids.
+    inverse_indices : np.ndarray
+        (N,) voxel index per input point.
+    n_voxels : int
+        Number of unique voxels.
+    """
+    if voxel_size <= 0:
+        raise ValueError(f"voxel_size must be > 0, got {voxel_size}")
+
+    voxel_indices = np.floor(xyz / voxel_size).astype(np.int32)
+    _, inverse_indices = np.unique(voxel_indices, axis=0, return_inverse=True)
+    n_voxels = int(inverse_indices.max()) + 1 if len(inverse_indices) > 0 else 0
+
+    voxel_centroids = np.zeros((n_voxels, 3), dtype=np.float64)
+    if n_voxels == 0:
+        return voxel_centroids, inverse_indices, n_voxels
+
+    voxel_counts = np.bincount(inverse_indices, minlength=n_voxels).astype(np.int32)
+    np.add.at(voxel_centroids, inverse_indices, xyz)
+    voxel_centroids /= np.maximum(voxel_counts, 1)[:, np.newaxis]
+
+    return voxel_centroids, inverse_indices, n_voxels
 
 
 def compute_geometric_features(
@@ -338,6 +373,17 @@ def compute_geometric_features_fast(
         Dataclass containing all computed features (same length as input xyz).
     """
     n_points = len(xyz)
+    if n_points == 0:
+        empty = np.array([], dtype=np.float32)
+        return GeometricFeatures(
+            verticality=empty,
+            linearity=empty,
+            planarity=empty,
+            sphericity=empty,
+            omnivariance=empty,
+            eigenvalues=np.zeros((0, 3), dtype=np.float32),
+            normals=np.zeros((0, 3), dtype=np.float32),
+        )
     
     if verbose:
         print(f"Computing geometric features (optimized) for {n_points:,} points...")
@@ -346,28 +392,10 @@ def compute_geometric_features_fast(
     # ========================================================================
     # Step 1: Voxelize point cloud
     # ========================================================================
-    # Compute voxel indices for each point
-    voxel_indices = np.floor(xyz / voxel_size).astype(np.int32)
-    
-    # Get unique voxels and mapping
-    unique_voxels, inverse_indices = np.unique(
-        voxel_indices, axis=0, return_inverse=True
-    )
-    n_voxels = len(unique_voxels)
+    voxel_centroids, inverse_indices, n_voxels = _voxelize_cloud(xyz, voxel_size)
     
     if verbose:
         print(f"  Voxelized: {n_points:,} points → {n_voxels:,} voxels ({100*n_voxels/n_points:.1f}%)")
-    
-    # Compute voxel centroids (average of points in each voxel)
-    voxel_centroids = np.zeros((n_voxels, 3), dtype=np.float64)
-    voxel_counts = np.zeros(n_voxels, dtype=np.int32)
-    
-    for i in range(n_points):
-        voxel_idx = inverse_indices[i]
-        voxel_centroids[voxel_idx] += xyz[i]
-        voxel_counts[voxel_idx] += 1
-    
-    voxel_centroids /= voxel_counts[:, np.newaxis]
     
     # ========================================================================
     # Step 2: Compute PCA features on voxel centroids
@@ -471,12 +499,113 @@ def compute_geometric_features_fast(
     )
 
 
+def compute_geometric_features_pgeof(
+    xyz: np.ndarray,
+    voxel_size: float = 0.1,
+    scale: float = 0.15,
+    max_knn: int = 50000,
+    verbose: bool = False
+) -> GeometricFeatures:
+    """
+    Compute geometric features with pgeof (C++ backend), then re-project.
+
+    Notes
+    -----
+    - `pgeof` provides `Scattering`; this is mapped to `sphericity`.
+    - `pgeof` does not expose eigenvalues/omnivariance in this API, so those are
+      returned as zeros for compatibility with `GeometricFeatures`.
+    """
+    try:
+        import pgeof
+        from pgeof import EFeatureID
+    except ImportError as exc:
+        raise ImportError(
+            "pgeof backend requested but package is not installed. "
+            "Install with: pip install pgeof"
+        ) from exc
+
+    n_points = len(xyz)
+    if n_points == 0:
+        empty = np.array([], dtype=np.float32)
+        return GeometricFeatures(
+            verticality=empty,
+            linearity=empty,
+            planarity=empty,
+            sphericity=empty,
+            omnivariance=empty,
+            eigenvalues=np.zeros((0, 3), dtype=np.float32),
+            normals=np.zeros((0, 3), dtype=np.float32),
+        )
+
+    if verbose:
+        print(f"Computing geometric features (pgeof) for {n_points:,} points...")
+        print(f"  Voxel size: {voxel_size}m, scale={scale}, max_knn={max_knn}")
+
+    voxel_centroids, inverse_indices, n_voxels = _voxelize_cloud(xyz, voxel_size)
+    if verbose:
+        print(f"  Voxelized: {n_points:,} points -> {n_voxels:,} voxels ({100*n_voxels/n_points:.1f}%)")
+
+    selected_features = [
+        EFeatureID.Verticality,
+        EFeatureID.Linearity,
+        EFeatureID.Planarity,
+        EFeatureID.Scattering,
+        EFeatureID.Normal_x,
+        EFeatureID.Normal_y,
+        EFeatureID.Normal_z,
+    ]
+
+    voxel_features = pgeof.compute_features_selected(
+        voxel_centroids.astype(np.float32),
+        scale,
+        max_knn,
+        selected_features,
+    )
+    voxel_features = np.asarray(voxel_features, dtype=np.float32)
+    if voxel_features.ndim != 2 or voxel_features.shape[1] != len(selected_features):
+        raise RuntimeError(
+            f"Unexpected pgeof output shape {voxel_features.shape}, "
+            f"expected (n_voxels, {len(selected_features)})"
+        )
+
+    voxel_verticality = voxel_features[:, 0]
+    voxel_linearity = voxel_features[:, 1]
+    voxel_planarity = voxel_features[:, 2]
+    voxel_sphericity = voxel_features[:, 3]  # scattering
+    voxel_normals = voxel_features[:, 4:7]
+
+    verticality = voxel_verticality[inverse_indices]
+    linearity = voxel_linearity[inverse_indices]
+    planarity = voxel_planarity[inverse_indices]
+    sphericity = voxel_sphericity[inverse_indices]
+    normals = voxel_normals[inverse_indices]
+
+    if verbose:
+        print("  Feature computation complete (pgeof)")
+        print(f"    Verticality: min={verticality.min():.2f}, max={verticality.max():.2f}, mean={verticality.mean():.2f}")
+        print(f"    Linearity: min={linearity.min():.2f}, max={linearity.max():.2f}, mean={linearity.mean():.2f}")
+        print(f"    Sphericity: min={sphericity.min():.2f}, max={sphericity.max():.2f}, mean={sphericity.mean():.2f}")
+
+    return GeometricFeatures(
+        verticality=verticality,
+        linearity=linearity,
+        planarity=planarity,
+        sphericity=sphericity,
+        omnivariance=np.zeros(n_points, dtype=np.float32),
+        eigenvalues=np.zeros((n_points, 3), dtype=np.float32),
+        normals=normals,
+    )
+
+
 def compute_all_features_fast(
     xyz: np.ndarray,
     voxel_size: float = 0.1,
     k_neighbors: int = 20,
     cylinder_radius: float = 0.5,
-    verbose: bool = False
+    verbose: bool = False,
+    backend: Optional[Literal["voxel", "pgeof"]] = None,
+    pgeof_scale: float = 0.15,
+    pgeof_max_knn: int = 50000,
 ) -> Tuple[GeometricFeatures, np.ndarray, np.ndarray]:
     """
     Compute all features using optimized voxel-based method.
@@ -495,6 +624,13 @@ def compute_all_features_fast(
         Radius for cylindrical relative feature computation.
     verbose : bool
         Print progress information.
+    backend : {"voxel", "pgeof"} | None
+        Geometric feature backend. If None, uses env var
+        `PS_LIDAR_FEATURE_BACKEND` (default: "voxel").
+    pgeof_scale : float
+        Neighborhood scale for pgeof backend.
+    pgeof_max_knn : int
+        Max neighbors for pgeof backend.
     
     Returns
     -------
@@ -505,14 +641,141 @@ def compute_all_features_fast(
     dist_to_top : np.ndarray
         Distance from each point to top in cylinder.
     """
-    features = compute_geometric_features_fast(
-        xyz, voxel_size=voxel_size, k_neighbors=k_neighbors, verbose=verbose
-    )
+    import os
+
+    selected_backend = (backend or os.getenv("PS_LIDAR_FEATURE_BACKEND", "voxel")).lower()
+    if selected_backend not in {"voxel", "pgeof"}:
+        raise ValueError(
+            f"Unsupported backend '{selected_backend}'. Use 'voxel' or 'pgeof'."
+        )
+
+    if selected_backend == "voxel":
+        features = compute_geometric_features_fast(
+            xyz, voxel_size=voxel_size, k_neighbors=k_neighbors, verbose=verbose
+        )
+    else:
+        features = compute_geometric_features_pgeof(
+            xyz,
+            voxel_size=voxel_size,
+            scale=pgeof_scale,
+            max_knn=pgeof_max_knn,
+            verbose=verbose,
+        )
+
     dist_to_ground, dist_to_top = compute_relative_features_fast(
         xyz, voxel_size=voxel_size, verbose=verbose
     )
     
     return features, dist_to_ground, dist_to_top
+
+
+def benchmark_feature_backends(
+    xyz: np.ndarray,
+    backends: Sequence[str] = ("voxel", "pgeof"),
+    repeats: int = 1,
+    sample_size: Optional[int] = None,
+    seed: int = 42,
+    voxel_size: float = 0.1,
+    k_neighbors: int = 20,
+    pgeof_scale: float = 0.15,
+    pgeof_max_knn: int = 50000,
+    verbose: bool = False,
+) -> Dict[str, Any]:
+    """
+    Reproducible benchmark for geometric-feature backends.
+
+    Returns a report dictionary with timing stats and feature deltas.
+    """
+    if repeats < 1:
+        raise ValueError(f"repeats must be >= 1, got {repeats}")
+
+    rng = np.random.default_rng(seed)
+    xyz_eval = xyz
+    if sample_size is not None and sample_size < len(xyz):
+        idx = rng.choice(len(xyz), size=sample_size, replace=False)
+        xyz_eval = xyz[idx]
+
+    if verbose:
+        print(f"Benchmarking backends on {len(xyz_eval):,} points (repeats={repeats})")
+
+    report: Dict[str, Any] = {
+        "metadata": {
+            "n_points_original": int(len(xyz)),
+            "n_points_evaluated": int(len(xyz_eval)),
+            "sample_size": None if sample_size is None else int(sample_size),
+            "seed": int(seed),
+            "repeats": int(repeats),
+            "voxel_size": float(voxel_size),
+            "k_neighbors": int(k_neighbors),
+            "pgeof_scale": float(pgeof_scale),
+            "pgeof_max_knn": int(pgeof_max_knn),
+        },
+        "backends": {},
+        "comparisons": {},
+    }
+
+    first_run_features: Dict[str, GeometricFeatures] = {}
+
+    for backend in backends:
+        backend_name = backend.lower()
+        durations = []
+        error = None
+
+        for run_idx in range(repeats):
+            t0 = time.perf_counter()
+            try:
+                features, _, _ = compute_all_features_fast(
+                    xyz_eval,
+                    voxel_size=voxel_size,
+                    k_neighbors=k_neighbors,
+                    verbose=False,
+                    backend=backend_name,
+                    pgeof_scale=pgeof_scale,
+                    pgeof_max_knn=pgeof_max_knn,
+                )
+                if run_idx == 0:
+                    first_run_features[backend_name] = features
+            except Exception as exc:
+                error = str(exc)
+                break
+            durations.append(time.perf_counter() - t0)
+
+        if error is not None:
+            report["backends"][backend_name] = {
+                "ok": False,
+                "error": error,
+            }
+            continue
+
+        f0 = first_run_features[backend_name]
+        report["backends"][backend_name] = {
+            "ok": True,
+            "timing_seconds": {
+                "runs": [float(v) for v in durations],
+                "mean": float(np.mean(durations)),
+                "std": float(np.std(durations)),
+                "min": float(np.min(durations)),
+                "max": float(np.max(durations)),
+            },
+            "feature_summary": {
+                "verticality_mean": float(np.mean(f0.verticality)),
+                "linearity_mean": float(np.mean(f0.linearity)),
+                "planarity_mean": float(np.mean(f0.planarity)),
+                "sphericity_mean": float(np.mean(f0.sphericity)),
+            },
+        }
+
+    if {"voxel", "pgeof"}.issubset(first_run_features.keys()):
+        fv = first_run_features["voxel"]
+        fp = first_run_features["pgeof"]
+        report["comparisons"]["pgeof_vs_voxel_mae"] = {
+            "verticality": float(np.mean(np.abs(fp.verticality - fv.verticality))),
+            "linearity": float(np.mean(np.abs(fp.linearity - fv.linearity))),
+            "planarity": float(np.mean(np.abs(fp.planarity - fv.planarity))),
+            "sphericity": float(np.mean(np.abs(fp.sphericity - fv.sphericity))),
+        }
+
+    return report
 
 
 def compute_relative_features_fast(
