@@ -70,6 +70,10 @@ from .features import (
     benchmark_feature_backends,
     estimate_local_radius,
 )
+from .multiscale_features import (
+    MultiScaleGeometricFeatures,
+    compute_multiscale_geometric_features,
+)
 from .classifier import (
     ClassifierResult,
     TrainingData,
@@ -163,6 +167,8 @@ __all__ = [
     "compute_all_features_fast",
     "benchmark_feature_backends",
     "estimate_local_radius",
+    "MultiScaleGeometricFeatures",
+    "compute_multiscale_geometric_features",
     "ClassifierResult",
     "TrainingData",
     "SliceClassifierResult",
