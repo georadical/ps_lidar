@@ -74,6 +74,20 @@ from .multiscale_features import (
     MultiScaleGeometricFeatures,
     compute_multiscale_geometric_features,
 )
+from .component_features import (
+    ComponentFeatureTable,
+    ComponentGeometricRules,
+    ComponentFilterResult,
+    compute_component_feature_table,
+    filter_components_by_geometric_rules,
+    component_ids_to_point_mask,
+)
+from .stem_components import (
+    StemSeedResult,
+    StemComponentResult,
+    extract_stem_seed_mask,
+    label_stem_seed_components,
+)
 from .classifier import (
     ClassifierResult,
     TrainingData,
@@ -169,6 +183,16 @@ __all__ = [
     "estimate_local_radius",
     "MultiScaleGeometricFeatures",
     "compute_multiscale_geometric_features",
+    "ComponentFeatureTable",
+    "ComponentGeometricRules",
+    "ComponentFilterResult",
+    "compute_component_feature_table",
+    "filter_components_by_geometric_rules",
+    "component_ids_to_point_mask",
+    "StemSeedResult",
+    "StemComponentResult",
+    "extract_stem_seed_mask",
+    "label_stem_seed_components",
     "ClassifierResult",
     "TrainingData",
     "SliceClassifierResult",
