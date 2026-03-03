@@ -1,0 +1,419 @@
+﻿
+============================================================
+=== CELL 0 (markdown) ===
+============================================================
+# PS LiDAR - Development Playground
+
+**Available Bricks:**
+- Brick 1: Data Loading
+- Brick 2: Circular Clipping (manual coordinates)
+- Brick 3: Normalisation Analysis
+- Brick 4: Ground Filtering
+- Brick 5: Height Normalisation + Export Checkpoint
+- Brick 6: 3D Visualisation
+- Brick 7: **Trunk Extraction** (verticality + DBSCAN + PCA)
+- Brick 8: **Branch Extraction** (linearity + connectivity)
+- Brick 9: **Export & Visualisation**
+
+
+============================================================
+=== CELL 1 (code) ===
+============================================================
+import os
+import sys
+import time
+import numpy as np
+
+# Resolve project root
+project_root = os.path.abspath(os.path.join(os.getcwd(), '..'))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
+from src.core import (
+    PointCloudLoader,
+    clip_circular_plot,
+    detect_normalization,
+    classify_ground,
+    normalize_heights,
+    export_point_cloud,
+)
+
+print(f"Project root: {project_root}")
+print("All imports loaded successfully.")
+
+
+============================================================
+=== CELL 2 (code) ===
+============================================================
+FILE_PATH = "D:/LiDAR QAs/T460298_subsampled_laz1_4.laz"
+
+loader = PointCloudLoader(FILE_PATH)
+loader.load()
+
+meta = loader.get_metadata()
+print(f"File: {meta['filename']}")
+print(f"Points: {meta['point_count']:,}")
+print(f"Size: {meta['file_size_mb']} MB")
+
+============================================================
+=== CELL 3 (code) ===
+============================================================
+# Load XYZ and available scalar fields
+xyz_full = loader.get_xyz()
+
+scalar_fields = {}
+for field in ['intensity', 'return_number', 'number_of_returns', 'classification']:
+    try:
+        scalar_fields[field] = loader.get_attribute(field)
+        print(f" {field}: {len(scalar_fields[field]):,} values")
+    except:
+        print(f" {field}: not available")
+
+print(f"\nXYZ memory: {xyz_full.nbytes / (1024**2):.1f} MB")
+
+============================================================
+=== CELL 4 (markdown) ===
+============================================================
+---
+## 2. Circular Clipping (Brick 2)
+
+**Instructions:**
+1. Open the original file in CloudCompare
+2. Use the "Point Picking" tool to locate the mat centre
+3. Copy the Xg, Yg coordinates shown
+4. Paste the values into `CENTER_X` y `CENTER_Y` abajo
+
+============================================================
+=== CELL 5 (code) ===
+============================================================
+# 
+# USER PARAMETERS - Modificar seg·n el plot
+# 
+
+# Coordenadas del centro (obtenidas de CloudCompare Point Picking)
+CENTER_X = -0.311372
+CENTER_Y = -1.461118
+
+# Radio del plot en metros
+PLOT_RADIUS = 16.0
+
+# 
+
+print(f"Centro: ({CENTER_X:.6f}, {CENTER_Y:.6f})")
+print(f"Radio: {PLOT_RADIUS}m")
+
+============================================================
+=== CELL 6 (code) ===
+============================================================
+# Run circular clipping
+t0 = time.perf_counter()
+clip_result = clip_circular_plot(xyz_full, CENTER_X, CENTER_Y, PLOT_RADIUS)
+elapsed = time.perf_counter() - t0
+
+plot_indices = clip_result.indices
+
+print(f" Clipped in {elapsed*1000:.0f}ms")
+print(f"Original points: {len(xyz_full):,}")
+print(f"Points in plot: {clip_result.n_points:,} ({clip_result.n_points/len(xyz_full):.1%})")
+
+============================================================
+=== CELL 7 (code) ===
+============================================================
+# Apply clipping to XYZ and scalar fields
+xyz = xyz_full[plot_indices]
+
+plot_scalars = {}
+for field, values in scalar_fields.items():
+    plot_scalars[field] = values[plot_indices]
+
+print(f"Plot XYZ: {xyz.shape}")
+print(f"Scalar fields: {list(plot_scalars.keys())}")
+
+# Free memory
+del xyz_full, scalar_fields
+import gc; gc.collect()
+print(" Memory freed")
+
+============================================================
+=== CELL 8 (markdown) ===
+============================================================
+---
+## 3. Normalisation Analysis (Brick 3)
+
+============================================================
+=== CELL 9 (code) ===
+============================================================
+analysis = detect_normalization(xyz)
+print(f"Estatus: {analysis.status.value.upper()}")
+print(f"Normalised?: {analysis.is_normalized}")
+print(f"Rango Z: {analysis.z_min:.2f}m a {analysis.z_max:.2f}m")
+
+============================================================
+=== CELL 10 (markdown) ===
+============================================================
+---
+## 4. Ground Filtering (Brick 4)
+
+============================================================
+=== CELL 11 (code) ===
+============================================================
+from src.core.ground import classify_ground
+print("Running CSF...")
+t0 = time.perf_counter()
+
+ground_result = classify_ground(
+    xyz,
+    cloth_resolution=1.0,
+    rigidness=1,
+    class_threshold=0.5,
+    slope_smooth=True,
+)
+
+print(f" Completed in {time.perf_counter() - t0:.2f}s")
+print(f"Ground: {ground_result.n_ground:,} ({ground_result.ground_ratio:.1%})")
+print(f"Vegetation: {ground_result.n_off_ground:,}")
+# Extract ground and vegetation point clouds
+ground_xyz = xyz[ground_result.groun
+  ... (665 chars total)
+
+============================================================
+=== CELL 12 (code) ===
+============================================================
+# Separate ground and vegetation
+ground_xyz = xyz[ground_result.ground_indices]
+vegetation_xyz = xyz[ground_result.off_ground_indices]
+
+ground_scalars = {k: v[ground_result.ground_indices] for k, v in plot_scalars.items()}
+vegetation_scalars = {k: v[ground_result.off_ground_indices] for k, v in plot_scalars.items()}
+
+print(f"Ground: {len(ground_xyz):,} points")
+print(f"Vegetation: {len(vegetation_xyz):,} points")
+
+============================================================
+=== CELL 13 (markdown) ===
+============================================================
+---
+## 5. Height Normalisation (Brick 5)
+
+============================================================
+=== CELL 14 (code) ===
+============================================================
+print("Normalising heights...")
+t0 = time.perf_counter()
+
+veg_norm_result = normalize_heights(vegetation_xyz, ground_xyz, resolution=0.5)
+veg_normalized = veg_norm_result.xyz_normalized
+
+ground_norm_result = normalize_heights(ground_xyz, ground_xyz, resolution=0.5)
+ground_normalized = ground_norm_result.xyz_normalized
+
+print(f" Completed in {(time.perf_counter() - t0)*1000:.0f}ms")
+print(f"")
+print(f"Vegetation: Z = {veg_normalized[:, 2].min():.2f}m a {veg_normalized[:, 2].max():.2f}m")
+print(f"
+  ... (589 chars total)
+
+============================================================
+=== CELL 15 (markdown) ===
+============================================================
+---
+## 5.5 Export Checkpoint
+
+============================================================
+=== CELL 16 (code) ===
+============================================================
+# Output directory
+OUTPUT_DIR = Path("C:/Users/geoal/Documents/Work/LidarProcessing/LiDAR Cline/Data/raw")
+
+# Export vegetaci≤n
+veg_file = Path("C:/Users/geoal/Documents/Work/LidarProcessing/LiDAR Cline/Data/processed/HQP079_01_veg_normalized.laz")
+export_point_cloud(
+    veg_file,
+    veg_normalized,
+    intensity=vegetation_scalars.get('intensity'),
+    return_number=vegetation_scalars.get('return_number'),
+    number_of_returns=vegetation_scalars.get('number_of_returns'),
+    classification=v
+  ... (1145 chars total)
+
+============================================================
+=== CELL 17 (markdown) ===
+============================================================
+---
+## 6. 3D Visualisation (Brick 6)
+
+============================================================
+=== CELL 18 (code) ===
+============================================================
+import open3d as o3d
+import numpy as np
+
+pcd = o3d.geometry.PointCloud()
+pcd.points = o3d.utility.Vector3dVector(veg_normalized)
+
+# Colour by height
+z = veg_normalized[:, 2]
+z_scaled = (z - z.min()) / (z.max() - z.min() + 1e-6)
+colors = np.zeros((len(z_scaled), 3))
+colors[:, 0] = z_scaled
+colors[:, 1] = 1 - np.abs(2 * z_scaled - 1)
+colors[:, 2] = 1 - z_scaled
+pcd.colors = o3d.utility.Vector3dVector(colors)
+
+print(f"Nube: {len(pcd.points):,} points")
+
+============================================================
+=== CELL 19 (code) ===
+============================================================
+o3d.visualization.draw_geometries([pcd], window_name="Normalised Vegetation", width=1280, height=720)
+
+
+============================================================
+=== CELL 20 (markdown) ===
+============================================================
+---
+---
+# BRICK 7: Trunk Extraction
+
+**Pipeline** (dendromatics/3DFin):
+1. Extract horizontal stripe at breast height
+2. Voxelise and compute verticality (pgeof C++)
+3. DBSCAN clustering in 2D (XY)
+4. Iterative peeling
+5. PCA for tree axes
+6. Assign all points to the nearest axis
+
+**Field parameters** (measured before/after scanning):
+
+
+============================================================
+=== CELL 21 (code) ===
+============================================================
+# ==============================================================
+# BRICK 7: TRUNK EXTRACTION
+# ==============================================================
+
+from src.core.trunk_extraction import extract_trunks, TrunkExtractionConfig
+
+trunk_config = TrunkExtractionConfig(
+    # Field-measured parameters
+    dbh_min=0.10,        # metres
+    dbh_max=0.80,        # metres
+    tree_height_min=5.0, # metres
+    tree_height_max=35.0,# metres
+    # Algorithm parameters
+    stripe_lower=1.0,    # metr
+  ... (942 chars total)
+
+============================================================
+=== CELL 22 (code) ===
+============================================================
+# ==============================================================
+# BRICK 7 (cont): ASSIGN ALL POINTS TO TRUNKS
+# ==============================================================
+
+# Points not assigned to any trunk
+non_trunk_mask = trunk_result.labels == -1
+non_trunk_points = veg_normalized[non_trunk_mask]
+print(f"Non-trunk points: {len(non_trunk_points):,}")
+
+
+============================================================
+=== CELL 23 (markdown) ===
+============================================================
+---
+# BRICK 8: Branch Extraction
+
+**Pipeline:**
+1. Compute linearity (pgeof) on non-trunk points
+2. Filter by linearity threshold
+3. 26-neighbour connectivity graph
+4. Keep only components connected to trunks
+5. Filter by maximum branch length
+
+
+============================================================
+=== CELL 24 (code) ===
+============================================================
+# ==============================================================
+# BRICK 8: BRANCH EXTRACTION
+# ==============================================================
+
+from src.core.branch_extraction import extract_branches, BranchExtractionConfig
+
+branch_config = BranchExtractionConfig(
+    linearity_threshold=0.5,
+    max_branch_length=8.0,  # metres
+    voxel_size=0.05,         # metres
+    k_neighbors=15,
+)
+
+print(f"Branch extraction config: {branch_config}")
+print(f"Input non-trunk points: {len(non
+  ... (698 chars total)
+
+============================================================
+=== CELL 25 (markdown) ===
+============================================================
+---
+# BRICK 9: Export & Visualisation
+
+Exports separated clouds for validation in CloudCompare.
+
+
+============================================================
+=== CELL 26 (code) ===
+============================================================
+# ==============================================================
+# BRICK 9: EXPORT & VISUALISATION
+# ==============================================================
+
+from src.core.io import export_point_cloud
+from pathlib import Path
+
+output_dir = Path("output")
+output_dir.mkdir(exist_ok=True)
+
+# Export trunks
+export_point_cloud(output_dir / "trunks.laz", trunk_result.trunk_points)
+print(f"Exported trunks: {len(trunk_result.trunk_points):,} points")
+
+# Export branches
+export_point_cloud(output_di
+  ... (866 chars total)
+
+============================================================
+=== CELL 27 (markdown) ===
+============================================================
+### Visualisation (Open3D)
+
+
+============================================================
+=== CELL 28 (code) ===
+============================================================
+# ==============================================================
+# BRICK 9 (cont): 3D VISUALISATION
+# ==============================================================
+
+import open3d as o3d
+import numpy as np
+
+# Colour trunks brown, branches green
+trunk_colours = np.tile([0.6, 0.4, 0.2], (len(trunk_result.trunk_points), 1))
+branch_colours = np.tile([0.2, 0.7, 0.3], (len(branch_result.branch_points), 1))
+
+pcd = o3d.geometry.PointCloud()
+pcd.points = o3d.utility.Vector3dVector(wood)
+pcd.colors = o3d.
+  ... (639 chars total)
+
+============================================================
+=== CELL 29 (markdown) ===
+============================================================
+---
+## Next Steps
+
+- **Brick 10:** Per-tree analysis (DBH, height, sweep)
+- **Brick 11:** Fork detection
+- **Brick 12:** HQP classification of branches and spikes
+

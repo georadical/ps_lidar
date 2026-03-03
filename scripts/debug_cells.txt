@@ -1,0 +1,30 @@
+﻿python :   File "<string>", 
+line 1
+At line:1 char:1
++ python -c "import json; nb=j
+son.load(open('notebooks/01_pl
+ayground.ip ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~
+    + CategoryInfo          : 
+    NotSpecified: (  File "<  
+  string>", line 1:String)    
+ [], RemoteException
+    + FullyQualifiedErrorId : 
+    NativeCommandError
+ 
+    import json; nb=json.load(
+open('notebooks/01_playground.
+ipynb',encoding='utf-8')); 
+[print(f'--- Cell {i} 
+---\n{chr(10).join(c[" 
+source\][:5])}')
+                              
+                              
+                              
+                              
+          ^
+SyntaxError: unterminated 
+string literal (detected at 
+line 1)

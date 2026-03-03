@@ -1,0 +1,46 @@
+﻿Total cells: 29
+
+=== MARKDOWN CELLS ===
+[ 0] # PS LiDAR - Development Playground
+
+**Available Bricks:**
+- Brick 1: Data Loadi
+[ 3] ---
+## 2. Circular Clipping (Brick 2)
+
+**Instructions:**
+1. Open the original fi
+[ 7] ---
+## 3. Normalisation Analysis (Brick 3)
+[ 9] ---
+## 4. Ground Filtering (Brick 4)
+[12] ---
+## 5. Normalisation de Height (Brick 5)
+[14] ---
+## 5.5 Export Checkpoints
+[16] ---
+## 6. Visualisation 3D (Brick 6)
+[19] ---
+---
+# BRICK 7: Trunk Extraction
+
+**Pipeline** (dendromatics/3DFin):
+1. Extra
+[22] ---
+# BRICK 8: Branch Extraction
+
+**Pipeline:**
+1. Compute linearity (pgeof) on 
+[24] ---
+# BRICK 9: Export & Visualisation
+
+Exports separated clouds for validation i
+[26] ### Visualisation (Open3D)
+[28] ---
+## Next Steps
+
+- **Brick 10:** Per-tree analysis (DBH, height, sweep)
+- **Br
+
+=== SPANISH CHECK ===
+  All clean! No Spanish text remaining.

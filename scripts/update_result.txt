@@ -1,0 +1,12 @@
+﻿Original cell count: 57
+  Cut point found at cell [23]: 7. Geometrics features
+Cutting at cell index 23
+  Removing noise filter markdown cell [0]
+  Removing SOR code cell [1]
+  Removing noise filter markdown cell [9]
+  Removing SOR code cell [10]
+After cleanup: 19 cells
+Applied 24 text fixes
+
+Final cell count: 29
+Done!

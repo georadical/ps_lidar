@@ -1,0 +1,28 @@
+--- BRICK 1: Loading ---
+File: HQP079_01_raw.laz
+Points: 19,173,291
+Size: 209.63 MB
+Calling loader.get_xyz()...
+get_xyz() returned!
+ intensity: 19,173,291 values
+ return_number: 19,173,291 values
+ number_of_returns: 19,173,291 values
+ classification: 19,173,291 values
+
+XYZ memory: 219.4 MB
+
+--- BRICK 2: Clipping ---
+Autocalculated coords for test: 22.642525, 1.412430, r=25.0
+ Clipped in 374ms
+Original points: 19,173,291
+Points in plot: 8,797,347 (45.9%)
+Plot XYZ: (8797347, 3)
+Scalar fields: ['intensity', 'return_number', 'number_of_returns', 'classification']
+ Memory freed
+
+--- BRICK 3: Noise Filtering ---
+Applying SOR filter...
+Clean points: 8,426,928
+Removed noise points: 370,419
+
+Filtering completed in 54.2s
