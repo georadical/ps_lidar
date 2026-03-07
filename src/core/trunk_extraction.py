@@ -52,6 +52,15 @@ class TrunkExtractionConfig:
         max_axis_distance: Maximum distance from axis to assign a point.
         height_range: Proportion of the stripe height that a cluster must span.
         dbscan_eps: DBSCAN epsilon (auto-computed from voxel_resolution if None).
+
+    Cluster validation parameters (applied in the stripe before axis computation):
+        cluster_circularity_min: Minimum XY circularity (PCA eigenvalue ratio) for a
+            stripe cluster to be considered a valid trunk cross-section.
+        cluster_diameter_max_factor: Maximum cluster XY diameter as a multiple of dbh_max.
+            Clusters wider than this are rejected as understory.
+        cluster_min_height: Minimum height for clusters with small diameter.
+            Rejects regeneration saplings.
+        cluster_min_diameter: Minimum diameter for short clusters.
     """
     # Field parameters
     stripe_lower_limit: float = 0.7     # m
@@ -71,6 +80,12 @@ class TrunkExtractionConfig:
     max_axis_distance: float = 15.0     # m
     height_range: float = 0.7
     dbscan_eps: Optional[float] = None  # auto if None
+
+    # Cluster validation parameters
+    cluster_circularity_min: float = 0.3
+    cluster_diameter_max_factor: float = 1.5
+    cluster_min_height: float = 2.0     # m — min height for small trees
+    cluster_min_diameter: float = 0.05  # m — min diameter
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +178,89 @@ def _relabel_clusters(labels: np.ndarray) -> np.ndarray:
     for new_id, old_id in enumerate(unique_labels):
         relabeled[labels == old_id] = new_id
     return relabeled
+
+
+def _validate_stripe_clusters(
+    xyz: np.ndarray,
+    labels: np.ndarray,
+    config: 'TrunkExtractionConfig',
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Validate stripe clusters by cross-section geometry.
+
+    For each cluster in the stripe, fits a circle to the XY cross-section
+    and checks circularity + diameter. Invalid clusters (understory masses,
+    regeneration saplings) are rejected by setting their labels to -1.
+
+    This runs BEFORE axis computation, so rejected clusters never get axes
+    and their points are never assigned to trees.
+
+    Returns updated labels array with invalid clusters set to -1.
+    """
+    labels = labels.copy()
+    unique_labels = sorted(set(labels) - {-1})
+    max_diameter = config.dbh_max * config.cluster_diameter_max_factor
+    rejected = []
+
+    for lbl in unique_labels:
+        mask = labels == lbl
+        pts = xyz[mask]
+
+        # --- Cross-section analysis (XY) ---
+        xy = pts[:, :2]
+        centroid_xy = np.median(xy, axis=0)  # robust centre
+        centred = xy - centroid_xy
+
+        # PCA on XY for circularity
+        cov = np.cov(centred, rowvar=False)
+        eigenvalues = np.linalg.eigvalsh(cov)
+        eig_max = max(eigenvalues.max(), 1e-10)
+        eig_min = max(eigenvalues.min(), 0.0)
+        circularity = eig_min / eig_max
+
+        # Diameter estimate (2 * mean radial distance)
+        radii = np.linalg.norm(centred, axis=1)
+        diameter = 2.0 * np.mean(radii)
+
+        # Height span of this cluster
+        z_span = pts[:, 2].max() - pts[:, 2].min()
+
+        # --- Validation rules ---
+        reason = ""
+
+        # Rule 1: Too wide → understory mass
+        if diameter > max_diameter:
+            reason = f"too_wide: diam={diameter:.3f}m > {max_diameter:.3f}m"
+
+        # Rule 2: Too low circularity → irregular shape (understory)
+        elif circularity < config.cluster_circularity_min:
+            reason = f"not_circular: circ={circularity:.3f} < {config.cluster_circularity_min}"
+
+        # Rule 3: Small diameter + short height → regeneration
+        elif (diameter < config.cluster_min_diameter * 2
+              and z_span < config.cluster_min_height):
+            reason = (f"regeneration: diam={diameter:.3f}m, "
+                      f"h={z_span:.1f}m")
+
+        if reason:
+            labels[mask] = -1
+            rejected.append((lbl, reason))
+            if verbose:
+                print(f"    Cluster {lbl}: ✗ REJECTED ({reason}) "
+                      f"[{mask.sum()} pts]")
+        else:
+            if verbose:
+                print(f"    Cluster {lbl}: ✓ valid "
+                      f"(circ={circularity:.2f}, diam={diameter:.3f}m, "
+                      f"h={z_span:.1f}m) [{mask.sum()} pts]")
+
+    if verbose:
+        n_remaining = len(unique_labels) - len(rejected)
+        print(f"    Cluster validation: {len(unique_labels)} → {n_remaining} "
+              f"({len(rejected)} rejected)")
+
+    return labels
 
 
 def _compute_axes_pca(
@@ -444,6 +542,32 @@ def extract_trunks(
     current_points = current_points[valid]
     final_labels = final_labels[valid]
     final_labels = _relabel_clusters(final_labels)
+
+    # ======================================================================
+    # Step 7a: Validate stripe clusters (cross-section geometry)
+    # ======================================================================
+    if verbose:
+        print(f"  Cluster validation (cross-section geometry):")
+    final_labels = _validate_stripe_clusters(
+        current_points, final_labels, config, verbose=verbose,
+    )
+    # Remove rejected points and relabel
+    valid_after_validation = final_labels >= 0
+    current_points = current_points[valid_after_validation]
+    final_labels = final_labels[valid_after_validation]
+    final_labels = _relabel_clusters(final_labels)
+
+    if len(current_points) == 0:
+        if verbose:
+            print("  No valid clusters after validation")
+        return TrunkExtractionResult(
+            trunk_mask=np.zeros(n_total, dtype=bool),
+            tree_ids=np.full(n_total, -1, dtype=np.int32),
+            n_trees=0,
+            tree_axes=[],
+            cluster_points=np.empty((0, 3)),
+            config=config,
+        )
 
     # Compute PCA axes
     tree_axes = _compute_axes_pca(current_points, final_labels)
