@@ -1,338 +1,421 @@
 """
-Trunk validation — point-level cylinder scrubbing.
+Trunk Validation — Stem Cleaning + Sectioning (inspired by 3DFin).
 
-Instead of accepting/rejecting entire trees, this module SCRUBS each
-trunk point-by-point: for each tree, it slices the trunk into horizontal
-sections, fits a circle per section, and keeps only points that fall
-within the fitted radius + a small offset. Points outside are reclassified
-as non-trunk (branches/understory).
+This module implements the post-extraction refinement of trunk points:
 
-After scrubbing, trees with too few remaining trunk points or too short
-total height are removed entirely.
+Step 1: clean_stems()
+    Takes trunk_mask points and runs a SECOND verticality pass to remove
+    non-vertical material (branches, attached understory, foliage) that
+    survived the initial trunk extraction. This is 3DFin's Step 4.
 
-This approach:
-  - Cleans real trunks of attached understory/branches
-  - Does NOT remove entire trees (no neighbour damage)
-  - Residual understory-only trees shrink to ~0 points → filtered by count/height
+Step 2: compute_stem_sections()
+    Slices each cleaned stem into horizontal sections and fits circles
+    using least-squares optimisation (scipy.optimize.leastsq). Returns
+    per-section centres, radii, and quality metrics. This is 3DFin's Step 5.
+
+The output of Step 2 can later be used for:
+  - Per-section adaptive trunk mask refinement (Step 3, future)
+  - DAP estimation
+  - Taper curves
+  - Feature extraction (sweep, knots, fluting, etc.)
 """
 
 from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import numpy as np
+from scipy import optimize
 
+from src.core.features import voxelize_cloud, compute_verticality
 from src.core.trunk_extraction import TrunkExtractionResult
 
 
-@dataclass
-class TrunkScrubConfig:
-    """
-    Configuration for point-level trunk scrubbing.
-
-    section_height: Height of each horizontal slice (metres).
-    radius_offset: Extra radius beyond fitted circle to keep (metres).
-        Controls how aggressively to scrub. Larger = more permissive.
-    min_points_per_section: Minimum points to attempt circle fitting.
-        Sections with fewer points are kept as-is (no filtering).
-    min_trunk_points_after: Minimum trunk points remaining after scrubbing
-        for a tree to be kept.
-    min_trunk_height: Minimum vertical extent of remaining trunk points (metres).
-    dbh_max: Maximum expected trunk diameter (metres). Sections with fitted
-        diameter larger than this * safety_factor are fully cleaned.
-    safety_factor: Multiplier on dbh_max for absolute maximum diameter.
-    percentile: Percentile for robust radius estimation (default 75th).
-        Using percentile instead of mean avoids influence from outlier
-        understory points.
-    """
-    section_height: float = 1.0         # metres
-    radius_offset: float = 0.03         # metres (3cm tolerance)
-    min_points_per_section: int = 30
-    min_trunk_points_after: int = 200
-    min_trunk_height: float = 5.0       # metres
-    dbh_max: float = 0.80               # metres (from field)
-    safety_factor: float = 1.5
-    percentile: float = 75.0            # robust radius percentile
-
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 @dataclass
-class TreeScrubResult:
-    """Per-tree scrubbing diagnostics."""
-    tree_id: int
-    points_before: int
-    points_after: int
-    points_removed: int
-    n_sections: int
-    n_sections_scrubbed: int
-    section_radii: List[float]    # fitted radius per section
-    height_before: float
-    height_after: float
-    removed_entirely: bool
-    removal_reason: str           # "" if kept
+class StemCleaningConfig:
+    """
+    Configuration for stem cleaning and sectioning.
+
+    Verticality pass parameters:
+        verticality_threshold: Minimum verticality to keep a point as stem.
+        verticality_scale: Neighbourhood radius for PCA.
+        voxel_resolution_xy: Horizontal voxel size.
+        voxel_resolution_z: Vertical voxel size.
+
+    Sectioning parameters (like 3DFin):
+        section_len: Distance between section centres (metres).
+        section_wid: Half-width of each section slice (metres).
+            Points within [section_h - wid, section_h + wid] are used.
+        min_points_section: Minimum points for circle fitting.
+        r_min: Minimum valid fitted radius (metres).
+        r_max: Maximum valid fitted radius (metres).
+        n_sectors: Number of angular sectors for quality check.
+        min_sectors: Minimum occupied sectors for valid fit.
+        sector_width: Width around fitted circle to check sectors (metres).
+        inner_circle_ratio: Ratio for inner circle quality test.
+        max_inner_points: Maximum points in inner circle before flagging.
+        minimum_height: Lowest height for sections (metres).
+        maximum_height: Highest height for sections (metres).
+    """
+    # 2nd verticality pass
+    verticality_threshold: float = 0.7
+    verticality_scale: float = 0.1
+    voxel_resolution_xy: float = 0.02
+    voxel_resolution_z: float = 0.02
+
+    # Sectioning
+    section_len: float = 0.2       # distance between sections (m)
+    section_wid: float = 0.05      # half-width of section slice (m)
+    min_points_section: int = 80
+    r_min: float = 0.03            # minimum radius (m)
+    r_max: float = 0.50            # maximum radius (m)
+    n_sectors: int = 16
+    min_sectors: int = 9
+    sector_width: float = 0.02     # width around circle for sector check (m)
+    inner_circle_ratio: float = 0.5
+    max_inner_points: int = 5
+    minimum_height: float = 0.3    # lowest section (m)
+    maximum_height: float = 25.0   # highest section (m)
+    cluster_eps: float = 0.02      # DBSCAN eps for section clustering (m)
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class StemCleaningResult:
+    """Result of stem cleaning (2nd verticality pass)."""
+    stem_mask: np.ndarray         # (N,) bool — updated stem mask
+    n_points_before: int
+    n_points_after: int
+    n_points_removed: int
+    per_tree_stats: List[Dict[str, Any]]
 
 
 @dataclass
-class TrunkScrubResult:
-    """Result of trunk scrubbing."""
-    trunk_mask: np.ndarray           # (N,) bool — updated trunk mask
-    tree_ids: np.ndarray             # (N,) int — updated tree ids
-    n_trees_before: int
-    n_trees_after: int
-    n_trees_removed: int
-    total_points_before: int
-    total_points_after: int
-    total_points_scrubbed: int
-    removed_tree_ids: List[int]
-    tree_results: List[TreeScrubResult]
-    config: TrunkScrubConfig
+class SectionResult:
+    """Result of stem sectioning (circle fitting)."""
+    X_c: np.ndarray               # (n_trees, n_sections) X centres
+    Y_c: np.ndarray               # (n_trees, n_sections) Y centres
+    R: np.ndarray                  # (n_trees, n_sections) radii
+    check: np.ndarray             # (n_trees, n_sections) validity flag
+    sector_pct: np.ndarray        # (n_trees, n_sections) sector occupancy %
+    sections: np.ndarray          # (n_sections,) section heights
+    tree_ids: List[int]           # tree IDs in order
+    config: StemCleaningConfig
 
 
-def _project_to_perpendicular_plane(
-    points: np.ndarray,
-    axis_direction: np.ndarray,
-) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Step 1: Stem cleaning — 2nd verticality pass
+# ---------------------------------------------------------------------------
+
+def clean_stems(
+    xyz: np.ndarray,
+    trunk_result: TrunkExtractionResult,
+    config: StemCleaningConfig,
+    verbose: bool = True,
+) -> StemCleaningResult:
     """
-    Project 3D points onto the plane perpendicular to the axis direction.
-    Returns 2D coordinates in the plane.
-    """
-    axis = axis_direction / np.linalg.norm(axis_direction)
+    Clean trunk points with a second verticality pass.
 
-    if abs(axis[0]) < 0.9:
-        ref = np.array([1.0, 0.0, 0.0])
-    else:
-        ref = np.array([0.0, 1.0, 0.0])
+    For each tree, takes trunk_mask points and recomputes verticality.
+    Points below the threshold are removed from the trunk mask.
+    This removes branches, attached understory, and foliage that
+    survived the initial extraction.
 
-    u = ref - np.dot(ref, axis) * axis
-    u = u / np.linalg.norm(u)
-    v = np.cross(axis, u)
-
-    return np.column_stack([points @ u, points @ v])
-
-
-def _fit_circle_robust(
-    points_2d: np.ndarray,
-    percentile: float = 75.0,
-) -> Tuple[np.ndarray, float]:
-    """
-    Robust circle fit using median centre and percentile radius.
+    Args:
+        xyz: (N, 3) full height-normalised point cloud.
+        trunk_result: Output of extract_trunks().
+        config: Cleaning parameters.
+        verbose: Print progress.
 
     Returns:
-        centre_2d: (2,) estimated centre
-        radius: estimated radius at the given percentile
+        StemCleaningResult with updated stem_mask.
     """
-    # Use median as robust centre estimate (resistant to outliers)
-    centre = np.median(points_2d, axis=0)
+    trunk_mask = trunk_result.trunk_mask.copy()
+    tree_ids = trunk_result.tree_ids
+    n_before = int(trunk_mask.sum())
 
-    # Compute radial distances from centre
-    radii = np.linalg.norm(points_2d - centre, axis=1)
+    if verbose:
+        print(f"\nStem cleaning (2nd verticality pass):")
+        print(f"  Input: {n_before:,} trunk points")
+        print(f"  Verticality threshold: {config.verticality_threshold}")
+        print(f"  Scale: {config.verticality_scale}m")
 
-    # Use percentile radius — more robust than mean
-    # The 75th percentile captures the "shell" of the cylinder
-    # while being resistant to outlier understory points
-    radius = np.percentile(radii, percentile)
+    # Get all trunk points
+    trunk_indices = np.where(trunk_mask)[0]
+    trunk_pts = xyz[trunk_indices]
 
+    if len(trunk_pts) == 0:
+        return StemCleaningResult(
+            stem_mask=trunk_mask,
+            n_points_before=0, n_points_after=0, n_points_removed=0,
+            per_tree_stats=[],
+        )
+
+    # Compute verticality on trunk points
+    if verbose:
+        print(f"  Computing verticality on {len(trunk_pts):,} trunk points...")
+
+    vert = compute_verticality(
+        trunk_pts,
+        scale=config.verticality_scale,
+        voxel_resolution_xy=config.voxel_resolution_xy,
+        voxel_resolution_z=config.voxel_resolution_z,
+    )
+
+    # Filter by verticality threshold
+    vert_mask = vert >= config.verticality_threshold
+
+    # Remove non-vertical points from trunk mask
+    remove_indices = trunk_indices[~vert_mask]
+    trunk_mask[remove_indices] = False
+
+    n_after = int(trunk_mask.sum())
+
+    # Per-tree statistics
+    unique_trees = sorted(set(tree_ids[trunk_result.trunk_mask]) - {-1})
+    per_tree = []
+    for tid in unique_trees:
+        tree_before = trunk_result.trunk_mask & (tree_ids == tid)
+        tree_after = trunk_mask & (tree_ids == tid)
+        nb = int(tree_before.sum())
+        na = int(tree_after.sum())
+        pct = ((nb - na) / max(nb, 1)) * 100
+        per_tree.append({
+            "tree_id": tid,
+            "before": nb,
+            "after": na,
+            "removed": nb - na,
+            "pct_removed": pct,
+        })
+        if verbose:
+            print(f"    Tree {tid:3d}: {nb:,} → {na:,} pts (-{pct:.0f}%)")
+
+    if verbose:
+        print(f"  Summary: {n_before:,} → {n_after:,} "
+              f"({n_before - n_after:,} non-vertical points removed)")
+
+    return StemCleaningResult(
+        stem_mask=trunk_mask,
+        n_points_before=n_before,
+        n_points_after=n_after,
+        n_points_removed=n_before - n_after,
+        per_tree_stats=per_tree,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Circle fitting (least squares, like 3DFin/dendromatics)
+# ---------------------------------------------------------------------------
+
+def _fit_circle_ls(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, float]:
+    """
+    Fit a circle to 2D points using least-squares (scipy.optimize.leastsq).
+    Returns (centre_xy, mean_radius).
+    """
+    def _calc_R(X, Y, xc, yc):
+        return np.sqrt((X - xc)**2 + (Y - yc)**2)
+
+    def _residuals(c, X, Y):
+        Ri = _calc_R(X, Y, *c)
+        return Ri - Ri.mean()
+
+    x0 = np.array([X.mean(), Y.mean()])
+    centre, _ = optimize.leastsq(_residuals, x0, args=(X, Y), maxfev=2000)
+    radius = _calc_R(X, Y, *centre).mean()
     return centre, float(radius)
 
 
-def _scrub_single_tree(
-    trunk_points: np.ndarray,
-    global_indices: np.ndarray,
-    axis_direction: np.ndarray,
-    tree_id: int,
-    config: TrunkScrubConfig,
-) -> Tuple[np.ndarray, TreeScrubResult]:
+def _sector_occupancy(
+    X: np.ndarray, Y: np.ndarray,
+    xc: float, yc: float, R: float,
+    n_sectors: int, min_sectors: int, width: float,
+) -> Tuple[float, bool]:
     """
-    Scrub a single tree's trunk points section by section.
-
-    Returns:
-        keep_mask: boolean mask over the GLOBAL indices (True = keep as trunk)
-        result: diagnostics for this tree
+    Check sector occupancy around the fitted circle.
+    Returns (pct_occupied, is_valid).
     """
-    n_before = len(trunk_points)
-    z_min = trunk_points[:, 2].min()
-    z_max = trunk_points[:, 2].max()
-    height_before = z_max - z_min
+    X_red = X - xc
+    Y_red = Y - yc
+    radial = np.sqrt(X_red**2 + Y_red**2)
+    angular = np.arctan2(X_red, Y_red)
 
-    # Start with all points marked to keep
-    keep = np.ones(len(trunk_points), dtype=bool)
-    section_radii = []
-    n_scrubbed = 0
-    max_radius = (config.dbh_max * config.safety_factor) / 2.0
+    # Points near the circle
+    near = (radial > (R - width)) & (radial < (R + width))
+    if near.sum() == 0:
+        return 0.0, False
 
-    # Slice into horizontal sections
-    section_edges = np.arange(z_min, z_max, config.section_height)
+    sectors = np.floor(angular[near] / (2 * np.pi / n_sectors))
+    n_occupied = len(np.unique(sectors))
+    pct = n_occupied * 100 / n_sectors
+    return pct, n_occupied >= min_sectors
 
-    for z_low in section_edges:
-        z_high = z_low + config.section_height
-        section_mask = (trunk_points[:, 2] >= z_low) & (trunk_points[:, 2] < z_high)
-        n_section = section_mask.sum()
 
-        if n_section < config.min_points_per_section:
-            # Too few points for reliable fitting — keep all
-            continue
+def _inner_circle_count(
+    X: np.ndarray, Y: np.ndarray,
+    xc: float, yc: float, R: float, ratio: float,
+) -> int:
+    """Count points inside inner circle (radius * ratio)."""
+    dist = np.sqrt((X - xc)**2 + (Y - yc)**2)
+    return int(np.sum(dist < R * ratio))
 
-        section_pts = trunk_points[section_mask]
 
-        # Project onto plane perpendicular to tree axis
-        pts_2d = _project_to_perpendicular_plane(section_pts, axis_direction)
+def _point_clustering_largest(X: np.ndarray, Y: np.ndarray, eps: float):
+    """DBSCAN on XY, return points from largest cluster."""
+    from sklearn.cluster import DBSCAN
+    xy = np.column_stack([X, Y])
+    labels = DBSCAN(eps=eps, min_samples=3).fit_predict(xy)
+    if labels.max() < 0:
+        return X, Y
+    # Find largest cluster
+    unique, counts = np.unique(labels[labels >= 0], return_counts=True)
+    largest = unique[np.argmax(counts)]
+    mask = labels == largest
+    return X[mask], Y[mask]
 
-        # Robust circle fit
-        centre, radius = _fit_circle_robust(pts_2d, config.percentile)
 
-        # Clamp radius to maximum expected
-        radius = min(radius, max_radius)
-        section_radii.append(radius)
+def _fit_circle_check(
+    X: np.ndarray, Y: np.ndarray,
+    config: StemCleaningConfig,
+    is_retry: bool = False,
+) -> Tuple[float, float, float, int, float]:
+    """
+    Fit circle with quality checks (like 3DFin's fit_circle_check).
+    Returns (xc, yc, R, check_status, sector_pct).
 
-        # Keep only points within radius + offset
-        scrub_radius = radius + config.radius_offset
-        distances = np.linalg.norm(pts_2d - centre, axis=1)
-        outside = distances > scrub_radius
+    check_status: 0 = valid, 1 = checked (retry), 2 = not enough points
+    """
+    if len(X) < config.min_points_section:
+        return 0.0, 0.0, 0.0, 2, 0.0
 
-        if outside.any():
-            # Find which points in the section to remove
-            section_indices = np.where(section_mask)[0]
-            remove_indices = section_indices[outside]
-            keep[remove_indices] = False
-            n_scrubbed += 1
+    centre, R = _fit_circle_ls(X, Y)
+    xc, yc = centre
 
-    n_after = keep.sum()
-    points_removed = n_before - n_after
-
-    # Compute height of remaining points
-    if n_after > 0:
-        remaining_z = trunk_points[keep, 2]
-        height_after = remaining_z.max() - remaining_z.min()
-    else:
-        height_after = 0.0
-
-    # Check if tree should be removed entirely
-    removed = False
-    reason = ""
-    if n_after < config.min_trunk_points_after:
-        removed = True
-        reason = f"too_few_points={n_after}<{config.min_trunk_points_after}"
-        keep[:] = False
-    elif height_after < config.min_trunk_height:
-        removed = True
-        reason = f"too_short={height_after:.1f}<{config.min_trunk_height}"
-        keep[:] = False
-
-    result = TreeScrubResult(
-        tree_id=tree_id,
-        points_before=n_before,
-        points_after=int(keep.sum()),
-        points_removed=n_before - int(keep.sum()),
-        n_sections=len(section_edges),
-        n_sections_scrubbed=n_scrubbed,
-        section_radii=section_radii,
-        height_before=height_before,
-        height_after=height_after,
-        removed_entirely=removed,
-        removal_reason=reason,
+    n_inner = _inner_circle_count(X, Y, xc, yc, R, config.inner_circle_ratio)
+    sector_pct, sectors_ok = _sector_occupancy(
+        X, Y, xc, yc, R,
+        config.n_sectors, config.min_sectors, config.sector_width,
     )
 
-    return keep, result
+    # Check if fit is good
+    fit_bad = (
+        n_inner > config.max_inner_points
+        or R < config.r_min
+        or R > config.r_max
+        or not sectors_ok
+    )
+
+    if fit_bad and not is_retry:
+        # Retry with largest cluster
+        Xg, Yg = _point_clustering_largest(X, Y, config.cluster_eps)
+        if len(Xg) >= config.min_points_section:
+            return _fit_circle_check(Xg, Yg, config, is_retry=True)
+        else:
+            return 0.0, 0.0, 0.0, 1, 0.0
+
+    return xc, yc, R, (1 if is_retry else 0), sector_pct
 
 
-def scrub_trunks(
+# ---------------------------------------------------------------------------
+# Step 2: Compute sections (circle fitting per section, per tree)
+# ---------------------------------------------------------------------------
+
+def compute_stem_sections(
     xyz: np.ndarray,
-    trunk_result: TrunkExtractionResult,
-    config: TrunkScrubConfig,
-) -> TrunkScrubResult:
+    stem_mask: np.ndarray,
+    tree_ids: np.ndarray,
+    config: StemCleaningConfig,
+    verbose: bool = True,
+) -> SectionResult:
     """
-    Scrub trunk points using section-wise cylinder fitting.
+    Compute stem sections with circle fitting for each tree.
 
-    For each tree, slices trunk into horizontal sections. Per section,
-    fits a circle and keeps only points within the fitted radius + offset.
-    Points outside are reclassified as non-trunk.
-
-    After scrubbing, trees with too few remaining points or insufficient
-    height are removed entirely.
+    For each tree, slices the cleaned stem points into horizontal sections
+    and fits circles using least-squares. Returns per-section centres,
+    radii, and quality metrics.
 
     Args:
-        xyz: (N, 3) full point cloud (height-normalised).
-        trunk_result: Output of extract_trunks().
-        config: Scrubbing parameters.
+        xyz: (N, 3) full height-normalised point cloud.
+        stem_mask: (N,) boolean mask — cleaned stem points.
+        tree_ids: (N,) tree ID per point.
+        config: Sectioning parameters.
+        verbose: Print progress.
 
     Returns:
-        TrunkScrubResult with updated masks and per-tree diagnostics.
+        SectionResult with per-tree, per-section circle fits.
     """
-    print(f"\nTrunk scrubbing: {trunk_result.n_trees} trees")
-    print(f"  Section height: {config.section_height}m")
-    print(f"  Radius offset:  {config.radius_offset}m")
-    print(f"  Max radius:     {(config.dbh_max * config.safety_factor) / 2:.3f}m")
-    print(f"  Min points:     {config.min_trunk_points_after}")
-    print(f"  Min height:     {config.min_trunk_height}m")
+    sections = np.arange(
+        config.minimum_height,
+        config.maximum_height,
+        config.section_len,
+    )
+    n_sections = len(sections)
 
-    trunk_mask = trunk_result.trunk_mask.copy()
-    tree_ids = trunk_result.tree_ids.copy()
-    total_before = int(trunk_mask.sum())
+    # Get unique tree IDs from stem mask
+    unique_trees = sorted(set(tree_ids[stem_mask]) - {-1})
+    n_trees = len(unique_trees)
 
-    # Build axis lookup
-    axis_by_id = {}
-    for ax in trunk_result.tree_axes:
-        axis_by_id[ax["tree_id"]] = ax
+    if verbose:
+        print(f"\nStem sectioning:")
+        print(f"  Trees: {n_trees}")
+        print(f"  Sections: {n_sections} "
+              f"({config.minimum_height}m → {config.maximum_height}m, "
+              f"step={config.section_len}m, width=±{config.section_wid}m)")
 
-    tree_results = []
-    removed_ids = []
-    unique_trees = sorted(set(tree_ids[trunk_mask]) - {-1})
+    # Allocate output arrays
+    X_c = np.zeros((n_trees, n_sections))
+    Y_c = np.zeros((n_trees, n_sections))
+    R = np.zeros((n_trees, n_sections))
+    check = np.zeros((n_trees, n_sections))
+    sector_pct = np.zeros((n_trees, n_sections))
 
-    for tid in unique_trees:
-        # Get trunk points for this tree
-        tree_trunk_mask = trunk_mask & (tree_ids == tid)
-        global_indices = np.where(tree_trunk_mask)[0]
-        trunk_pts = xyz[global_indices]
+    for i, tid in enumerate(unique_trees):
+        # Get stem points for this tree
+        tree_mask = stem_mask & (tree_ids == tid)
+        tree_pts = xyz[tree_mask]
 
-        # Get axis direction
-        ax = axis_by_id.get(tid)
-        axis_dir = ax["direction"] if ax is not None else np.array([0, 0, 1.0])
+        n_valid = 0
+        radii_valid = []
 
-        # Scrub this tree
-        keep, result = _scrub_single_tree(
-            trunk_pts, global_indices, axis_dir, tid, config
-        )
-        tree_results.append(result)
+        for j, sh in enumerate(sections):
+            # Select points in this section slice
+            z_low = sh - config.section_wid
+            z_high = sh + config.section_wid
+            sec_mask = (tree_pts[:, 2] >= z_low) & (tree_pts[:, 2] < z_high)
 
-        # Apply scrubbing to global masks
-        remove_indices = global_indices[~keep]
-        if len(remove_indices) > 0:
-            trunk_mask[remove_indices] = False
+            sec_X = tree_pts[sec_mask, 0]
+            sec_Y = tree_pts[sec_mask, 1]
 
-        if result.removed_entirely:
-            # Also clear tree_ids for this tree
-            tree_ids[tree_ids == tid] = -1
-            removed_ids.append(tid)
+            # Fit circle with checks
+            xc, yc, r, chk, spct = _fit_circle_check(sec_X, sec_Y, config)
 
-        # Print summary per tree
-        pct = (result.points_removed / max(result.points_before, 1)) * 100
-        mean_r = np.mean(result.section_radii) if result.section_radii else 0
-        if result.removed_entirely:
-            print(f"  Tree {tid:3d}: ✗ REMOVED "
-                  f"({result.removal_reason})")
-        else:
-            print(f"  Tree {tid:3d}: ✓ scrubbed "
-                  f"{result.points_before:,} → {result.points_after:,} pts "
-                  f"(-{pct:.0f}%), "
-                  f"r̄={mean_r:.3f}m, "
-                  f"h={result.height_after:.1f}m")
+            X_c[i, j] = xc
+            Y_c[i, j] = yc
+            R[i, j] = r
+            check[i, j] = chk
+            sector_pct[i, j] = spct
 
-    total_after = int(trunk_mask.sum())
-    n_after = trunk_result.n_trees - len(removed_ids)
+            if r > 0:
+                n_valid += 1
+                radii_valid.append(r)
 
-    print(f"\n  Summary:")
-    print(f"    Trees:  {trunk_result.n_trees} → {n_after} "
-          f"({len(removed_ids)} removed)")
-    print(f"    Points: {total_before:,} → {total_after:,} "
-          f"({total_before - total_after:,} scrubbed)")
+        if verbose:
+            mean_r = np.mean(radii_valid) if radii_valid else 0
+            mean_d = mean_r * 2
+            print(f"    Tree {tid:3d}: {n_valid}/{n_sections} valid sections, "
+                  f"mean_diam={mean_d:.3f}m")
 
-    return TrunkScrubResult(
-        trunk_mask=trunk_mask,
-        tree_ids=tree_ids,
-        n_trees_before=trunk_result.n_trees,
-        n_trees_after=n_after,
-        n_trees_removed=len(removed_ids),
-        total_points_before=total_before,
-        total_points_after=total_after,
-        total_points_scrubbed=total_before - total_after,
-        removed_tree_ids=removed_ids,
-        tree_results=tree_results,
+    return SectionResult(
+        X_c=X_c,
+        Y_c=Y_c,
+        R=R,
+        check=check,
+        sector_pct=sector_pct,
+        sections=sections,
+        tree_ids=unique_trees,
         config=config,
     )

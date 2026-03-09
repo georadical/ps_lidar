@@ -13,21 +13,26 @@ for i, cell in enumerate(nb["cells"]):
         break
 
 if brick7_idx is None:
-    print("ERROR: Could not find trunk_config cell")
+    print("ERROR")
     exit(1)
 
-# Find the line with TrunkExtractionConfig and add cluster validation params
+# Check if adaptive params already present
 source = nb["cells"][brick7_idx]["source"]
+src_text = "".join(source)
+
+if "trunk_section_height" in src_text:
+    print("Adaptive params already present, skipping")
+    exit(0)
+
+# Insert adaptive trunk search params after cluster validation params
 new_source = []
 for line in source:
     new_source.append(line)
-    # After stem_search_radius line, add cluster validation params
-    if "stem_search_radius" in line and "STEM_SEARCH_RADIUS" in line:
-        new_source.append("    # ---- CLUSTER VALIDATION (rejects understory/regeneration) ----\n")
-        new_source.append("    cluster_circularity_min=0.3,       # min XY circularity\n")
-        new_source.append("    cluster_diameter_max_factor=1.5,    # max cluster diam = DBH_MAX * factor\n")
-        new_source.append("    cluster_min_height=2.0,             # min stripe height for small trees\n")
-        new_source.append("    cluster_min_diameter=0.05,           # min diameter (metres)\n")
+    if "cluster_min_diameter" in line:
+        new_source.append("    # ---- ADAPTIVE TRUNK SEARCH (per-tree, per-section) ----\n")
+        new_source.append("    trunk_section_height=0.3,          # metres — section height for radius fitting\n")
+        new_source.append("    radius_offset_pct=0.10,            # 10% outward offset\n")
+        new_source.append("    min_offset_abs=0.02,               # metres — minimum 2cm offset\n")
 
 nb["cells"][brick7_idx]["source"] = new_source
 nb["cells"][brick7_idx]["outputs"] = []
@@ -36,4 +41,4 @@ nb["cells"][brick7_idx]["execution_count"] = None
 with open(path, "w", encoding="utf-8") as f:
     json.dump(nb, f, indent=1, ensure_ascii=False)
 
-print(f"Done! Updated Brick 7 at cell {brick7_idx} with cluster validation params")
+print(f"Updated Brick 7 at cell {brick7_idx} with adaptive params")
