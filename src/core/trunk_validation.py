@@ -419,3 +419,107 @@ def compute_stem_sections(
         tree_ids=unique_trees,
         config=config,
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Tree-level filters (Height and Edge)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TreeFilterConfig:
+    """
+    Configuration for final tree-level filtering (Stage B & D).
+    
+    Parameters:
+        plot_center_x: X coordinate of plot centre.
+        plot_center_y: Y coordinate of plot centre.
+        max_distance_from_center: Maximum allowed distance from plot centre to 
+                                  tree centroid (metres) before it's considered an edge tree.
+    """
+    plot_center_x: float = 0.0
+    plot_center_y: float = 0.0
+    max_distance_from_center: float = 15.5  # Slightly less than plot radius to catch edge intersections
+
+
+@dataclass
+class TreeFilterResult:
+    """Result of final tree filtering."""
+    stem_mask: np.ndarray         # (N,) bool — updated stem mask with remaining valid trees
+    tree_ids: np.ndarray          # (N,) int — updated tree IDs (-1 for filtered)
+    n_trees_before: int
+    n_trees_after: int
+    n_trees_removed: int
+    trees_removed_edge: List[int]
+
+
+def filter_trees(
+    xyz: np.ndarray,
+    stem_mask: np.ndarray,
+    tree_ids: np.ndarray,
+    config: TreeFilterConfig,
+    verbose: bool = True,
+) -> TreeFilterResult:
+    """
+    Filter trees by distance from plot centre.
+    
+    Trees that are too far from the
+    centre (cut edge trees) are completely removed from the stem_mask and tree_ids.
+
+    Args:
+        xyz: (N, 3) full height-normalised point cloud.
+        stem_mask: (N,) boolean mask of cleaned stem points.
+        tree_ids: (N,) tree ID per point.
+        config: Filter parameters.
+        verbose: Print progress.
+
+    Returns:
+        TreeFilterResult with updated masks.
+    """
+    updated_stem_mask = stem_mask.copy()
+    updated_tree_ids = tree_ids.copy()
+    
+    unique_trees = sorted(set(tree_ids[stem_mask]) - {-1})
+    n_before = len(unique_trees)
+    
+    if verbose:
+        print(f"\nTree-level filtering:")
+        print(f"  Input: {n_before} trees")
+        print(f"  Max distance from centre ({config.plot_center_x:.2f}, {config.plot_center_y:.2f}): {config.max_distance_from_center}m")
+
+    removed_edge = []
+
+    
+    for tid in unique_trees:
+        tree_pts_mask = stem_mask & (tree_ids == tid)
+        x_vals = xyz[tree_pts_mask, 0]
+        y_vals = xyz[tree_pts_mask, 1]
+        
+        # 1. Edge filter
+        centroid_x = x_vals.mean()
+        centroid_y = y_vals.mean()
+        distance = np.sqrt((centroid_x - config.plot_center_x)**2 + (centroid_y - config.plot_center_y)**2)
+        
+        if distance > config.max_distance_from_center:
+            removed_edge.append(tid)
+            updated_stem_mask[tree_pts_mask] = False
+            updated_tree_ids[tree_pts_mask] = -1
+            if verbose:
+                print(f"    Tree {tid:3d}: ✗ REJECTED (edge tree: dist={distance:.1f}m > {config.max_distance_from_center}m)")
+            continue
+            
+        if verbose:
+            print(f"    Tree {tid:3d}: ✓ valid (dist={distance:.1f}m)")
+
+    n_after = len(unique_trees) - len(removed_edge)
+    
+    if verbose:
+        print(f"  Summary: {n_before} → {n_after} trees ({len(removed_edge)} edge)")
+
+    return TreeFilterResult(
+        stem_mask=updated_stem_mask,
+        tree_ids=updated_tree_ids,
+        n_trees_before=n_before,
+        n_trees_after=n_after,
+        n_trees_removed=n_before - n_after,
+        trees_removed_edge=removed_edge,
+    )
