@@ -180,6 +180,39 @@ def _relabel_clusters(labels: np.ndarray) -> np.ndarray:
     return relabeled
 
 
+def _summarize_cluster_geometry(xyz: np.ndarray) -> Dict[str, float]:
+    """Compute audit-friendly geometry metrics for a stripe cluster."""
+    if len(xyz) == 0:
+        return {
+            "stripe_points": 0,
+            "stripe_circularity": float("nan"),
+            "stripe_diameter": float("nan"),
+            "stripe_z_span": float("nan"),
+        }
+
+    xy = xyz[:, :2]
+    centroid_xy = np.median(xy, axis=0)
+    centred = xy - centroid_xy
+
+    if len(xy) < 2:
+        circularity = 0.0
+    else:
+        cov = np.cov(centred, rowvar=False)
+        eigenvalues = np.linalg.eigvalsh(np.atleast_2d(cov))
+        eig_max = max(float(eigenvalues.max()), 1e-10)
+        eig_min = max(float(eigenvalues.min()), 0.0)
+        circularity = eig_min / eig_max
+
+    radii = np.linalg.norm(centred, axis=1)
+
+    return {
+        "stripe_points": int(len(xyz)),
+        "stripe_circularity": float(circularity),
+        "stripe_diameter": float(2.0 * np.mean(radii)),
+        "stripe_z_span": float(xyz[:, 2].max() - xyz[:, 2].min()),
+    }
+
+
 def _validate_stripe_clusters(
     xyz: np.ndarray,
     labels: np.ndarray,
@@ -277,6 +310,7 @@ def _compute_axes_pca(
         mask = labels == lbl
         pts = xyz[mask]
         centroid = pts.mean(axis=0)
+        geometry = _summarize_cluster_geometry(pts)
 
         # PCA to get principal direction
         centered = pts - centroid
@@ -296,6 +330,7 @@ def _compute_axes_pca(
             "n_points": int(mask.sum()),
             "z_min": float(pts[:, 2].min()),
             "z_max": float(pts[:, 2].max()),
+            **geometry,
         })
     return axes
 

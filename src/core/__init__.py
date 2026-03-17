@@ -61,6 +61,10 @@ from .branch_extraction import (
     BranchExtractionResult,
     extract_branches,
 )
+from .trunk_audit import (
+    build_trunk_audit_table,
+    export_trunk_audit_table,
+)
 
 __all__ = [
     # I/O
@@ -118,4 +122,7 @@ __all__ = [
     "BranchExtractionConfig",
     "BranchExtractionResult",
     "extract_branches",
+    # Trunk audit
+    "build_trunk_audit_table",
+    "export_trunk_audit_table",
 ]
