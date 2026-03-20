@@ -5,7 +5,7 @@ This project now uses dependency profiles instead of a single oversized list.
 ## Files
 
 - `requirements/core.txt`: minimal runtime for core processing pipeline.
-- `requirements/ml.txt`: adds training-bank parquet support (`pyarrow`).
+- `requirements/ml.txt`: adds sample-bank parquet support (`pyarrow`) for the upcoming ML workflow.
 - `requirements/notebook.txt`: adds Jupyter + visualization stack.
 - `requirements/dev.txt`: full setup for development and tests.
 
@@ -17,7 +17,7 @@ Core runtime:
 pip install -r requirements/core.txt
 ```
 
-ML workflow:
+Sample-bank / ML workflow:
 
 ```bash
 pip install -r requirements/ml.txt

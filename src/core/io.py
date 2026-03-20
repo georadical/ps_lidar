@@ -388,6 +388,7 @@ def export_point_cloud(
     classification: Optional[np.ndarray] = None,
     return_number: Optional[np.ndarray] = None,
     number_of_returns: Optional[np.ndarray] = None,
+    extra_dimensions: Optional[Dict[str, np.ndarray]] = None,
     point_format: int = 0,
     compress: bool = True,
 ) -> Path:
@@ -401,6 +402,7 @@ def export_point_cloud(
         classification: Optional (N,) array of point classifications.
         return_number: Optional (N,) array of return numbers.
         number_of_returns: Optional (N,) array of total returns per pulse.
+        extra_dimensions: Optional mapping of scalar names to (N,) arrays.
         point_format: LAS point format ID (0-10). Default 0 for basic XYZ.
         compress: If True and path ends in .laz, compress output. Default True.
         
@@ -421,15 +423,25 @@ def export_point_cloud(
     if xyz.ndim != 2 or xyz.shape[1] < 3:
         raise ValueError(f"xyz must be (N, 3), got {xyz.shape}")
     
-    # Create header
     header = laspy.LasHeader(point_format=point_format, version="1.4")
-    
-    # Set scale and offset for precision
-    # Use offset [0,0,0] to preserve original coordinates
     header.scales = [0.001, 0.001, 0.001]  # 1mm precision
     header.offsets = [0.0, 0.0, 0.0]
-    
-    # Create LAS data
+
+    prepared_extra_dims: Dict[str, np.ndarray] = {}
+    if extra_dimensions is not None:
+        for name, values in extra_dimensions.items():
+            arr = np.asarray(values)
+            if arr.ndim != 1 or len(arr) != len(xyz):
+                raise ValueError(
+                    f"extra dimension '{name}' must be a 1D array of length {len(xyz)}, "
+                    f"got shape {arr.shape}"
+                )
+            dim_name = str(name)
+            header.add_extra_dim(
+                laspy.ExtraBytesParams(name=dim_name, type=np.float32)
+            )
+            prepared_extra_dims[dim_name] = arr.astype(np.float32, copy=False)
+
     las = laspy.LasData(header)
     las.x = xyz[:, 0]
     las.y = xyz[:, 1]
@@ -447,6 +459,9 @@ def export_point_cloud(
     
     if number_of_returns is not None:
         las.number_of_returns = number_of_returns.astype(np.uint8)
+
+    for name, values in prepared_extra_dims.items():
+        las[name] = values
     
     # Write file with explicit compression behavior
     is_laz = output_path.suffix.lower() == ".laz"

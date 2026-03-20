@@ -9,8 +9,10 @@ Features used in the pipeline:
 - Linearity:   identifies branches (linear structures, any orientation)
 """
 
-from typing import Tuple, Optional
+import math
+from typing import Tuple
 import numpy as np
+from scipy.spatial import cKDTree
 
 try:
     import pgeof
@@ -18,6 +20,11 @@ try:
     _HAS_PGEOF = True
 except ImportError:
     _HAS_PGEOF = False
+
+
+_MIN_NEIGHBORS = 5
+_NEIGHBORHOOD_FACTOR = 3.0
+_EPS = 1e-12
 
 
 # ---------------------------------------------------------------------------
@@ -233,3 +240,150 @@ def compute_wood_features(
         print(f"  Linearity:   mean={lin.mean():.3f}, p95={np.percentile(lin, 95):.3f}")
 
     return vert, lin
+
+
+def _compute_local_shape_features(
+    centroids: np.ndarray,
+    counts: np.ndarray,
+    voxel_size: float,
+) -> dict[str, np.ndarray]:
+    """
+    Compute local PCA shape features on voxel centroids and reproject later.
+
+    This mirrors the geometry used by the sample-bank builder so the exported
+    Brick 7 features and the future ML dataset are consistent.
+    """
+    n_voxels = len(centroids)
+    if n_voxels == 0:
+        empty = np.array([], dtype=np.float64)
+        return {
+            "planarity": empty,
+            "sphericity": empty,
+            "anisotropy": empty,
+            "surface_variation": empty,
+            "roughness": empty,
+            "neighbor_count": empty,
+            "volume_density": empty,
+        }
+
+    radius = max(voxel_size * _NEIGHBORHOOD_FACTOR, voxel_size + 0.05)
+    sphere_volume = (4.0 / 3.0) * math.pi * (radius**3)
+    tree = cKDTree(centroids)
+
+    planarity = np.zeros(n_voxels, dtype=np.float64)
+    sphericity = np.zeros(n_voxels, dtype=np.float64)
+    anisotropy = np.zeros(n_voxels, dtype=np.float64)
+    surface_variation = np.zeros(n_voxels, dtype=np.float64)
+    roughness = np.zeros(n_voxels, dtype=np.float64)
+    neighbor_count = np.zeros(n_voxels, dtype=np.float64)
+    volume_density = np.zeros(n_voxels, dtype=np.float64)
+
+    k_fallback = min(max(_MIN_NEIGHBORS, 3), n_voxels)
+
+    for idx in range(n_voxels):
+        neighbor_ids = tree.query_ball_point(centroids[idx], radius)
+        if len(neighbor_ids) < _MIN_NEIGHBORS and k_fallback > 0:
+            _, knn_ids = tree.query(centroids[idx], k=k_fallback)
+            neighbor_ids = np.atleast_1d(knn_ids).astype(np.int64).tolist()
+
+        neighbor_ids = sorted(set(int(i) for i in neighbor_ids))
+        local_xyz = centroids[neighbor_ids]
+        local_counts = counts[neighbor_ids]
+
+        neighbor_count[idx] = float(len(neighbor_ids))
+        volume_density[idx] = float(np.sum(local_counts) / max(sphere_volume, _EPS))
+
+        if len(local_xyz) < 3:
+            continue
+
+        centered = local_xyz - np.mean(local_xyz, axis=0, keepdims=True)
+        cov = np.cov(centered, rowvar=False, bias=True)
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        eigvals = np.clip(eigvals, a_min=0.0, a_max=None)
+        lam1, lam2, lam3 = eigvals[::-1]
+
+        if lam1 > _EPS:
+            planarity[idx] = float((lam2 - lam3) / lam1)
+            sphericity[idx] = float(lam3 / lam1)
+            anisotropy[idx] = float((lam1 - lam3) / lam1)
+
+        lam_sum = lam1 + lam2 + lam3
+        if lam_sum > _EPS:
+            surface_variation[idx] = float(lam3 / lam_sum)
+
+        normal = eigvecs[:, 0]
+        distances = centered @ normal
+        roughness[idx] = float(np.sqrt(np.mean(distances**2)))
+
+    return {
+        "planarity": planarity,
+        "sphericity": sphericity,
+        "anisotropy": anisotropy,
+        "surface_variation": surface_variation,
+        "roughness": roughness,
+        "neighbor_count": neighbor_count,
+        "volume_density": volume_density,
+    }
+
+
+def compute_exportable_geometry_features(
+    xyz: np.ndarray,
+    scale: float = 0.1,
+    max_knn: int = 50000,
+    voxel_resolution_xy: float = 0.05,
+    voxel_resolution_z: float = 0.05,
+    verbose: bool = False,
+) -> dict[str, np.ndarray]:
+    """
+    Compute a consistent set of pointwise geometric features for export.
+
+    The shape features are computed on voxel centroids and then reprojected to
+    the original points through the voxel mapping.
+    """
+    if xyz.ndim != 2 or xyz.shape[1] < 3:
+        raise ValueError(f"xyz must be (N, 3), got {xyz.shape}")
+
+    n_points = len(xyz)
+    if n_points == 0:
+        empty = np.array([], dtype=np.float64)
+        return {
+            "verticality": empty,
+            "linearity": empty,
+            "planarity": empty,
+            "sphericity": empty,
+            "anisotropy": empty,
+            "surface_variation": empty,
+            "roughness": empty,
+            "neighbor_count": empty,
+            "volume_density": empty,
+        }
+
+    verticality, linearity = compute_wood_features(
+        xyz,
+        scale=scale,
+        max_knn=max_knn,
+        voxel_resolution_xy=voxel_resolution_xy,
+        voxel_resolution_z=voxel_resolution_z,
+        verbose=verbose,
+    )
+
+    centroids, point_to_voxel, n_voxels = voxelize_cloud(
+        xyz,
+        resolution_xy=voxel_resolution_xy,
+        resolution_z=voxel_resolution_z,
+    )
+    voxel_counts = np.bincount(point_to_voxel, minlength=n_voxels)
+    shape_features = _compute_local_shape_features(
+        centroids,
+        voxel_counts,
+        max(voxel_resolution_xy, voxel_resolution_z),
+    )
+
+    exportable = {
+        "verticality": verticality.astype(np.float64, copy=False),
+        "linearity": linearity.astype(np.float64, copy=False),
+    }
+    for name, voxel_values in shape_features.items():
+        exportable[name] = voxel_values[point_to_voxel]
+
+    return exportable

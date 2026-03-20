@@ -50,6 +50,7 @@ from .features import (
     compute_verticality as compute_verticality_pgeof,
     compute_linearity,
     compute_wood_features,
+    compute_exportable_geometry_features,
 )
 from .trunk_extraction import (
     TrunkExtractionConfig,
@@ -64,6 +65,14 @@ from .branch_extraction import (
 from .trunk_audit import (
     build_trunk_audit_table,
     export_trunk_audit_table,
+)
+from .sample_bank import (
+    SampleBankBuildResult,
+    SampleBankFileReport,
+    build_sample_bank,
+    split_sample_bank_by_plot,
+    save_sample_splits,
+    reports_to_dataframe,
 )
 
 __all__ = [
@@ -114,6 +123,7 @@ __all__ = [
     "compute_verticality_pgeof",
     "compute_linearity",
     "compute_wood_features",
+    "compute_exportable_geometry_features",
     # Trunk extraction (Brick 7)
     "TrunkExtractionConfig",
     "TrunkExtractionResult",
@@ -125,4 +135,11 @@ __all__ = [
     # Trunk audit
     "build_trunk_audit_table",
     "export_trunk_audit_table",
+    # Sample bank
+    "SampleBankBuildResult",
+    "SampleBankFileReport",
+    "build_sample_bank",
+    "split_sample_bank_by_plot",
+    "save_sample_splits",
+    "reports_to_dataframe",
 ]
