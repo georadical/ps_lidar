@@ -20,8 +20,8 @@ The output of Step 2 can later be used for:
   - Feature extraction (sweep, knots, fluting, etc.)
 """
 
-from dataclasses import dataclass
-from typing import List, Dict, Any, Tuple, Optional
+from dataclasses import dataclass, replace
+from typing import List, Dict, Any, Tuple, Optional, Literal
 import numpy as np
 from scipy import optimize
 
@@ -80,6 +80,15 @@ class StemCleaningConfig:
     maximum_height: float = 25.0   # highest section (m)
     cluster_eps: float = 0.02      # DBSCAN eps for section clustering (m)
 
+    # Execution mode
+    mode: Literal["global", "suspicious_only"] = "global"
+    suspicious_axis_tilt_deg: float = 10.0
+    suspicious_stripe_circularity_max: float = 0.45
+    suspicious_trunk_to_stripe_ratio_min: float = 10.0
+    suspicious_point_count_min: int = 25_000
+    global_fallback_point_ratio: float = 0.60
+    global_fallback_tree_ratio: float = 0.50
+
 
 # ---------------------------------------------------------------------------
 # Result dataclasses
@@ -93,6 +102,11 @@ class StemCleaningResult:
     n_points_after: int
     n_points_removed: int
     per_tree_stats: List[Dict[str, Any]]
+    mode_used: str = "global"
+    n_trees_processed: int = 0
+    n_trees_skipped: int = 0
+    n_points_processed_verticality: int = 0
+    used_global_fallback: bool = False
 
 
 @dataclass
@@ -112,51 +126,124 @@ class SectionResult:
 # Step 1: Stem cleaning — 2nd verticality pass
 # ---------------------------------------------------------------------------
 
-def clean_stems(
+def _axis_tilt_deg(direction: np.ndarray) -> float:
+    """Angle between an axis direction and the global vertical axis."""
+    direction = np.asarray(direction, dtype=np.float64)
+    norm = np.linalg.norm(direction)
+    if norm <= 1e-12:
+        return 90.0
+    direction = direction / norm
+    vertical_alignment = np.clip(abs(direction[2]), 0.0, 1.0)
+    return float(np.degrees(np.arccos(vertical_alignment)))
+
+
+def _unique_tree_ids(tree_ids: np.ndarray, stem_mask: np.ndarray) -> List[int]:
+    """Sorted tree IDs present in a stem mask."""
+    return sorted(set(tree_ids[stem_mask]) - {-1})
+
+
+def _build_per_tree_stats(
+    tree_ids: np.ndarray,
+    stem_mask_before: np.ndarray,
+    stem_mask_after: np.ndarray,
+    unique_trees: List[int],
+) -> List[Dict[str, Any]]:
+    """Build per-tree before/after cleaning statistics."""
+    per_tree = []
+    for tid in unique_trees:
+        tree_before = stem_mask_before & (tree_ids == tid)
+        tree_after = stem_mask_after & (tree_ids == tid)
+        n_before = int(tree_before.sum())
+        n_after = int(tree_after.sum())
+        pct_removed = ((n_before - n_after) / max(n_before, 1)) * 100.0
+        per_tree.append(
+            {
+                "tree_id": tid,
+                "before": n_before,
+                "after": n_after,
+                "removed": n_before - n_after,
+                "pct_removed": pct_removed,
+            }
+        )
+    return per_tree
+
+
+def _score_suspicious_trees(
+    trunk_mask: np.ndarray,
+    tree_ids: np.ndarray,
+    tree_axes: List[Dict[str, Any]],
+    config: StemCleaningConfig,
+) -> Tuple[List[int], int, int, List[int]]:
+    """
+    Select trees that justify a second verticality pass.
+
+    Returns:
+        suspicious_tree_ids, suspicious_points, total_trunk_points, unique_tree_ids
+    """
+    unique_trees = _unique_tree_ids(tree_ids, trunk_mask)
+    axis_by_tid = {int(axis["tree_id"]): axis for axis in tree_axes}
+
+    suspicious_tree_ids: List[int] = []
+    suspicious_points = 0
+    total_trunk_points = int(trunk_mask.sum())
+
+    for tid in unique_trees:
+        before_points = int(np.sum(trunk_mask & (tree_ids == tid)))
+        axis = axis_by_tid.get(tid, {})
+        stripe_circularity = float(axis.get("stripe_circularity", np.nan))
+        stripe_points = int(axis.get("stripe_points", axis.get("n_points", 0)))
+        trunk_to_stripe_ratio = float(before_points / max(stripe_points, 1))
+        axis_tilt = _axis_tilt_deg(axis.get("direction", np.array([0.0, 0.0, 1.0])))
+
+        is_suspicious = (
+            axis_tilt > config.suspicious_axis_tilt_deg
+            or (np.isfinite(stripe_circularity) and stripe_circularity < config.suspicious_stripe_circularity_max)
+            or trunk_to_stripe_ratio > config.suspicious_trunk_to_stripe_ratio_min
+            or before_points >= config.suspicious_point_count_min
+        )
+        if is_suspicious:
+            suspicious_tree_ids.append(tid)
+            suspicious_points += before_points
+
+    return suspicious_tree_ids, suspicious_points, total_trunk_points, unique_trees
+
+
+def _clean_stems_global(
     xyz: np.ndarray,
     trunk_result: TrunkExtractionResult,
     config: StemCleaningConfig,
     verbose: bool = True,
 ) -> StemCleaningResult:
-    """
-    Clean trunk points with a second verticality pass.
-
-    For each tree, takes trunk_mask points and recomputes verticality.
-    Points below the threshold are removed from the trunk mask.
-    This removes branches, attached understory, and foliage that
-    survived the initial extraction.
-
-    Args:
-        xyz: (N, 3) full height-normalised point cloud.
-        trunk_result: Output of extract_trunks().
-        config: Cleaning parameters.
-        verbose: Print progress.
-
-    Returns:
-        StemCleaningResult with updated stem_mask.
-    """
+    """Reference implementation: apply the second verticality pass to all trunk points."""
     trunk_mask = trunk_result.trunk_mask.copy()
     tree_ids = trunk_result.tree_ids
     n_before = int(trunk_mask.sum())
+    unique_trees = _unique_tree_ids(tree_ids, trunk_result.trunk_mask)
 
     if verbose:
         print(f"\nStem cleaning (2nd verticality pass):")
+        print("  Mode: global")
         print(f"  Input: {n_before:,} trunk points")
         print(f"  Verticality threshold: {config.verticality_threshold}")
         print(f"  Scale: {config.verticality_scale}m")
 
-    # Get all trunk points
     trunk_indices = np.where(trunk_mask)[0]
     trunk_pts = xyz[trunk_indices]
 
     if len(trunk_pts) == 0:
         return StemCleaningResult(
             stem_mask=trunk_mask,
-            n_points_before=0, n_points_after=0, n_points_removed=0,
+            n_points_before=0,
+            n_points_after=0,
+            n_points_removed=0,
             per_tree_stats=[],
+            mode_used="global",
+            n_trees_processed=0,
+            n_trees_skipped=0,
+            n_points_processed_verticality=0,
+            used_global_fallback=False,
         )
 
-    # Compute verticality on trunk points
     if verbose:
         print(f"  Computing verticality on {len(trunk_pts):,} trunk points...")
 
@@ -167,37 +254,23 @@ def clean_stems(
         voxel_resolution_z=config.voxel_resolution_z,
     )
 
-    # Filter by verticality threshold
     vert_mask = vert >= config.verticality_threshold
-
-    # Remove non-vertical points from trunk mask
     remove_indices = trunk_indices[~vert_mask]
     trunk_mask[remove_indices] = False
 
     n_after = int(trunk_mask.sum())
-
-    # Per-tree statistics
-    unique_trees = sorted(set(tree_ids[trunk_result.trunk_mask]) - {-1})
-    per_tree = []
-    for tid in unique_trees:
-        tree_before = trunk_result.trunk_mask & (tree_ids == tid)
-        tree_after = trunk_mask & (tree_ids == tid)
-        nb = int(tree_before.sum())
-        na = int(tree_after.sum())
-        pct = ((nb - na) / max(nb, 1)) * 100
-        per_tree.append({
-            "tree_id": tid,
-            "before": nb,
-            "after": na,
-            "removed": nb - na,
-            "pct_removed": pct,
-        })
-        if verbose:
-            print(f"    Tree {tid:3d}: {nb:,} → {na:,} pts (-{pct:.0f}%)")
+    per_tree = _build_per_tree_stats(tree_ids, trunk_result.trunk_mask, trunk_mask, unique_trees)
 
     if verbose:
-        print(f"  Summary: {n_before:,} → {n_after:,} "
-              f"({n_before - n_after:,} non-vertical points removed)")
+        for row in per_tree:
+            print(
+                f"    Tree {row['tree_id']:3d}: {row['before']:,} → {row['after']:,} "
+                f"pts (-{row['pct_removed']:.0f}%)"
+            )
+        print(
+            f"  Summary: {n_before:,} → {n_after:,} "
+            f"({n_before - n_after:,} non-vertical points removed)"
+        )
 
     return StemCleaningResult(
         stem_mask=trunk_mask,
@@ -205,6 +278,123 @@ def clean_stems(
         n_points_after=n_after,
         n_points_removed=n_before - n_after,
         per_tree_stats=per_tree,
+        mode_used="global",
+        n_trees_processed=len(unique_trees),
+        n_trees_skipped=0,
+        n_points_processed_verticality=len(trunk_pts),
+        used_global_fallback=False,
+    )
+
+
+def clean_stems(
+    xyz: np.ndarray,
+    trunk_result: TrunkExtractionResult,
+    config: StemCleaningConfig,
+    verbose: bool = True,
+) -> StemCleaningResult:
+    """
+    Clean trunk points with a second verticality pass.
+
+    In `global` mode the second pass runs on all trunk points.
+    In `suspicious_only` mode it runs only on trees marked as suspicious,
+    with an automatic fallback to the global path if the plot is mostly
+    suspicious anyway.
+    """
+    if config.mode == "global":
+        return _clean_stems_global(xyz, trunk_result, config, verbose=verbose)
+
+    if config.mode != "suspicious_only":
+        raise ValueError(f"Unsupported stem cleaning mode: {config.mode}")
+
+    trunk_mask_before = trunk_result.trunk_mask.copy()
+    tree_ids = trunk_result.tree_ids
+    n_before = int(trunk_mask_before.sum())
+
+    suspicious_ids, suspicious_points, total_trunk_points, unique_trees = _score_suspicious_trees(
+        trunk_mask_before,
+        tree_ids,
+        trunk_result.tree_axes,
+        config,
+    )
+
+    tree_ratio = len(suspicious_ids) / max(len(unique_trees), 1)
+    point_ratio = suspicious_points / max(total_trunk_points, 1)
+    use_global_fallback = (
+        point_ratio > config.global_fallback_point_ratio
+        or tree_ratio > config.global_fallback_tree_ratio
+    )
+
+    if use_global_fallback:
+        if verbose:
+            print("\nStem cleaning (2nd verticality pass):")
+            print("  Mode request: suspicious_only")
+            print(
+                f"  Fallback to global: suspicious trees={len(suspicious_ids)}/{len(unique_trees)}, "
+                f"suspicious points={suspicious_points:,}/{total_trunk_points:,}"
+            )
+        return replace(
+            _clean_stems_global(xyz, trunk_result, config, verbose=verbose),
+            used_global_fallback=True,
+        )
+
+    trunk_mask_after = trunk_mask_before.copy()
+
+    if verbose:
+        print("\nStem cleaning (2nd verticality pass):")
+        print("  Mode: suspicious_only")
+        print(f"  Input: {n_before:,} trunk points")
+        print(f"  Verticality threshold: {config.verticality_threshold}")
+        print(f"  Scale: {config.verticality_scale}m")
+        print(f"  Suspicious trees: {len(suspicious_ids)}/{len(unique_trees)}")
+        print(f"  Suspicious points: {suspicious_points:,}/{total_trunk_points:,}")
+
+    processed_points = 0
+    for tid in suspicious_ids:
+        tree_mask = trunk_mask_before & (tree_ids == tid)
+        tree_indices = np.where(tree_mask)[0]
+        tree_pts = xyz[tree_indices]
+        if len(tree_pts) == 0:
+            continue
+
+        processed_points += len(tree_pts)
+        if verbose:
+            print(f"  Computing verticality on tree {tid} ({len(tree_pts):,} pts)...")
+
+        vert = compute_verticality(
+            tree_pts,
+            scale=config.verticality_scale,
+            voxel_resolution_xy=config.voxel_resolution_xy,
+            voxel_resolution_z=config.voxel_resolution_z,
+        )
+        keep_mask = vert >= config.verticality_threshold
+        remove_indices = tree_indices[~keep_mask]
+        trunk_mask_after[remove_indices] = False
+
+    n_after = int(trunk_mask_after.sum())
+    per_tree = _build_per_tree_stats(tree_ids, trunk_mask_before, trunk_mask_after, unique_trees)
+
+    if verbose:
+        for row in per_tree:
+            print(
+                f"    Tree {row['tree_id']:3d}: {row['before']:,} -> {row['after']:,} "
+                f"pts (-{row['pct_removed']:.0f}%)"
+            )
+        print(
+            f"  Summary: {n_before:,} -> {n_after:,} "
+            f"({n_before - n_after:,} non-vertical points removed)"
+        )
+
+    return StemCleaningResult(
+        stem_mask=trunk_mask_after,
+        n_points_before=n_before,
+        n_points_after=n_after,
+        n_points_removed=n_before - n_after,
+        per_tree_stats=per_tree,
+        mode_used="suspicious_only",
+        n_trees_processed=len(suspicious_ids),
+        n_trees_skipped=len(unique_trees) - len(suspicious_ids),
+        n_points_processed_verticality=processed_points,
+        used_global_fallback=False,
     )
 
 
