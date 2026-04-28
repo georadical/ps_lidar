@@ -4,6 +4,9 @@ Trunk Validation — Stem Cleaning + Sectioning (inspired by 3DFin).
 This module implements the post-extraction refinement of trunk points:
 
 Step 1: clean_stems()
+    Includes optional fine-grained profiling (emitted via verbose mode and
+    stored in StemCleaningResult.profile) to diagnose runtime bottlenecks.
+
     Takes trunk_mask points and runs a SECOND verticality pass to remove
     non-vertical material (branches, attached understory, foliage) that
     survived the initial trunk extraction. This is 3DFin's Step 4.
@@ -20,12 +23,18 @@ The output of Step 2 can later be used for:
   - Feature extraction (sweep, knots, fluting, etc.)
 """
 
-from dataclasses import dataclass, replace
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field, replace
 from typing import List, Dict, Any, Tuple, Optional, Literal
 import numpy as np
 from scipy import optimize
 
-from src.core.features import voxelize_cloud, compute_verticality
+from src.core.features import (
+    voxelize_cloud,
+    compute_verticality,
+    compute_verticality_mask_early_exit,
+)
 from src.core.trunk_extraction import TrunkExtractionResult
 
 
@@ -64,6 +73,12 @@ class StemCleaningConfig:
     verticality_scale: float = 0.1
     voxel_resolution_xy: float = 0.02
     voxel_resolution_z: float = 0.02
+    # Coarser voxel resolution for the 2nd verticality pass (clean_stems).
+    # Set to e.g. 0.04 for ~1.2× speedup (but ~0.5% mask difference).
+    # Defaults to None → reuses the primary voxel_resolution_xy / _z values
+    # for exact output equivalence with the pre-optimisation behaviour.
+    voxel_resolution_xy_2nd: Optional[float] = None
+    voxel_resolution_z_2nd: Optional[float] = None
 
     # Sectioning
     section_len: float = 0.2       # distance between sections (m)
@@ -89,6 +104,28 @@ class StemCleaningConfig:
     global_fallback_point_ratio: float = 0.60
     global_fallback_tree_ratio: float = 0.50
 
+    # Parallel execution (suspicious_only mode only).
+    # Uses ThreadPoolExecutor — pgeof (C++ backend) releases the GIL,
+    # so threads achieve true parallelism for the verticality computation.
+    parallel: bool = False
+    parallel_max_workers: Optional[int] = None  # None = cpu_count()
+
+    # Voxel-level early exit — two-tier screening.
+    # Coarse pass auto-keeps obviously vertical voxels; remaining voxels run
+    # the full-resolution fine pass.
+    #
+    # Real-data benchmark (T460298A, 17.5M points, 32 trees, mode="global"):
+    #   speedup       ~1.11x   (below the 1.20x bar to promote to default)
+    #   workload red. ~0.0%    (auto-keep barely fires on this dataset)
+    #   mask diff     ~1.82%   (>0.5% — output drift vs baseline)
+    #   recall loss   104,416 points dropped that the baseline kept
+    # Conclusion: kept opt-in, NOT default. Bidirectional auto-decisions
+    # (auto-keep + auto-reject) would be needed to deliver the original
+    # 10–50× ambition of the plan; not pursued for now (low marginal value).
+    voxel_early_exit: bool = False
+    voxel_early_exit_coarse_resolution: float = 0.08
+    voxel_early_exit_margin: float = 0.1
+
 
 # ---------------------------------------------------------------------------
 # Result dataclasses
@@ -107,6 +144,7 @@ class StemCleaningResult:
     n_trees_skipped: int = 0
     n_points_processed_verticality: int = 0
     used_global_fallback: bool = False
+    profile: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -120,6 +158,43 @@ class SectionResult:
     sections: np.ndarray          # (n_sections,) section heights
     tree_ids: List[int]           # tree IDs in order
     config: StemCleaningConfig
+
+
+# ---------------------------------------------------------------------------
+# Profiling helper
+# ---------------------------------------------------------------------------
+
+def _format_profile_summary(profile: Dict[str, Any]) -> str:
+    """Format a profiling dict into a human-readable summary table."""
+    lines = ["\n  ── Profiling breakdown ──"]
+    total = profile.get("total_seconds", 0.0)
+    stages = [
+        ("input_preparation", "Input preparation"),
+        ("suspicious_scoring", "Suspicious scoring"),
+        ("verticality_computation", "Verticality computation"),
+        ("threshold_filtering", "Threshold filtering"),
+        ("mask_update", "Mask update"),
+        ("stats_aggregation", "Stats aggregation"),
+    ]
+    for key, label in stages:
+        secs = profile.get(f"{key}_seconds", 0.0)
+        if secs > 0.0 or key in ("verticality_computation",):
+            pct = (secs / total * 100.0) if total > 0 else 0.0
+            lines.append(f"    {label:30s} {secs:8.3f}s  ({pct:5.1f}%)")
+    lines.append(f"    {'TOTAL':30s} {total:8.3f}s")
+    lines.append(f"    Points → verticality:       {profile.get('n_points_verticality', 0):,}")
+    if profile.get("per_tree_timings"):
+        lines.append(f"    Trees processed individually: {len(profile['per_tree_timings'])}")
+        for t in profile["per_tree_timings"]:
+            lines.append(
+                f"      Tree {t['tree_id']:3d}: "
+                f"{t['n_points']:>7,} pts, "
+                f"vert={t['verticality_seconds']:.3f}s, "
+                f"filter={t['filtering_seconds']:.3f}s, "
+                f"total={t['tree_total_seconds']:.3f}s"
+            )
+    lines.append("  ── end profiling ──")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +290,17 @@ def _clean_stems_global(
     verbose: bool = True,
 ) -> StemCleaningResult:
     """Reference implementation: apply the second verticality pass to all trunk points."""
+    t_total_start = time.perf_counter()
+
+    # --- input preparation ---
+    t0 = time.perf_counter()
     trunk_mask = trunk_result.trunk_mask.copy()
     tree_ids = trunk_result.tree_ids
     n_before = int(trunk_mask.sum())
     unique_trees = _unique_tree_ids(tree_ids, trunk_result.trunk_mask)
+    trunk_indices = np.where(trunk_mask)[0]
+    trunk_pts = xyz[trunk_indices]
+    t_input_prep = time.perf_counter() - t0
 
     if verbose:
         print(f"\nStem cleaning (2nd verticality pass):")
@@ -227,10 +309,16 @@ def _clean_stems_global(
         print(f"  Verticality threshold: {config.verticality_threshold}")
         print(f"  Scale: {config.verticality_scale}m")
 
-    trunk_indices = np.where(trunk_mask)[0]
-    trunk_pts = xyz[trunk_indices]
-
     if len(trunk_pts) == 0:
+        profile = {
+            "total_seconds": time.perf_counter() - t_total_start,
+            "input_preparation_seconds": t_input_prep,
+            "verticality_computation_seconds": 0.0,
+            "threshold_filtering_seconds": 0.0,
+            "mask_update_seconds": 0.0,
+            "stats_aggregation_seconds": 0.0,
+            "n_points_verticality": 0,
+        }
         return StemCleaningResult(
             stem_mask=trunk_mask,
             n_points_before=0,
@@ -242,24 +330,64 @@ def _clean_stems_global(
             n_trees_skipped=0,
             n_points_processed_verticality=0,
             used_global_fallback=False,
+            profile=profile,
         )
 
     if verbose:
         print(f"  Computing verticality on {len(trunk_pts):,} trunk points...")
 
-    vert = compute_verticality(
-        trunk_pts,
-        scale=config.verticality_scale,
-        voxel_resolution_xy=config.voxel_resolution_xy,
-        voxel_resolution_z=config.voxel_resolution_z,
-    )
+    # --- verticality computation + filtering ---
+    vox_xy = config.voxel_resolution_xy_2nd or config.voxel_resolution_xy
+    vox_z = config.voxel_resolution_z_2nd or config.voxel_resolution_z
 
-    vert_mask = vert >= config.verticality_threshold
-    remove_indices = trunk_indices[~vert_mask]
+    t0 = time.perf_counter()
+    if config.voxel_early_exit:
+        keep_mask, ee_stats = compute_verticality_mask_early_exit(
+            trunk_pts,
+            threshold=config.verticality_threshold,
+            scale=config.verticality_scale,
+            voxel_resolution_xy=vox_xy,
+            voxel_resolution_z=vox_z,
+            coarse_resolution=config.voxel_early_exit_coarse_resolution,
+            margin=config.voxel_early_exit_margin,
+        )
+    else:
+        vert = compute_verticality(
+            trunk_pts,
+            scale=config.verticality_scale,
+            voxel_resolution_xy=vox_xy,
+            voxel_resolution_z=vox_z,
+        )
+        keep_mask = vert >= config.verticality_threshold
+        ee_stats = None
+    t_vert = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    remove_indices = trunk_indices[~keep_mask]
+    t_filter = time.perf_counter() - t0
+
+    # --- mask update ---
+    t0 = time.perf_counter()
     trunk_mask[remove_indices] = False
-
     n_after = int(trunk_mask.sum())
+    t_mask = time.perf_counter() - t0
+
+    # --- stats aggregation ---
+    t0 = time.perf_counter()
     per_tree = _build_per_tree_stats(tree_ids, trunk_result.trunk_mask, trunk_mask, unique_trees)
+    t_stats = time.perf_counter() - t0
+
+    t_total = time.perf_counter() - t_total_start
+
+    profile = {
+        "total_seconds": t_total,
+        "input_preparation_seconds": t_input_prep,
+        "verticality_computation_seconds": t_vert,
+        "threshold_filtering_seconds": t_filter,
+        "mask_update_seconds": t_mask,
+        "stats_aggregation_seconds": t_stats,
+        "n_points_verticality": len(trunk_pts),
+    }
 
     if verbose:
         for row in per_tree:
@@ -271,6 +399,7 @@ def _clean_stems_global(
             f"  Summary: {n_before:,} → {n_after:,} "
             f"({n_before - n_after:,} non-vertical points removed)"
         )
+        print(_format_profile_summary(profile))
 
     return StemCleaningResult(
         stem_mask=trunk_mask,
@@ -283,7 +412,99 @@ def _clean_stems_global(
         n_trees_skipped=0,
         n_points_processed_verticality=len(trunk_pts),
         used_global_fallback=False,
+        profile=profile,
     )
+
+
+def _process_single_tree(
+    tid: int,
+    tree_indices: np.ndarray,
+    tree_pts: np.ndarray,
+    verticality_scale: float,
+    vox_xy: float,
+    vox_z: float,
+    verticality_threshold: float,
+    early_exit: bool = False,
+    early_exit_coarse_res: float = 0.08,
+    early_exit_margin: float = 0.1,
+) -> Tuple[int, np.ndarray, Dict[str, Any]]:
+    """Process one tree: compute verticality, threshold, return removal indices.
+
+    This helper is used by both serial and parallel paths in
+    ``suspicious_only`` mode.  It is intentionally a module-level function
+    so that it works with concurrent.futures (must be picklable for
+    ProcessPoolExecutor, though we default to ThreadPoolExecutor).
+    """
+    t_start = time.perf_counter()
+
+    t0 = time.perf_counter()
+    if early_exit:
+        keep_mask, _ = compute_verticality_mask_early_exit(
+            tree_pts,
+            threshold=verticality_threshold,
+            scale=verticality_scale,
+            voxel_resolution_xy=vox_xy,
+            voxel_resolution_z=vox_z,
+            coarse_resolution=early_exit_coarse_res,
+            margin=early_exit_margin,
+        )
+    else:
+        vert = compute_verticality(
+            tree_pts,
+            scale=verticality_scale,
+            voxel_resolution_xy=vox_xy,
+            voxel_resolution_z=vox_z,
+        )
+        keep_mask = vert >= verticality_threshold
+    t_vert = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    remove_indices = tree_indices[~keep_mask]
+    t_filter = time.perf_counter() - t0
+
+    timing = {
+        "tree_id": tid,
+        "n_points": len(tree_pts),
+        "verticality_seconds": t_vert,
+        "filtering_seconds": t_filter,
+        "mask_update_seconds": 0.0,              # filled by caller
+        "tree_total_seconds": time.perf_counter() - t_start,
+    }
+    return tid, remove_indices, timing
+
+
+def _process_trees_parallel(
+    tree_work: List[Tuple[int, np.ndarray, np.ndarray]],
+    verticality_scale: float,
+    vox_xy: float,
+    vox_z: float,
+    verticality_threshold: float,
+    max_workers: Optional[int],
+    early_exit: bool = False,
+    early_exit_coarse_res: float = 0.08,
+    early_exit_margin: float = 0.1,
+) -> List[Tuple[int, np.ndarray, Dict[str, Any]]]:
+    """Run per-tree verticality in parallel using ThreadPoolExecutor.
+
+    ThreadPoolExecutor is chosen over ProcessPoolExecutor because pgeof
+    (C++ backend) releases the GIL, giving true parallelism without the
+    cost of serialising large numpy arrays across process boundaries.
+    """
+    results: List[Tuple[int, np.ndarray, Dict[str, Any]]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _process_single_tree, tid, tree_indices, tree_pts,
+                verticality_scale, vox_xy, vox_z, verticality_threshold,
+                early_exit, early_exit_coarse_res, early_exit_margin,
+            ): tid
+            for tid, tree_indices, tree_pts in tree_work
+        }
+        for future in futures:
+            results.append(future.result())
+    # Sort by tree_id so output order is deterministic
+    results.sort(key=lambda r: r[0])
+    return results
 
 
 def clean_stems(
@@ -299,6 +520,9 @@ def clean_stems(
     In `suspicious_only` mode it runs only on trees marked as suspicious,
     with an automatic fallback to the global path if the plot is mostly
     suspicious anyway.
+
+    When verbose=True, a profiling breakdown is printed after the summary.
+    The profile dict is also stored on StemCleaningResult.profile.
     """
     if config.mode == "global":
         return _clean_stems_global(xyz, trunk_result, config, verbose=verbose)
@@ -306,10 +530,17 @@ def clean_stems(
     if config.mode != "suspicious_only":
         raise ValueError(f"Unsupported stem cleaning mode: {config.mode}")
 
+    t_total_start = time.perf_counter()
+
+    # --- input preparation ---
+    t0 = time.perf_counter()
     trunk_mask_before = trunk_result.trunk_mask.copy()
     tree_ids = trunk_result.tree_ids
     n_before = int(trunk_mask_before.sum())
+    t_input_prep = time.perf_counter() - t0
 
+    # --- suspicious scoring ---
+    t0 = time.perf_counter()
     suspicious_ids, suspicious_points, total_trunk_points, unique_trees = _score_suspicious_trees(
         trunk_mask_before,
         tree_ids,
@@ -323,6 +554,7 @@ def clean_stems(
         point_ratio > config.global_fallback_point_ratio
         or tree_ratio > config.global_fallback_tree_ratio
     )
+    t_suspicious = time.perf_counter() - t0
 
     if use_global_fallback:
         if verbose:
@@ -332,46 +564,112 @@ def clean_stems(
                 f"  Fallback to global: suspicious trees={len(suspicious_ids)}/{len(unique_trees)}, "
                 f"suspicious points={suspicious_points:,}/{total_trunk_points:,}"
             )
-        return replace(
-            _clean_stems_global(xyz, trunk_result, config, verbose=verbose),
-            used_global_fallback=True,
-        )
+        result = _clean_stems_global(xyz, trunk_result, config, verbose=verbose)
+        # Merge suspicious-scoring time into the profile from _clean_stems_global
+        if result.profile is not None:
+            result.profile["suspicious_scoring_seconds"] = t_suspicious
+        return replace(result, used_global_fallback=True)
 
     trunk_mask_after = trunk_mask_before.copy()
+    use_parallel = config.parallel and len(suspicious_ids) > 1
 
     if verbose:
         print("\nStem cleaning (2nd verticality pass):")
-        print("  Mode: suspicious_only")
+        print(f"  Mode: suspicious_only{' (parallel)' if use_parallel else ''}")
         print(f"  Input: {n_before:,} trunk points")
         print(f"  Verticality threshold: {config.verticality_threshold}")
         print(f"  Scale: {config.verticality_scale}m")
         print(f"  Suspicious trees: {len(suspicious_ids)}/{len(unique_trees)}")
         print(f"  Suspicious points: {suspicious_points:,}/{total_trunk_points:,}")
 
-    processed_points = 0
+    # Resolve voxel resolutions once
+    vox_xy = config.voxel_resolution_xy_2nd or config.voxel_resolution_xy
+    vox_z = config.voxel_resolution_z_2nd or config.voxel_resolution_z
+
+    # Pre-compute per-tree indices (needed by both serial and parallel paths)
+    tree_work: List[Tuple[int, np.ndarray, np.ndarray]] = []
     for tid in suspicious_ids:
         tree_mask = trunk_mask_before & (tree_ids == tid)
         tree_indices = np.where(tree_mask)[0]
         tree_pts = xyz[tree_indices]
-        if len(tree_pts) == 0:
-            continue
+        if len(tree_pts) > 0:
+            tree_work.append((tid, tree_indices, tree_pts))
 
-        processed_points += len(tree_pts)
-        if verbose:
-            print(f"  Computing verticality on tree {tid} ({len(tree_pts):,} pts)...")
+    processed_points = 0
+    t_vert_total = 0.0
+    t_filter_total = 0.0
+    t_mask_total = 0.0
+    per_tree_timings: List[Dict[str, Any]] = []
 
-        vert = compute_verticality(
-            tree_pts,
-            scale=config.verticality_scale,
-            voxel_resolution_xy=config.voxel_resolution_xy,
-            voxel_resolution_z=config.voxel_resolution_z,
+    if use_parallel:
+        # --- parallel path: ThreadPoolExecutor ---
+        # pgeof (C++) releases the GIL → threads achieve true parallelism.
+        tree_results = _process_trees_parallel(
+            tree_work, config.verticality_scale, vox_xy, vox_z,
+            config.verticality_threshold, config.parallel_max_workers,
+            config.voxel_early_exit, config.voxel_early_exit_coarse_resolution,
+            config.voxel_early_exit_margin,
         )
-        keep_mask = vert >= config.verticality_threshold
-        remove_indices = tree_indices[~keep_mask]
-        trunk_mask_after[remove_indices] = False
+        for tid, remove_idx, timing in tree_results:
+            processed_points += timing["n_points"]
+            t_vert_total += timing["verticality_seconds"]
+            t_filter_total += timing["filtering_seconds"]
+            per_tree_timings.append(timing)
+            # Mask update is always serial (trivial cost)
+            t0 = time.perf_counter()
+            trunk_mask_after[remove_idx] = False
+            t_mask_tree = time.perf_counter() - t0
+            t_mask_total += t_mask_tree
+            per_tree_timings[-1]["mask_update_seconds"] = t_mask_tree
+            per_tree_timings[-1]["tree_total_seconds"] += t_mask_tree
+    else:
+        # --- serial path ---
+        for tid, tree_indices, tree_pts in tree_work:
+            if verbose:
+                print(f"  Computing verticality on tree {tid} ({len(tree_pts):,} pts)...")
+            _, remove_indices, timing = _process_single_tree(
+                tid, tree_indices, tree_pts,
+                config.verticality_scale, vox_xy, vox_z,
+                config.verticality_threshold,
+                config.voxel_early_exit,
+                config.voxel_early_exit_coarse_resolution,
+                config.voxel_early_exit_margin,
+            )
+            processed_points += timing["n_points"]
+            t_vert_total += timing["verticality_seconds"]
+            t_filter_total += timing["filtering_seconds"]
 
+            t0 = time.perf_counter()
+            trunk_mask_after[remove_indices] = False
+            t_mask_tree = time.perf_counter() - t0
+            t_mask_total += t_mask_tree
+
+            timing["mask_update_seconds"] = t_mask_tree
+            timing["tree_total_seconds"] += t_mask_tree
+            per_tree_timings.append(timing)
+
+    # --- stats aggregation ---
+    t0 = time.perf_counter()
     n_after = int(trunk_mask_after.sum())
     per_tree = _build_per_tree_stats(tree_ids, trunk_mask_before, trunk_mask_after, unique_trees)
+    t_stats = time.perf_counter() - t0
+
+    t_total = time.perf_counter() - t_total_start
+
+    profile = {
+        "total_seconds": t_total,
+        "input_preparation_seconds": t_input_prep,
+        "suspicious_scoring_seconds": t_suspicious,
+        "verticality_computation_seconds": t_vert_total,
+        "threshold_filtering_seconds": t_filter_total,
+        "mask_update_seconds": t_mask_total,
+        "stats_aggregation_seconds": t_stats,
+        "n_points_verticality": processed_points,
+        "n_trees_suspicious": len(suspicious_ids),
+        "n_trees_skipped": len(unique_trees) - len(suspicious_ids),
+        "per_tree_timings": per_tree_timings,
+        "parallel": use_parallel,
+    }
 
     if verbose:
         for row in per_tree:
@@ -383,6 +681,7 @@ def clean_stems(
             f"  Summary: {n_before:,} -> {n_after:,} "
             f"({n_before - n_after:,} non-vertical points removed)"
         )
+        print(_format_profile_summary(profile))
 
     return StemCleaningResult(
         stem_mask=trunk_mask_after,
@@ -395,6 +694,7 @@ def clean_stems(
         n_trees_skipped=len(unique_trees) - len(suspicious_ids),
         n_points_processed_verticality=processed_points,
         used_global_fallback=False,
+        profile=profile,
     )
 
 
