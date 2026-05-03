@@ -1,5 +1,5 @@
 """
-Trunk Extraction Module — Brick 7
+Trunk Extraction — Module 7
 
 Extracts tree trunks from a height-normalized point cloud using
 the proven dendromatics/3DFin pipeline:

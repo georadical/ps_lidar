@@ -346,7 +346,7 @@ def _compute_local_shape_features(
     Compute local PCA shape features on voxel centroids and reproject later.
 
     This mirrors the geometry used by the sample-bank builder so the exported
-    Brick 7 features and the future ML dataset are consistent.
+    Module 7 features and the future ML dataset are consistent.
     """
     n_voxels = len(centroids)
     if n_voxels == 0:
