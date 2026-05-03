@@ -27,6 +27,7 @@ def test_build_trunk_audit_table_computes_expected_metrics(monkeypatch):
             {
                 "tree_id": 0,
                 "centroid": np.array([0.05, 0.05, 1.3]),
+                "line_point": np.array([0.02, 0.04, 0.45]),
                 "direction": np.array([0.0, 0.1, 0.995]),
                 "n_points": 4,
                 "z_min": 1.0,
@@ -35,6 +36,33 @@ def test_build_trunk_audit_table_computes_expected_metrics(monkeypatch):
                 "stripe_diameter": 0.22,
                 "stripe_circularity": 0.82,
                 "stripe_z_span": 0.6,
+                "axis_source": "basal_anchor",
+                "basal_anchor_found": True,
+                "basal_anchor_applied": True,
+                "basal_anchor_candidates_total": 3,
+                "basal_anchor_candidates_validated": 1,
+                "basal_anchor_x": 0.02,
+                "basal_anchor_y": 0.04,
+                "basal_anchor_z": 0.45,
+                "basal_anchor_radius": 0.10,
+                "basal_anchor_circularity": 0.88,
+                "basal_anchor_sector_pct": 0.81,
+                "basal_anchor_inner_fraction": np.nan,
+                "basal_anchor_support_slices": 4,
+                "basal_anchor_center_offset": 0.03,
+                "basal_anchor_model": "ellipse",
+                "basal_anchor_arc_coverage": 0.81,
+                "basal_anchor_fit_residual": 0.06,
+                "basal_anchor_track_center_std": 0.02,
+                "basal_anchor_track_radius_cv": 0.08,
+                "basal_anchor_track_id": 7,
+                "basal_anchor_track_score": 0.91,
+                "basal_anchor_match_passed": True,
+                "basal_anchor_match_score": 0.88,
+                "basal_anchor_match_xy_distance": 0.03,
+                "basal_anchor_match_radius_ratio": 0.91,
+                "basal_anchor_match_tilt_deg": 1.8,
+                "axis_direction_delta_deg": 2.5,
                 "seed_selection_mode": "microband",
                 "seed_points": 96,
                 "seed_z_min": 1.0,
@@ -66,6 +94,14 @@ def test_build_trunk_audit_table_computes_expected_metrics(monkeypatch):
                 "stripe_diameter": 0.35,
                 "stripe_circularity": 0.41,
                 "stripe_z_span": 0.6,
+                "axis_source": "pca",
+                "basal_anchor_found": False,
+                "basal_anchor_applied": False,
+                "basal_anchor_candidates_total": 3,
+                "basal_anchor_candidates_validated": 1,
+                "basal_anchor_model": "none",
+                "basal_anchor_match_passed": False,
+                "basal_anchor_track_id": -1,
                 "seed_selection_mode": "full_stripe_short",
                 "seed_points": 84,
                 "seed_z_min": 1.0,
@@ -131,11 +167,26 @@ def test_build_trunk_audit_table_computes_expected_metrics(monkeypatch):
     assert list(df["seed_selection_mode"]) == ["microband", "full_stripe_short"]
     assert list(df["growth_slices_down"]) == [4, 1]
     assert list(df["growth_points_kept"]) == [8, 6]
+    assert list(df["axis_source"]) == ["basal_anchor", "pca"]
+    assert list(df["basal_anchor_applied"]) == [True, False]
+    assert list(df["basal_anchor_candidates_total"]) == [3, 3]
+    assert list(df["basal_anchor_model"]) == ["ellipse", "none"]
+    assert list(df["basal_anchor_match_passed"]) == [True, False]
+    assert list(df["basal_anchor_track_id"]) == [7, -1]
     assert np.isclose(df.loc[0, "mean_radius"], 0.10)
     assert np.isclose(df.loc[1, "seed_radius_ref"], 0.17)
     assert np.isclose(df.loc[0, "seed_vs_half_diam"], 1.0)
     assert np.isclose(df.loc[0, "seed_mean_dominant_fraction"], 0.95)
     assert np.isclose(df.loc[0, "growth_ratio"], 2.0)
+    assert np.isclose(df.loc[0, "basal_anchor_radius"], 0.10)
+    assert np.isclose(df.loc[0, "basal_anchor_arc_coverage"], 0.81)
+    assert np.isclose(df.loc[0, "basal_anchor_fit_residual"], 0.06)
+    assert np.isclose(df.loc[0, "basal_anchor_track_score"], 0.91)
+    assert np.isclose(df.loc[0, "basal_anchor_match_score"], 0.88)
+    assert np.isclose(df.loc[0, "basal_anchor_match_xy_distance"], 0.03)
+    assert np.isclose(df.loc[0, "basal_anchor_match_radius_ratio"], 0.91)
+    assert np.isclose(df.loc[0, "basal_anchor_match_tilt_deg"], 1.8)
+    assert np.isclose(df.loc[0, "axis_direction_delta_deg"], 2.5)
     assert df.loc[1, "distance_to_center"] > df.loc[0, "distance_to_center"]
     assert "plo_seed_mode" in df.columns
     assert "plo_growth_voxel_count" in df.columns
