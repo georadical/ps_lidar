@@ -1,5 +1,5 @@
 """
-Branch Extraction Module — Brick 8
+Branch Extraction — Module 8
 
 Extracts tree branches from a height-normalized point cloud using
 linearity-based filtering and topological connectivity to trunks.

@@ -124,11 +124,11 @@ __all__ = [
     "compute_linearity",
     "compute_wood_features",
     "compute_exportable_geometry_features",
-    # Trunk extraction (Brick 7)
+    # Trunk extraction (Module 7)
     "TrunkExtractionConfig",
     "TrunkExtractionResult",
     "extract_trunks",
-    # Branch extraction (Brick 8)
+    # Branch extraction (Module 8)
     "BranchExtractionConfig",
     "BranchExtractionResult",
     "extract_branches",
