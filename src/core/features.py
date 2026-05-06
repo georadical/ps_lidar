@@ -228,6 +228,66 @@ def compute_verticality_mask_early_exit(
     return keep_mask, stats
 
 
+def compute_sphericity(
+    xyz: np.ndarray,
+    scale: float = 0.1,
+    max_knn: int = 50000,
+    voxel_resolution_xy: float = 0.02,
+    voxel_resolution_z: float = 0.02,
+    verbose: bool = False,
+) -> np.ndarray:
+    """
+    Compute sphericity for each point using pgeof (C++ backend).
+
+    Sphericity = lambda_3 / lambda_1, where lambdas are the PCA eigenvalues
+    of the local neighbourhood sorted in descending order. Values close to
+    1 indicate isotropic scatter (chaotic understory, foliage), values
+    close to 0 indicate anisotropic structure (planes, lines, cylinders).
+
+    Operates on voxel centroids and re-projects results to original points
+    (same pattern as `compute_verticality`).
+
+    Parameters
+    ----------
+    xyz : np.ndarray
+        (N, 3) point cloud.
+    scale : float
+        Radius for neighbourhood search during PCA.
+    max_knn : int
+        Maximum neighbours for radius search.
+    voxel_resolution_xy, voxel_resolution_z : float
+        Voxel resolution for subsampling.
+    verbose : bool
+        Print progress information.
+
+    Returns
+    -------
+    sphericity : np.ndarray
+        (N,) sphericity values in [0, 1].
+    """
+    if not _HAS_PGEOF:
+        raise ImportError(
+            "pgeof is required. Install with: pip install pgeof"
+        )
+
+    if verbose:
+        print(f"  Computing sphericity: {len(xyz):,} points, scale={scale}m")
+
+    centroids, point_to_voxel, n_voxels = voxelize_cloud(
+        xyz, resolution_xy=voxel_resolution_xy, resolution_z=voxel_resolution_z,
+    )
+    if verbose:
+        print(f"  Voxelized: {len(xyz):,} → {n_voxels:,} voxels")
+
+    # pgeof exposes this feature as `Scattering`; mathematically identical
+    # to sphericity in the literature (λ₃/λ₁ of the local PCA).
+    sph = pgeof.compute_features_selected(
+        centroids, scale, max_knn, [EFeatureID.Scattering],
+    )
+    # sph is (n_voxels, 1), flatten and reproject
+    return sph.ravel()[point_to_voxel]
+
+
 def compute_linearity(
     xyz: np.ndarray,
     scale: float = 0.1,
@@ -346,7 +406,7 @@ def _compute_local_shape_features(
     Compute local PCA shape features on voxel centroids and reproject later.
 
     This mirrors the geometry used by the sample-bank builder so the exported
-    Brick 7 features and the future ML dataset are consistent.
+    Module 7 features and the future ML dataset are consistent.
     """
     n_voxels = len(centroids)
     if n_voxels == 0:

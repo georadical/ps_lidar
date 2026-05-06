@@ -1,5 +1,5 @@
 """
-Trunk Extraction Module — Brick 7
+Trunk Extraction — Module 7
 
 Extracts tree trunks from a height-normalized point cloud using
 the proven dendromatics/3DFin pipeline:
@@ -22,7 +22,7 @@ import numpy as np
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Literal, Tuple
 
-from .features import voxelize_cloud, compute_verticality
+from .features import voxelize_cloud, compute_verticality, compute_sphericity
 
 
 # ---------------------------------------------------------------------------
@@ -86,6 +86,33 @@ class TrunkExtractionConfig:
     cluster_diameter_max_factor: float = 1.5
     cluster_min_height: float = 2.0     # m — min height for small trees
     cluster_min_diameter: float = 0.05  # m — min diameter
+
+    # Multi-scale geometric pre-filter (Improvement 4 — opt-in).
+    # Optional voxel-level rejection applied AFTER the verticality threshold
+    # and BEFORE DBSCAN, on the same voxel centroids of each peeling
+    # iteration. Targets two failure modes that pure verticality lets
+    # through:
+    #   * chaotic understory / foliage scatter (high sphericity = isotropic
+    #     PCA spread). Rejected when sphericity > sphericity_max.
+    #   * sparse leaves / twigs (very low local point density). Rejected
+    #     when points/m³ < density_min.
+    # Defaults preserve existing behaviour (filter disabled). To enable,
+    # set sphericity_max to e.g. 0.35 and/or density_min to a positive
+    # value calibrated against your data.
+    #
+    # Empirical closure on Hovermap/TFS data (plot T460298A, 60 trees):
+    # the per-tree sphericity diagnostic in notebooks/01_playground.ipynb
+    # showed the false positives observed in this dataset (Tree 7 and 10:
+    # merged-cluster artifacts with absurd diameters and inconsistent
+    # sectioning) have LOWER sphericity (median ~0.18-0.20) than the
+    # legitimate trees (median ~0.21). They are highly cylindrical, not
+    # chaotic. No per-voxel sphericity threshold can separate the two
+    # groups for this sensor and setup. The correct fix for those FPs is
+    # section-based rejection (Improvement 6), not this pre-filter. The
+    # implementation is left opt-in for sensors / scenes where FPs are
+    # genuine chaotic-foliage clusters.
+    sphericity_max: float = 1.0   # 1.0 = no rejection
+    density_min: float = 0.0      # 0.0 = no rejection (points / voxel m³)
 
 
     # Axis refinement (optional)
@@ -1199,12 +1226,46 @@ def extract_trunks(
         # Step 4: Filter voxels by verticality (operate on centroids, not raw points)
         vox_vert_mask = vert_voxels >= config.verticality_threshold
         n_vox_before = n_vox
-        
+
+        # Step 4b: Optional multi-scale geometric pre-filter (Improvement 4).
+        # Narrows vox_vert_mask further by rejecting voxels with chaotic
+        # PCA spread (sphericity > sphericity_max) and/or low local point
+        # density (points/m³ < density_min). Both filters share the voxel
+        # centroids already computed in Step 2, so the only added cost is
+        # one extra pgeof call (sphericity).
+        if config.sphericity_max < 1.0 or config.density_min > 0.0:
+            n_after_vert = int(vox_vert_mask.sum())
+            if config.sphericity_max < 1.0:
+                sph_voxels = compute_sphericity(
+                    centroids,
+                    scale=config.verticality_scale,
+                    voxel_resolution_xy=config.voxel_resolution_xy,
+                    voxel_resolution_z=config.voxel_resolution_z,
+                )
+                vox_vert_mask = vox_vert_mask & (sph_voxels <= config.sphericity_max)
+            if config.density_min > 0.0:
+                voxel_volume = (
+                    config.voxel_resolution_xy
+                    * config.voxel_resolution_xy
+                    * config.voxel_resolution_z
+                )
+                voxel_counts = np.bincount(pt_to_vox, minlength=n_vox)
+                voxel_density = voxel_counts / voxel_volume
+                vox_vert_mask = vox_vert_mask & (voxel_density >= config.density_min)
+            if verbose:
+                n_after_prefilter = int(vox_vert_mask.sum())
+                print(
+                    f"    Pre-filter (sphericity≤{config.sphericity_max}, "
+                    f"density≥{config.density_min}): "
+                    f"{n_after_vert:,} → {n_after_prefilter:,} voxels "
+                    f"(rejected {n_after_vert - n_after_prefilter:,})"
+                )
+
         # Map voxel filter back to raw points
         pt_vert_mask = vox_vert_mask[pt_to_vox]
         n_before = len(current_points)
         current_points = current_points[pt_vert_mask]
-        
+
         # Also filter centroids and rebuild mapping for DBSCAN
         kept_centroids = centroids[vox_vert_mask]
 
