@@ -81,6 +81,17 @@ class TrunkExtractionConfig:
     height_range: float = 0.7
     dbscan_eps: Optional[float] = None  # auto if None
 
+    # Centerline construction (Improvement 1, Phase 1A — informational only).
+    # After point-to-axis assignment, build a piecewise centerline (polyline) per
+    # tree by tracking the median XY position of assigned points across vertical
+    # slabs of `centerline_slab_step` metres. The result is attached to each
+    # tree_axes entry under the key `centerline` (an (K, 3) ndarray sorted by Z,
+    # or None if too few points). Downstream consumers (point assignment, stem
+    # cleaning, sectioning) still operate on the straight-line axis — Phases 1B
+    # and 1C will switch them to the polyline incrementally.
+    centerline_slab_step: float = 0.5         # m
+    centerline_min_points_per_slab: int = 5   # minimum points to record a control point
+
     # Cluster validation parameters
     cluster_circularity_min: float = 0.3
     cluster_diameter_max_factor: float = 1.5
@@ -1073,6 +1084,79 @@ def _compute_axes_pca(
     return axes
 
 
+def _build_tree_centerlines(
+    xyz: np.ndarray,
+    tree_ids: np.ndarray,
+    tree_axes: List[Dict[str, Any]],
+    slab_step: float,
+    min_points_per_slab: int,
+) -> List[Dict[str, Any]]:
+    """
+    Build a piecewise centerline (polyline) per tree by tracking the median XY
+    position of assigned points across vertical slabs.
+
+    Improvement 1, Phase 1A: this enriches each ``tree_axes`` entry with a
+    ``centerline`` field (a (K, 3) ndarray of control points sorted by Z, or
+    ``None`` if the tree has too few points to build a meaningful polyline).
+    Downstream consumers (point assignment, stem cleaning, sectioning) are not
+    yet aware of this field — they still use the straight-line axis. Future
+    phases (1B, 1C) will switch them to the polyline incrementally.
+
+    Parameters
+    ----------
+    xyz : (N, 3) ndarray
+        Full input point cloud.
+    tree_ids : (N,) int ndarray
+        Per-point tree assignment from ``_assign_points_to_axes`` (-1 for
+        unassigned points).
+    tree_axes : list of dict
+        Tree axis records produced by ``_compute_axes_pca`` /
+        ``_refine_axes_with_basal_anchor``. Mutated in place.
+    slab_step : float
+        Vertical spacing between control points, in metres.
+    min_points_per_slab : int
+        Minimum number of assigned points a slab must contain to produce a
+        control point. Slabs below this threshold are skipped (the polyline
+        has gaps).
+
+    Returns
+    -------
+    The same ``tree_axes`` list, with each entry's ``centerline`` field set.
+    """
+    for ax in tree_axes:
+        tid = ax["tree_id"]
+        mask = tree_ids == tid
+        if not mask.any():
+            ax["centerline"] = None
+            continue
+        pts = xyz[mask]
+        z_min = float(pts[:, 2].min())
+        z_max = float(pts[:, 2].max())
+        if z_max - z_min < slab_step:
+            ax["centerline"] = None
+            continue
+        n_slabs = max(1, int(np.ceil((z_max - z_min) / slab_step)))
+        slab_indices = np.minimum(
+            ((pts[:, 2] - z_min) / slab_step).astype(np.int64),
+            n_slabs - 1,
+        )
+        control_points: List[List[float]] = []
+        for s in range(n_slabs):
+            slab_mask = slab_indices == s
+            if int(slab_mask.sum()) < min_points_per_slab:
+                continue
+            slab_pts = pts[slab_mask]
+            cx = float(np.median(slab_pts[:, 0]))
+            cy = float(np.median(slab_pts[:, 1]))
+            cz = float(np.median(slab_pts[:, 2]))
+            control_points.append([cx, cy, cz])
+        if len(control_points) < 2:
+            ax["centerline"] = None
+        else:
+            ax["centerline"] = np.asarray(control_points, dtype=np.float64)
+    return tree_axes
+
+
 def _assign_points_to_axes(
     xyz: np.ndarray,
     axes: List[Dict[str, Any]],
@@ -1392,6 +1476,26 @@ def extract_trunks(
     # Step 8: Assign ALL points to nearest axis
     # ======================================================================
     tree_ids = _assign_points_to_axes(xyz, tree_axes, config.max_axis_distance)
+
+    # Step 8b: Build piecewise centerlines (Improvement 1, Phase 1A).
+    # Adds a 'centerline' field to each tree_axes entry. Currently informational
+    # only — point assignment, stem cleaning and sectioning still use the
+    # straight-line axis. The polyline is exposed for visualisation in Module 9
+    # and for the downstream phases that will switch to it.
+    tree_axes = _build_tree_centerlines(
+        xyz,
+        tree_ids,
+        tree_axes,
+        slab_step=config.centerline_slab_step,
+        min_points_per_slab=config.centerline_min_points_per_slab,
+    )
+    if verbose:
+        n_with_centerline = sum(1 for ax in tree_axes if ax.get("centerline") is not None)
+        print(
+            f"  Centerlines built: {n_with_centerline}/{len(tree_axes)} trees "
+            f"(slab={config.centerline_slab_step}m, "
+            f"min_pts={config.centerline_min_points_per_slab})"
+        )
 
     # Build trunk mask: points within stem_search_radius of their axis
     trunk_mask = np.zeros(n_total, dtype=bool)
