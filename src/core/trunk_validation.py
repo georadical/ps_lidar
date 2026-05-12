@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from typing import List, Dict, Any, Tuple, Optional, Literal
 import numpy as np
 from scipy import optimize
+from scipy.ndimage import median_filter
 
 from src.core.features import (
     voxelize_cloud,
@@ -909,6 +910,107 @@ def compute_stem_sections(
         tree_ids=unique_trees,
         config=config,
     )
+
+
+# ---------------------------------------------------------------------------
+# Step 2b: Centerline from section circle centres (Improvement 1, Phase 1A.REAL)
+# ---------------------------------------------------------------------------
+
+def build_centerline_from_sections(
+    section_result: SectionResult,
+    min_valid_sections: int = 3,
+    smooth_window: int = 3,
+) -> List[Optional[np.ndarray]]:
+    """
+    Build a piecewise centerline per tree from section circle centres.
+
+    For each tree, concatenates the `(X_c, Y_c, z_section)` triplets of the
+    sections whose circle fit succeeded into a polyline sorted ascending by Z,
+    then applies a moving-median filter across adjacent sections to suppress
+    per-fit jitter (improvement F1).
+
+    A section is considered valid when its fitted radius is strictly positive
+    (``R > 0``) — this is the same criterion ``compute_stem_sections`` uses
+    internally to report "N valid sections" in its verbose output. The
+    ``check`` field is intentionally NOT used because its value ``1`` is
+    ambiguous (returned both for valid retry fits and for retry failures);
+    ``R > 0`` distinguishes the two cases unambiguously.
+
+    Smoothing (F1)
+    --------------
+    Independent per-section LS circle fits produce small XY jitter (a few cm)
+    even on geometrically straight trunks, because each fit is solved in
+    isolation with no awareness of the adjacent sections. A moving median of
+    odd width ``smooth_window`` (default 3) is applied per coordinate
+    (``X_c`` and ``Y_c``; ``z_section`` is left untouched) with
+    ``mode='nearest'`` for edge replication. ``mode='nearest'`` is chosen
+    deliberately: it makes the filter the identity transform on monotonic
+    series (a leaning trunk stays leaning), and only flattens local spikes
+    surrounded by quieter neighbours — exactly the failure mode it is
+    meant to suppress. ``smooth_window=1`` disables smoothing entirely.
+
+    Parameters
+    ----------
+    section_result : SectionResult
+        Output of :func:`compute_stem_sections`. Provides ``X_c``, ``Y_c``,
+        ``R`` arrays of shape ``(n_trees, n_sections)``, the ``sections``
+        height grid of shape ``(n_sections,)``, and the ``tree_ids`` list.
+    min_valid_sections : int, default 3
+        Minimum number of valid sections a tree must have to produce a
+        centerline. Trees below this threshold get ``None`` (treated as
+        no-data downstream).
+    smooth_window : int, default 3
+        Odd-sized moving-median window applied to ``X_c`` and ``Y_c`` along
+        the section dimension. Must be ``>= 1``. ``1`` disables smoothing.
+
+    Returns
+    -------
+    list of (ndarray or None)
+        One entry per tree, indexed positionally to match
+        ``section_result.tree_ids``. Each entry is either:
+          - an ``(K, 3) float64`` array of control points
+            ``(X_c, Y_c, z_section)`` sorted by Z, where ``K`` is the number
+            of valid sections for that tree (``K >= min_valid_sections``); or
+          - ``None`` if the tree has fewer than ``min_valid_sections`` valid
+            sections.
+    """
+    if min_valid_sections < 2:
+        raise ValueError(
+            f"min_valid_sections must be >= 2 to form a polyline; got {min_valid_sections}"
+        )
+    if smooth_window < 1 or smooth_window % 2 == 0:
+        raise ValueError(
+            f"smooth_window must be a positive odd integer; got {smooth_window}"
+        )
+
+    sections_z = np.asarray(section_result.sections, dtype=np.float64)
+    n_trees = len(section_result.tree_ids)
+
+    centerlines: List[Optional[np.ndarray]] = []
+    for i in range(n_trees):
+        valid_mask = section_result.R[i] > 0
+        n_valid = int(valid_mask.sum())
+        if n_valid < min_valid_sections:
+            centerlines.append(None)
+            continue
+
+        xc = section_result.X_c[i, valid_mask].astype(np.float64, copy=False)
+        yc = section_result.Y_c[i, valid_mask].astype(np.float64, copy=False)
+        zc = sections_z[valid_mask]
+
+        # Sections come from np.arange (monotonic increasing) but sort
+        # defensively in case a future change reorders them.
+        order = np.argsort(zc)
+        xc, yc, zc = xc[order], yc[order], zc[order]
+
+        if smooth_window > 1:
+            xc = median_filter(xc, size=smooth_window, mode="nearest")
+            yc = median_filter(yc, size=smooth_window, mode="nearest")
+
+        polyline = np.column_stack([xc, yc, zc])
+        centerlines.append(polyline)
+
+    return centerlines
 
 
 # ---------------------------------------------------------------------------
