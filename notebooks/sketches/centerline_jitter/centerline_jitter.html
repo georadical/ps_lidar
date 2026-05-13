@@ -340,6 +340,93 @@
             font-style: italic;
         }
 
+        /* Tree identifier labels: HTML divs that float over the canvas at
+           projected positions of each tree's base. Pointer-events:none so
+           the user can still drag the canvas through them. */
+        .tree-label {
+            position: absolute;
+            pointer-events: none;
+            color: var(--anthropic-light);
+            background: rgba(20, 20, 19, 0.78);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 10px;
+            padding: 1px 8px;
+            font-family: 'Poppins', sans-serif;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.4;
+            transform: translate(-50%, 8px);
+            box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+            display: none;
+            user-select: none;
+            white-space: nowrap;
+        }
+
+        /* Per-tree configuration cards (sidebar). */
+        .tree-panel {
+            background: var(--anthropic-light);
+            border: 1px solid var(--anthropic-light-gray);
+            border-radius: 6px;
+            padding: 10px 12px;
+            margin-bottom: 10px;
+        }
+
+        .tree-panel-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--anthropic-dark);
+        }
+
+        .tree-panel-title { display: flex; align-items: center; gap: 6px; }
+
+        .tree-panel-summary {
+            font-size: 10px;
+            font-weight: 400;
+            color: var(--anthropic-mid-gray);
+            font-family: 'Courier New', monospace;
+        }
+
+        .tree-panel button.tree-roll {
+            background: transparent;
+            border: 1px solid var(--anthropic-light-gray);
+            color: var(--anthropic-dark);
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 12px;
+            cursor: pointer;
+            width: auto;
+            line-height: 1;
+        }
+
+        .tree-panel button.tree-roll:hover {
+            background: white;
+            border-color: var(--anthropic-orange);
+            transform: none;
+        }
+
+        .tree-panel .control-group { margin-bottom: 6px; }
+        .tree-panel .control-group label { font-size: 11px; margin-bottom: 2px; }
+        .tree-panel .value-display { font-size: 10px; min-width: 44px; }
+
+        .tree-panel select {
+            width: 100%;
+            background: white;
+            border: 1px solid var(--anthropic-light-gray);
+            border-radius: 4px;
+            padding: 4px 6px;
+            font-size: 12px;
+            font-family: 'Poppins', sans-serif;
+            color: var(--anthropic-dark);
+            cursor: pointer;
+        }
+
+        .tree-panel input[disabled] { opacity: 0.35; pointer-events: none; }
+        .tree-panel .control-group.disabled label { opacity: 0.4; }
+
         #canvas-container canvas {
             display: block;
             width: 100% !important;
@@ -415,22 +502,6 @@
                 </div>
 
                 <div class="control-group">
-                    <label>Min height (m)</label>
-                    <div class="slider-container">
-                        <input type="range" id="minHeightM" min="0.0" max="44.5" step="0.1" value="0.0" oninput="updateParam('minHeightM', this.value)">
-                        <span class="value-display" id="minHeightM-value">0.0 m</span>
-                    </div>
-                </div>
-
-                <div class="control-group">
-                    <label>Max height (m)</label>
-                    <div class="slider-container">
-                        <input type="range" id="maxHeightM" min="0.5" max="45.0" step="0.1" value="45.0" oninput="updateParam('maxHeightM', this.value)">
-                        <span class="value-display" id="maxHeightM-value">45.0 m</span>
-                    </div>
-                </div>
-
-                <div class="control-group">
                     <label>Noise level (cm)</label>
                     <div class="slider-container">
                         <input type="range" id="noiseLevel" min="0.2" max="5.0" step="0.1" value="2.0" oninput="updateParam('noiseLevel', this.value)">
@@ -440,55 +511,27 @@
             </div>
 
             <div class="control-section">
-                <h3>Trunk Shape</h3>
-
+                <h3>Forest re-roll bounds</h3>
                 <div class="control-group">
-                    <label>Lean angle (deg) — trunk 1</label>
+                    <label>Tree height min (m)</label>
                     <div class="slider-container">
-                        <input type="range" id="leanAngle" min="0" max="30" step="1" value="15" oninput="updateParam('leanAngle', this.value)">
-                        <span class="value-display" id="leanAngle-value">15</span>
+                        <input type="range" id="treeHeightMinM" min="2.5" max="44.0" step="0.5" value="2.5" oninput="updateBound('treeHeightMinM', this.value)">
+                        <span class="value-display" id="treeHeightMinM-value">2.5 m</span>
                     </div>
                 </div>
-
                 <div class="control-group">
-                    <label>S-curve amplitude — trunk 2 (% h)</label>
+                    <label>Tree height max (m)</label>
                     <div class="slider-container">
-                        <input type="range" id="curveAmp" min="0" max="10" step="0.5" value="3" oninput="updateParam('curveAmp', this.value)">
-                        <span class="value-display" id="curveAmp-value">3.0 %</span>
+                        <input type="range" id="treeHeightMaxM" min="3.0" max="45.0" step="0.5" value="45.0" oninput="updateBound('treeHeightMaxM', this.value)">
+                        <span class="value-display" id="treeHeightMaxM-value">45.0 m</span>
                     </div>
                 </div>
+                <button class="button tertiary" onclick="rollAll()">🎲 Re-roll all (stratified)</button>
+            </div>
 
-                <div class="control-group">
-                    <label>Consistent sweep amp — trunk 3 (% h)</label>
-                    <div class="slider-container">
-                        <input type="range" id="sweepAmp" min="0" max="15" step="0.5" value="5" oninput="updateParam('sweepAmp', this.value)">
-                        <span class="value-display" id="sweepAmp-value">5.0 %</span>
-                    </div>
-                </div>
-
-                <div class="control-group">
-                    <label>Back-and-forth amp — trunk 4 (% h)</label>
-                    <div class="slider-container">
-                        <input type="range" id="oscAmp" min="0" max="8" step="0.25" value="2.5" oninput="updateParam('oscAmp', this.value)">
-                        <span class="value-display" id="oscAmp-value">2.5 %</span>
-                    </div>
-                </div>
-
-                <div class="control-group">
-                    <label>Back-and-forth bends — trunk 4</label>
-                    <div class="slider-container">
-                        <input type="range" id="oscBends" min="2" max="8" step="1" value="2" oninput="updateParam('oscBends', this.value)">
-                        <span class="value-display" id="oscBends-value">2</span>
-                    </div>
-                </div>
-
-                <div class="control-group">
-                    <label>Taper (fraction lost at top)</label>
-                    <div class="slider-container">
-                        <input type="range" id="taper" min="0" max="0.8" step="0.05" value="0.4" oninput="updateParam('taper', this.value)">
-                        <span class="value-display" id="taper-value">0.4</span>
-                    </div>
-                </div>
+            <div class="control-section">
+                <h3>Trees</h3>
+                <div id="tree-panels"></div>
             </div>
 
             <div class="control-section">
@@ -511,6 +554,13 @@
 
         <div class="canvas-area">
             <div id="canvas-container">
+                <!-- Tree identifier labels (1..5). Positioned in JS each frame
+                     via projection of each tree's base coord to screen space. -->
+                <div class="tree-label" id="tree-label-0">1</div>
+                <div class="tree-label" id="tree-label-1">2</div>
+                <div class="tree-label" id="tree-label-2">3</div>
+                <div class="tree-label" id="tree-label-3">4</div>
+                <div class="tree-label" id="tree-label-4">5</div>
                 <!-- Floating layer panel (replaces the sidebar legend + display block). -->
                 <div class="layer-panel" id="layer-panel">
                     <h4>Layers</h4>
@@ -539,6 +589,11 @@
                         <span class="layer-swatch" style="background:#788c5d"></span>
                         <span class="layer-label">Smoothed centerline</span>
                     </div>
+                    <div class="layer-row on" id="layer-row-treeLabels" onclick="toggleLayer('treeLabels')">
+                        <span class="layer-toggle"></span>
+                        <span class="layer-dot" style="background:#faf9f5"></span>
+                        <span class="layer-label">Tree labels</span>
+                    </div>
                     <div class="hint">drag rotate · scroll zoom</div>
                 </div>
                 <div class="loading">Initializing scene…</div>
@@ -550,22 +605,138 @@
         // ═══════════════════════════════════════════════════════════════════
         // PARAMETERS
         // ═══════════════════════════════════════════════════════════════════
+        // --- Global parameters (algorithm only) ---
+        // Algorithm knobs that act uniformly across every tree. Each one
+        // mirrors a real parameter in compute_stem_sections or its inputs.
         let params = {
             seed: 12345,
             pointsPerSection: 40,
             sectionSpacing: 20,       // cm between adjacent section rings (StemCleaningConfig.section_len)
-            minHeightM: 0.0,          // metres above base — lowest section to compute
-            maxHeightM: 45.0,         // metres above base — highest section to compute
             noiseLevel: 2.0,          // cm — sensor noise (size-independent)
-            leanAngle: 15,            // degrees, trunk 1 (angle is scale-invariant)
-            curveAmp: 3.0,            // % of tree height, trunk 2 (S-curve)
-            sweepAmp: 5.0,            // % of tree height, trunk 3 (consistent bow)
-            oscAmp: 2.5,              // % of tree height, trunk 4 (multi-bend)
-            oscBends: 2,              // number of half-cycles for trunk 4 (2 = one full S)
-            taper: 0.4,               // fraction of base radius lost at the top (0 = cylinder)
-            smoothWindow: 3           // median filter window (odd)
+            smoothWindow: 3           // median filter window (odd) — F1
         };
         const defaultParams = {...params};
+
+        // --- Re-roll bounds (forest composition) ---
+        // Ranges within which the stratified re-roll picks tree heights and
+        // (allometric) DBHs. Editing these does NOT change existing trees on
+        // their own — it constrains the next random roll.
+        let bounds = {
+            treeHeightMinM: 2.5,
+            treeHeightMaxM: 45.0
+            // DBH is no longer a re-roll bound: each tree's DBH is derived
+            // from its height via the allometric envelope (dbhRangeFor),
+            // which makes a global DBH cap redundant.
+        };
+        const defaultBounds = {...bounds};
+
+        // --- Curvature catalogue ---
+        // Each tree carries an independent LEAN (linear tilt, scale-invariant
+        // angle) AND an independent CURVATURE (sinusoidal, % of tree height).
+        // Setting either to 0 turns that contribution off — the two modifiers
+        // compose additively along the trunk.
+        //
+        // Curvature is parameterised by a single `curvBends` count: the trunk
+        // axis is offset by sin(tFrac · π · curvBends). bends=1 is a
+        // half-sine (consistent one-direction bow: zero at base, max in
+        // middle, zero at top); bends=2 is one full S (back-and-forth ×1);
+        // bends=N gives N/2 full S cycles. Set curvAmp=0 to flatten the
+        // contribution to zero (straight tree).
+        const CURV_AMP_MIN = 0;
+        const CURV_AMP_MAX = 15;
+        const CURV_AMP_STEP = 0.5;
+        const CURV_BENDS_MIN = 1;
+        const CURV_BENDS_MAX = 50;
+
+        // Per-tree taper range — fraction of base radius lost at the top.
+        const TAPER_MIN = 0;
+        const TAPER_MAX = 0.8;
+        const TAPER_STEP = 0.05;
+        const TAPER_DEFAULT = 0.4;
+
+        // --- Per-tree state ---
+        // One entry per tree slot. The forest re-roll fills this array
+        // deterministically from the current seed; users may then edit any
+        // field manually via the per-tree panel.
+        let trees = [];
+
+        // Allometric DBH given height in metres, clamped to the configured DBH bounds.
+        function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
+
+        function allometricDBH(heightM) {
+            const t = clamp((heightM - TREE_HEIGHT_MIN_M) /
+                            (TREE_HEIGHT_MAX_M - TREE_HEIGHT_MIN_M), 0, 1);
+            return DBH_MIN_CM + (DBH_MAX_CM - DBH_MIN_CM) * Math.pow(t, ALLOMETRIC_EXP);
+        }
+
+        // Stratified roll: divide the configured tree height range into N
+        // equal quintiles and place one tree in each. Guarantees a spread of
+        // heights even with a small N, regardless of the seed's vagaries.
+        function rollAllStratified() {
+            const n = TRUNK_X_OFFSETS.length;
+            const lo = bounds.treeHeightMinM;
+            const hi = bounds.treeHeightMaxM;
+            const span = Math.max(0, hi - lo) / n;
+            // Shuffle the bin order so the tall trees aren't always last.
+            const binOrder = [];
+            for (let i = 0; i < n; i++) binOrder.push(i);
+            for (let i = n - 1; i > 0; i--) {
+                const j = Math.floor(random() * (i + 1));
+                [binOrder[i], binOrder[j]] = [binOrder[j], binOrder[i]];
+            }
+            trees = [];
+            for (let t = 0; t < n; t++) {
+                const bin = binOrder[t];
+                const hM = lo + (bin + random()) * span;       // uniform within bin
+                trees.push(makeTreeFromHeight(hM));
+            }
+        }
+
+        // Re-roll a single tree across the full configured height range.
+        function rollOne(treeIdx) {
+            const hM = bounds.treeHeightMinM +
+                       random() * (bounds.treeHeightMaxM - bounds.treeHeightMinM);
+            trees[treeIdx] = makeTreeFromHeight(hM);
+            initializeSystem();
+            syncTreeUI(treeIdx);
+        }
+
+        // DBH ± fraction allowed around the allometric mean — the
+        // proportionality envelope that the per-tree DBH slider enforces.
+        const DBH_PROP_TOLERANCE = 0.30;   // ±30% from allometric(height)
+
+        function dbhRangeFor(heightM) {
+            const allo = allometricDBH(heightM);
+            return {
+                lo: allo * (1 - DBH_PROP_TOLERANCE),
+                hi: allo * (1 + DBH_PROP_TOLERANCE),
+                mean: allo
+            };
+        }
+
+        function makeTreeFromHeight(heightM) {
+            heightM = clamp(heightM, TREE_HEIGHT_MIN_M, TREE_HEIGHT_MAX_M);
+            // DBH constrained to the proportionality envelope around the
+            // allometric mean — no implausible "thin giant" or "fat dwarf".
+            const range = dbhRangeFor(heightM);
+            const dbhCm = clamp(range.mean + randomGaussian() * DBH_NOISE_CM,
+                                range.lo, range.hi);
+            // Random lean: 50% chance the tree is upright (0°), otherwise
+            // uniform in (0°, 25°]. Avoids every random forest looking like
+            // a windstorm hit it.
+            const leanAngle = random() < 0.5 ? 0 : random() * 25;
+            // Random curvature: 50% chance straight (amp=0); otherwise a
+            // moderate amplitude. Bend count biased toward low values so
+            // most trees show consistent bow or one S, with occasional
+            // higher-frequency wiggle from the long tail.
+            const curvAmp = random() < 0.5 ? 0 : random() * (CURV_AMP_MAX * 0.6);
+            const curvBends = 1 + Math.floor(Math.pow(random(), 2.5) *
+                                             (CURV_BENDS_MAX - 1));  // 1..50, strongly low-biased
+            // Taper: jitter a bit around the default so trees don't all look
+            // identical in profile. Range ~ [0.25, 0.55].
+            const taper = clamp(TAPER_DEFAULT + (random() - 0.5) * 0.30, TAPER_MIN, TAPER_MAX);
+            return {heightM, dbhCm, leanAngle, curvAmp, curvBends, taper};
+        }
 
         // Layer visibility — controlled by the floating Layers panel inside
         // the canvas. Each draw() conditionally renders the corresponding glyphs.
@@ -574,7 +745,8 @@
             rings:             true,
             trueAxis:          true,
             rawCenterline:     true,
-            smoothCenterline:  true
+            smoothCenterline:  true,
+            treeLabels:        true
         };
         const defaultLayers = {...layers};
 
@@ -593,23 +765,13 @@
         const ALLOMETRIC_EXP = 0.85;
         const DBH_NOISE_CM = 4.0;   // sd of random deviation from the curve
 
-        // Per-tree dimensions, deterministic from seed (re-rolled by initializeSystem).
-        let treeDims = [];
-
-        function clamp(x, lo, hi) { return Math.max(lo, Math.min(hi, x)); }
-
-        // Allometric DBH given height in metres.
-        function allometricDBH(heightM) {
-            const t = clamp((heightM - TREE_HEIGHT_MIN_M) /
-                            (TREE_HEIGHT_MAX_M - TREE_HEIGHT_MIN_M), 0, 1);
-            return DBH_MIN_CM + (DBH_MAX_CM - DBH_MIN_CM) * Math.pow(t, ALLOMETRIC_EXP);
-        }
-
-        // True radius at world height yh (negative = up). Linear taper:
+        // True radius at world height yh (negative = up). Linear taper
+        // is now a per-tree property — different species/individuals have
+        // different taper curves.
         // r(z) = radius_base * (1 - taper * z_fraction).
-        function trueRadiusAt(yh, treeHeightCm, treeRadiusCm) {
+        function trueRadiusAt(yh, treeHeightCm, treeRadiusCm, taper) {
             const tFrac = -yh / treeHeightCm;   // 0 at base, 1 at top
-            return treeRadiusCm * (1 - params.taper * tFrac);
+            return treeRadiusCm * (1 - taper * tFrac);
         }
 
         // Derived state (recomputed when params change)
@@ -666,6 +828,9 @@
             }
             document.querySelector('.loading').style.display = 'none';
             initializeSystem();
+            // Once `trees` is populated by the initial roll, materialise the
+            // per-tree DOM panels and sync them.
+            renderTreePanels();
         }
 
         // Re-fit the canvas drawing surface whenever the browser is resized,
@@ -678,31 +843,23 @@
         function initializeSystem() {
             randomSeed(params.seed);
             noiseSeed(params.seed);
-            rollTreeDimensions();
+            // Roll the forest if it's empty (first call) OR if the seed
+            // changed since the last roll. Manual edits to `trees` are
+            // preserved across param changes that don't touch the seed.
+            if (!trees.length || params.seed !== lastSeedRolled) {
+                rollAllStratified();
+                lastSeedRolled = params.seed;
+                // Sync the per-tree panels so the sliders/displays reflect
+                // the new forest. Safe before the panels exist (the helpers
+                // bail out when their DOM nodes are absent).
+                syncAllTreesUI();
+            }
             buildScenes();
         }
 
-        // Pre-roll per-tree height & DBH using the current (seeded) random
-        // state. Doing this BEFORE buildScenes ensures the same seed always
-        // produces the same forest, regardless of how many random() calls
-        // the section generation makes later.
-        function rollTreeDimensions() {
-            treeDims = [];
-            for (let t = 0; t < TRUNK_X_OFFSETS.length; t++) {
-                const heightM = TREE_HEIGHT_MIN_M +
-                                random() * (TREE_HEIGHT_MAX_M - TREE_HEIGHT_MIN_M);
-                const dbhMean = allometricDBH(heightM);
-                const dbh = clamp(dbhMean + randomGaussian() * DBH_NOISE_CM,
-                                  DBH_MIN_CM, DBH_MAX_CM);
-                treeDims.push({
-                    heightCm: heightM * 100,
-                    radiusCm: dbh / 2,
-                    // Stored for any downstream label/diagnostic use.
-                    heightM: heightM,
-                    dbhCm: dbh
-                });
-            }
-        }
+        // Track the seed used for the last forest roll so we only re-roll
+        // when the seed actually changes (not on every param tweak).
+        let lastSeedRolled = null;
 
         function buildScenes() {
             scenes = [];
@@ -712,53 +869,45 @@
         }
 
         // True axis offset (cx, cz) at height yh in world cm.
-        // yh is in [0, -treeHeightCm] (negative = up).
-        // tFrac = -yh / treeHeightCm runs 0 (base) → 1 (top).
-        // Sweep amplitudes are % of tree height — same shape parameters
-        // produce proportional curvature on tall and short trees alike.
+        // Each tree composes TWO independent modifiers additively:
+        //   - leanAngle (degrees): a linear tilt of the axis from vertical.
+        //     0 = perfectly vertical. Scale-invariant — angle behaves the
+        //     same on tall and short trees.
+        //   - curvAmp + curvBends: a sinusoidal deviation expressed as
+        //     % of tree height, so the curvature scales proportionally
+        //     between short and tall trees. curvBends controls the shape:
+        //       bends=1 → half-sine (consistent bow: zero at base/top,
+        //                 max in the middle)
+        //       bends=2 → one full S (single back-and-forth cycle)
+        //       bends=4 → two full S cycles
+        //       bends=50 → twenty-five cycles (high-frequency wiggle)
+        // Setting either contribution to 0 (lean=0 or amp=0) turns it off.
+        // tFrac runs 0 (base) → 1 (top); yh is negative (up).
         function trueAxisFor(trunkIdx, yh, treeHeightCm) {
+            const tree = trees[trunkIdx];
+            if (!tree) return {cx: 0, cz: 0};
             const tFrac = -yh / treeHeightCm;
-            switch (trunkIdx) {
-                case 0:
-                    // Perfectly straight trunk.
-                    return {cx: 0, cz: 0};
-                case 1: {
-                    // Linear lean: straight axis tilted by leanAngle degrees.
-                    const dx = Math.tan(params.leanAngle * Math.PI / 180) * (-yh);
-                    return {cx: dx, cz: 0};
-                }
-                case 2: {
-                    // S-curve: sinusoidal with 1.4π span (mild back-and-forth).
-                    const ampCm = params.curveAmp * 0.01 * treeHeightCm;
-                    const dx = ampCm * Math.sin(tFrac * Math.PI * 1.4);
-                    return {cx: dx, cz: 0};
-                }
-                case 3: {
-                    // Consistent sweep (bow): quarter sine, monotonic in one direction.
-                    // Zero at base, +sweepAmp%·height at the top, no zero crossings.
-                    const ampCm = params.sweepAmp * 0.01 * treeHeightCm;
-                    const dx = ampCm * Math.sin(tFrac * Math.PI / 2);
-                    return {cx: dx, cz: 0};
-                }
-                case 4: {
-                    // Multi-bend back-and-forth: configurable number of half-cycles.
-                    // oscBends = 2 → one full S; 4 → two S's; etc.
-                    const ampCm = params.oscAmp * 0.01 * treeHeightCm;
-                    const dx = ampCm * Math.sin(tFrac * Math.PI * params.oscBends);
-                    return {cx: dx, cz: 0};
-                }
-                default:
-                    return {cx: 0, cz: 0};
+            let dx = 0;
+            // Lean component (linear).
+            if (tree.leanAngle && tree.leanAngle !== 0) {
+                dx += Math.tan(tree.leanAngle * Math.PI / 180) * (-yh);
             }
+            // Curvature component (sinusoidal). curvAmp = 0 disables it.
+            if (tree.curvAmp && tree.curvAmp > 0) {
+                const ampCm = tree.curvAmp * 0.01 * treeHeightCm;
+                const bends = tree.curvBends || 1;
+                dx += ampCm * Math.sin(tFrac * Math.PI * bends);
+            }
+            return {cx: dx, cz: 0};
         }
 
         function buildOneScene(trunkIdx) {
             const points = []; // each {x, y, z}
             const fittedCenters = []; // each {cx, cy, cz, r}
             const xOff = TRUNK_X_OFFSETS[trunkIdx];
-            const dims = treeDims[trunkIdx];
-            const treeHeightCm = dims.heightCm;
-            const treeRadiusCm = dims.radiusCm;
+            const tree = trees[trunkIdx];
+            const treeHeightCm = tree.heightM * 100;
+            const treeRadiusCm = tree.dbhCm / 2;
 
             // True axis line spans the FULL trunk (not just the section range)
             // so the user can see the ground truth where no sections are fit.
@@ -772,19 +921,14 @@
             }
 
             // Section heights in cm above base, derived from the configured
-            // spacing and range. Mirrors StemCleaningConfig (section_len,
-            // minimum_height, maximum_height). Section range is given in
-            // metres (minHeightM, maxHeightM) — convert to cm here. Sections
-            // are also clipped by this tree's actual height: a 3 m tree gets
-            // no sections above z=300 cm regardless of params.maxHeightM.
+            // spacing. Sections span the FULL tree (0 → treeHeightCm) — each
+            // tree is sectioned all the way up. This mirrors what Module 7B
+            // would do with `minimum_height=0` and `maximum_height` set to at
+            // least the tallest stem.
             const sectionZ = [];
-            const minH = params.minHeightM * 100;
-            const maxH = Math.min(params.maxHeightM * 100, treeHeightCm);
             const step = Math.max(1, params.sectionSpacing);
-            if (minH < maxH) {
-                for (let z = minH; z <= maxH + 1e-6; z += step) {
-                    sectionZ.push(z);
-                }
+            for (let z = 0; z <= treeHeightCm + 1e-6; z += step) {
+                sectionZ.push(z);
             }
 
             for (const zCm of sectionZ) {
@@ -792,7 +936,7 @@
                 const truth = trueAxisFor(trunkIdx, yh, treeHeightCm);
 
                 // Generate points around true circle (tapered with height) plus Gaussian noise.
-                const rTrue = trueRadiusAt(yh, treeHeightCm, treeRadiusCm);
+                const rTrue = trueRadiusAt(yh, treeHeightCm, treeRadiusCm, tree.taper);
                 const sliceLocal = []; // 2D (x, z) relative to xOff
                 for (let p = 0; p < params.pointsPerSection; p++) {
                     const theta = 2 * Math.PI * (p / params.pointsPerSection) + randomGaussian() * 0.05;
@@ -925,6 +1069,10 @@
             meanHeightCm /= Math.max(1, scenes.length);
             translate(0, meanHeightCm * 0.5, 0);
 
+            // Update tree-label DOM positions now that the modelview matrix
+            // reflects the camera state and the scene-centering translate.
+            updateTreeLabels();
+
             // Reference ground plane (subtle).
             drawGroundGrid();
 
@@ -934,6 +1082,68 @@
                 if (layers.rings)            drawFittedRings(scene);
                 if (layers.rawCenterline)    drawPolyline(scene.rawCenterline,    [207, 58, 138], 3);
                 if (layers.smoothCenterline) drawPolyline(scene.smoothCenterline, [120, 140,  93], 4);
+            }
+        }
+
+        // Project a point (model coords AT THE CURRENT TRANSFORM STATE) to
+        // canvas pixel coords using p5.js WEBGL's modelview and projection
+        // matrices. Returns {x, y, visible} where visible=false means the
+        // point is behind the camera or outside the view frustum.
+        //
+        // Reads `_renderer.uMVMatrix` and `_renderer.uPMatrix` (both column-
+        // major 4x4) — these reflect every camera() + orbitControl() + push/
+        // translate that has run so far in the current draw frame.
+        function projectToScreen(mx, my, mz) {
+            const r = _renderer;
+            if (!r || !r.uMVMatrix || !r.uPMatrix) return null;
+            const mv = r.uMVMatrix.mat4;
+            const pm = r.uPMatrix.mat4;
+            // mv * (mx, my, mz, 1) → eye space (column-major multiply).
+            const ex = mv[0]*mx + mv[4]*my + mv[8]*mz  + mv[12];
+            const ey = mv[1]*mx + mv[5]*my + mv[9]*mz  + mv[13];
+            const ez = mv[2]*mx + mv[6]*my + mv[10]*mz + mv[14];
+            const ew = mv[3]*mx + mv[7]*my + mv[11]*mz + mv[15];
+            // pm * eyePoint → clip space.
+            const cx = pm[0]*ex + pm[4]*ey + pm[8]*ez  + pm[12]*ew;
+            const cy = pm[1]*ex + pm[5]*ey + pm[9]*ez  + pm[13]*ew;
+            const cw = pm[3]*ex + pm[7]*ey + pm[11]*ez + pm[15]*ew;
+            if (cw <= 0.0001) return {visible: false};
+            const ndcX = cx / cw;
+            const ndcY = cy / cw;
+            const visible = (ndcX >= -1 && ndcX <= 1 && ndcY >= -1 && ndcY <= 1);
+            // Use the canvas's DISPLAYED CSS dimensions, NOT p5's `width`/
+            // `height` globals (those are the drawing-buffer size, which is
+            // capped in getCanvasSize() and can be smaller than the on-screen
+            // canvas when the container exceeds the cap). CSS stretches the
+            // buffer to fill the container; we must project to the same
+            // stretched coordinate space the user actually sees.
+            const canvasEl = (r.elt) || document.querySelector('#canvas-container canvas');
+            const dispW = (canvasEl && canvasEl.clientWidth)  || width;
+            const dispH = (canvasEl && canvasEl.clientHeight) || height;
+            return {
+                x: (ndcX + 1) * 0.5 * dispW,
+                y: (1 - ndcY) * 0.5 * dispH,
+                visible
+            };
+        }
+
+        // Position each tree's identifier label below the projected base of
+        // its trunk. Called from draw() AFTER the scene-centering translate,
+        // so the modelview matrix reflects that shift.
+        function updateTreeLabels() {
+            const show = layers.treeLabels;
+            for (let i = 0; i < TRUNK_X_OFFSETS.length; i++) {
+                const el = document.getElementById(`tree-label-${i}`);
+                if (!el) continue;
+                if (!show) { el.style.display = 'none'; continue; }
+                // Tree base in model coords (at current transform state) is
+                // (xOff, 0, 0) — the translate(0, meanH/2, 0) is already in
+                // the modelview matrix.
+                const p = projectToScreen(TRUNK_X_OFFSETS[i], 0, 0);
+                if (!p || !p.visible) { el.style.display = 'none'; continue; }
+                el.style.display = 'block';
+                el.style.left = p.x + 'px';
+                el.style.top  = p.y + 'px';
             }
         }
 
@@ -1021,18 +1231,16 @@
         // Unit suffix per parameter, used for the value-display badge next
         // to each slider. Empty string means "no unit" (raw number).
         const PARAM_UNITS = {
-            minHeightM:       ' m',
-            maxHeightM:       ' m',
             sectionSpacing:   ' cm',
             noiseLevel:       ' cm',
-            leanAngle:        ' °',
-            curveAmp:         ' %',
-            sweepAmp:         ' %',
-            oscAmp:           ' %',
-            taper:            '',
             smoothWindow:     '',
-            oscBends:         '',
             pointsPerSection: ''
+        };
+
+        // Unit suffix for forest re-roll bounds (separate dict).
+        const BOUND_UNITS = {
+            treeHeightMinM: ' m',
+            treeHeightMaxM: ' m'
         };
 
         function updateParam(name, value) {
@@ -1043,6 +1251,218 @@
             initializeSystem();
         }
 
+        function updateBound(name, value) {
+            const numeric = Number(value);
+            bounds[name] = numeric;
+            const unit = BOUND_UNITS[name] || '';
+            document.getElementById(name + '-value').textContent = value + unit;
+            // Editing bounds does NOT re-roll trees on its own — only the
+            // "Re-roll all" button does. Bounds take effect at the next roll.
+        }
+
+        // Field → {displayId, unit, step} map used to refresh the value-badge
+        // next to each per-tree slider whenever its value changes.
+        const TREE_FIELD_DISPLAY = {
+            heightM:   {suffix: 'height-value',  unit: ' m',  step: 0.1},
+            dbhCm:     {suffix: 'dbh-value',     unit: ' cm', step: 1},
+            leanAngle: {suffix: 'lean-value',    unit: ' °',  step: 0.5},
+            curvAmp:   {suffix: 'curvAmp-value', unit: ' %',  step: CURV_AMP_STEP},
+            curvBends: {suffix: 'bends-value',   unit: '',    step: 1},
+            taper:     {suffix: 'taper-value',   unit: '',    step: TAPER_STEP}
+        };
+
+        // Update one field of one tree from a per-tree control. Also refreshes
+        // the value-badge next to that slider (otherwise it would lag the slider).
+        //
+        // Special case for heightM: the DBH is SCALED proportionally with the
+        // allometric trend (dbh_new = dbh_old · allo(h_new) / allo(h_old)).
+        // This preserves the tree's "fat/thin" character across height edits
+        // and keeps the DBH slider thumb at roughly the same relative position
+        // inside the (also-shifting) ±30% envelope. Plain clamping would have
+        // made the thumb visually drift while leaving the numeric DBH stuck
+        // at the same value — counter-intuitive for the user.
+        function updateTreeField(idx, field, value) {
+            const numeric = Number(value);
+            const t = trees[idx];
+            if (field === 'heightM') {
+                const oldAllo = allometricDBH(t.heightM);
+                const newAllo = allometricDBH(numeric);
+                if (oldAllo > 0) t.dbhCm = t.dbhCm * (newAllo / oldAllo);
+                t.heightM = numeric;
+            } else {
+                t[field] = numeric;
+            }
+            const disp = TREE_FIELD_DISPLAY[field];
+            if (disp) {
+                const el = document.getElementById(`tree-${idx}-${disp.suffix}`);
+                if (el) el.textContent = formatNumber(t[field], disp.step) + disp.unit;
+            }
+            // When height changes, the DBH envelope shifts; re-range the
+            // DBH slider, clamp DBH defensively, and refresh its badge.
+            if (field === 'heightM') applyDbhRangeFor(idx);
+            buildScenes();
+        }
+
+        // Re-roll a single tree using the current bounds. Advances the
+        // seeded RNG; the rest of the forest's appearance may shift slightly
+        // because section point generation re-consumes random state.
+        function rollOne(idx) {
+            const hM = bounds.treeHeightMinM +
+                       random() * (bounds.treeHeightMaxM - bounds.treeHeightMinM);
+            trees[idx] = makeTreeFromHeight(hM);
+            syncTreeUI(idx);
+            buildScenes();
+        }
+
+        // Re-roll the entire forest. Bumps the seed so the new state is
+        // reproducible from the Seed input (and so successive clicks land
+        // on different forests).
+        function rollAll() {
+            params.seed = Math.floor(Math.random() * 999999) + 1;
+            updateSeedDisplay();
+            initializeSystem();
+            syncAllTreesUI();
+        }
+
+        // --- Tree panel rendering ---
+
+        function renderTreePanels() {
+            const container = document.getElementById('tree-panels');
+            if (!container) return;
+            const parts = [];
+            for (let i = 0; i < trees.length; i++) {
+                parts.push(`
+                    <div class="tree-panel" id="tree-panel-${i}">
+                        <div class="tree-panel-header">
+                            <div class="tree-panel-title">Tree ${i + 1}</div>
+                            <button class="tree-roll" onclick="rollOne(${i})" title="Re-roll this tree">🎲</button>
+                        </div>
+                        <div class="control-group">
+                            <label>Height (m)</label>
+                            <div class="slider-container">
+                                <input type="range" id="tree-${i}-height" min="2.5" max="45.0" step="0.1"
+                                       oninput="updateTreeField(${i}, 'heightM', this.value)">
+                                <span class="value-display" id="tree-${i}-height-value"></span>
+                            </div>
+                        </div>
+                        <div class="control-group">
+                            <label>DBH (cm)</label>
+                            <div class="slider-container">
+                                <input type="range" id="tree-${i}-dbh" min="5" max="150" step="1"
+                                       oninput="updateTreeField(${i}, 'dbhCm', this.value)">
+                                <span class="value-display" id="tree-${i}-dbh-value"></span>
+                            </div>
+                        </div>
+                        <div class="control-group">
+                            <label>Lean angle (°)</label>
+                            <div class="slider-container">
+                                <input type="range" id="tree-${i}-lean" min="0" max="30" step="0.5"
+                                       oninput="updateTreeField(${i}, 'leanAngle', this.value)">
+                                <span class="value-display" id="tree-${i}-lean-value"></span>
+                            </div>
+                        </div>
+                        <div class="control-group">
+                            <label>Curvature amplitude (% h)</label>
+                            <div class="slider-container">
+                                <input type="range" id="tree-${i}-curvAmp"
+                                       min="${CURV_AMP_MIN}" max="${CURV_AMP_MAX}" step="${CURV_AMP_STEP}"
+                                       oninput="updateTreeField(${i}, 'curvAmp', this.value)">
+                                <span class="value-display" id="tree-${i}-curvAmp-value"></span>
+                            </div>
+                        </div>
+                        <div class="control-group">
+                            <label>Bends (1 = consistent, 2+ = back-and-forth)</label>
+                            <div class="slider-container">
+                                <input type="range" id="tree-${i}-bends"
+                                       min="${CURV_BENDS_MIN}" max="${CURV_BENDS_MAX}" step="1"
+                                       oninput="updateTreeField(${i}, 'curvBends', this.value)">
+                                <span class="value-display" id="tree-${i}-bends-value"></span>
+                            </div>
+                        </div>
+                        <div class="control-group">
+                            <label>Taper (fraction lost at top)</label>
+                            <div class="slider-container">
+                                <input type="range" id="tree-${i}-taper"
+                                       min="${TAPER_MIN}" max="${TAPER_MAX}" step="${TAPER_STEP}"
+                                       oninput="updateTreeField(${i}, 'taper', this.value)">
+                                <span class="value-display" id="tree-${i}-taper-value"></span>
+                            </div>
+                        </div>
+                    </div>
+                `);
+            }
+            container.innerHTML = parts.join('');
+            syncAllTreesUI();
+        }
+
+        // Format a value to the number of decimals implied by the slider step.
+        function formatNumber(v, step) {
+            const decimals = (step >= 1) ? 0 : (step >= 0.1 ? 1 : 2);
+            return Number(v).toFixed(decimals);
+        }
+
+        // Sync the DOM controls of one tree panel from trees[idx]. Reads each
+        // field's display metadata from TREE_FIELD_DISPLAY so the unit/step
+        // logic lives in exactly one place.
+        function syncTreeUI(idx) {
+            const t = trees[idx];
+            if (!t) return;
+            // Probe one element to detect whether panels have been built yet.
+            if (!document.getElementById(`tree-${idx}-height`)) return;
+
+            const FIELDS = [
+                {name: 'heightM',   sliderId: `tree-${idx}-height`},
+                {name: 'dbhCm',     sliderId: `tree-${idx}-dbh`},
+                {name: 'leanAngle', sliderId: `tree-${idx}-lean`},
+                {name: 'curvAmp',   sliderId: `tree-${idx}-curvAmp`},
+                {name: 'curvBends', sliderId: `tree-${idx}-bends`},
+                {name: 'taper',     sliderId: `tree-${idx}-taper`}
+            ];
+            // Sync DBH slider min/max to the proportionality envelope
+            // for the tree's current height BEFORE setting the DBH value,
+            // so the value isn't clamped by stale range attributes.
+            applyDbhRangeFor(idx);
+            for (const f of FIELDS) {
+                const slider = document.getElementById(f.sliderId);
+                if (!slider) continue;
+                slider.value = t[f.name];
+                const disp = TREE_FIELD_DISPLAY[f.name];
+                if (disp) {
+                    const el = document.getElementById(`tree-${idx}-${disp.suffix}`);
+                    if (el) el.textContent = formatNumber(t[f.name], disp.step) + disp.unit;
+                }
+            }
+        }
+
+        function syncAllTreesUI() {
+            for (let i = 0; i < trees.length; i++) syncTreeUI(i);
+        }
+
+        // Adjust the DBH slider's min/max to the ±DBH_PROP_TOLERANCE envelope
+        // around the allometric DBH for this tree's current height, then clamp
+        // the stored DBH value to fit. Called when the panel renders, when
+        // the height changes, and on re-roll.
+        function applyDbhRangeFor(idx) {
+            const t = trees[idx];
+            if (!t) return;
+            const range = dbhRangeFor(t.heightM);
+            // Round to integer cm so the slider's step=1 lands cleanly on
+            // both endpoints (fractional min/max with integer step produces
+            // off-by-fraction thumb snapping that looks like the slider is
+            // "between" notches). Slight bound widening (<1 cm) is harmless.
+            const sliderMin = Math.floor(range.lo);
+            const sliderMax = Math.ceil(range.hi);
+            t.dbhCm = clamp(t.dbhCm, sliderMin, sliderMax);
+            const slider = document.getElementById(`tree-${idx}-dbh`);
+            if (!slider) return;
+            slider.min = sliderMin;
+            slider.max = sliderMax;
+            slider.value = t.dbhCm;
+            const disp = TREE_FIELD_DISPLAY.dbhCm;
+            const el = document.getElementById(`tree-${idx}-${disp.suffix}`);
+            if (el) el.textContent = formatNumber(t.dbhCm, disp.step) + disp.unit;
+        }
+
         // Toggle a layer on/off and reflect the state in its DOM row.
         function toggleLayer(name) {
             if (!(name in layers)) return;
@@ -1051,7 +1471,8 @@
             if (row) row.classList.toggle('on', layers[name]);
         }
 
-        // Keyboard shortcuts: p=points, c=circles, a=axis, r=raw, s=smoothed.
+        // Keyboard shortcuts: p=points, c=circles, a=axis, r=raw,
+        // s=smoothed, l=tree labels.
         window.addEventListener('keydown', (e) => {
             if (e.target.tagName === 'INPUT') return;
             const k = e.key.toLowerCase();
@@ -1060,6 +1481,7 @@
             else if (k === 'a') toggleLayer('trueAxis');
             else if (k === 'r') toggleLayer('rawCenterline');
             else if (k === 's') toggleLayer('smoothCenterline');
+            else if (k === 'l') toggleLayer('treeLabels');
         });
 
         function updateSeedDisplay() {
@@ -1096,23 +1518,42 @@
 
         function resetParameters() {
             params = {...defaultParams};
-            const fields = ['pointsPerSection', 'sectionSpacing', 'minHeightM',
-                            'maxHeightM', 'noiseLevel', 'leanAngle', 'curveAmp',
-                            'sweepAmp', 'oscAmp', 'oscBends', 'taper',
-                            'smoothWindow'];
-            for (const f of fields) {
-                document.getElementById(f).value = params[f];
+            bounds = {...defaultBounds};
+
+            // Sync the global algorithm sliders + their value badges.
+            const paramFields = ['pointsPerSection', 'sectionSpacing',
+                                 'noiseLevel', 'smoothWindow'];
+            for (const f of paramFields) {
+                const el = document.getElementById(f);
+                if (!el) continue;
+                el.value = params[f];
                 const unit = PARAM_UNITS[f] || '';
                 document.getElementById(f + '-value').textContent = params[f] + unit;
             }
+
+            // Sync the forest re-roll bounds sliders + their value badges.
+            const boundFields = ['treeHeightMinM', 'treeHeightMaxM'];
+            for (const f of boundFields) {
+                const el = document.getElementById(f);
+                if (!el) continue;
+                el.value = bounds[f];
+                const unit = BOUND_UNITS[f] || '';
+                document.getElementById(f + '-value').textContent = bounds[f] + unit;
+            }
+
             // Restore layer visibility defaults and sync the DOM rows.
             layers = {...defaultLayers};
             for (const name of Object.keys(layers)) {
                 const row = document.getElementById('layer-row-' + name);
                 if (row) row.classList.toggle('on', layers[name]);
             }
+
+            // Force a re-roll of the forest (since the seed may have come
+            // back to the default) and refresh the per-tree panels.
+            lastSeedRolled = null;
             updateSeedDisplay();
             initializeSystem();
+            syncAllTreesUI();
         }
 
         window.addEventListener('load', updateSeedDisplay);
