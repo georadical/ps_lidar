@@ -340,6 +340,62 @@
             font-style: italic;
         }
 
+        /* Category legend — static, non-interactive rows listing the colour
+           of each sweep category. Generated from CATEGORY_CONFIG so it
+           scales automatically when more categories are added. */
+        .layer-subheader {
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: var(--anthropic-mid-gray);
+            margin-top: 10px;
+            padding-top: 6px;
+            border-top: 1px solid rgba(255, 255, 255, 0.07);
+        }
+
+        .legend-row {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 3px 0;
+            font-size: 11px;
+            color: var(--anthropic-light);
+            cursor: default;
+        }
+
+        /* Static (non-interactive) version of layer-row, used by the
+           sweep-category legend below the layer toggles. No hover, no
+           cursor change, no .on state — purely informational. */
+        .legend-row-static {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 3px 0;
+            font-size: 11px;
+            color: var(--anthropic-light);
+            cursor: default;
+            opacity: 0.85;
+        }
+
+        .legend-swatch-line {
+            width: 18px;
+            height: 3px;
+            border-radius: 1px;
+            flex-shrink: 0;
+        }
+
+        .legend-key {
+            font-family: 'Courier New', monospace;
+            font-weight: 700;
+            min-width: 14px;
+        }
+
+        .legend-desc {
+            color: var(--anthropic-mid-gray);
+            font-size: 10px;
+        }
+
         /* Tree identifier labels: HTML divs that float over the canvas at
            projected positions of each tree's base. Pointer-events:none so
            the user can still drag the canvas through them. */
@@ -426,6 +482,135 @@
 
         .tree-panel input[disabled] { opacity: 0.35; pointer-events: none; }
         .tree-panel .control-group.disabled label { opacity: 0.4; }
+
+        /* Per-tree section list (stack of HQP-categorised sweep regions). */
+        .sections-block { margin: 8px 0 6px; }
+
+        .section-card {
+            background: white;
+            border: 1px solid var(--anthropic-light-gray);
+            border-radius: 5px;
+            padding: 6px 8px;
+            margin-bottom: 6px;
+        }
+
+        .section-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 4px;
+        }
+
+        .section-card-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--anthropic-dark);
+        }
+
+        .section-remove-btn {
+            background: transparent;
+            border: 1px solid var(--anthropic-light-gray);
+            color: var(--anthropic-mid-gray);
+            border-radius: 3px;
+            font-size: 13px;
+            line-height: 1;
+            width: 20px;
+            height: 20px;
+            cursor: pointer;
+            padding: 0;
+            font-family: inherit;
+        }
+
+        .section-remove-btn:hover:not([disabled]) {
+            background: var(--anthropic-orange);
+            color: white;
+            border-color: var(--anthropic-orange);
+        }
+
+        .section-remove-btn[disabled] { opacity: 0.3; cursor: not-allowed; }
+
+        .section-row { margin-bottom: 4px; }
+
+        .section-range {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .section-range input[type="range"] { flex: 1; }
+
+        .section-range-arrow {
+            font-size: 10px;
+            color: var(--anthropic-mid-gray);
+        }
+
+        .section-add-btn {
+            width: 100%;
+            background: var(--anthropic-light-gray);
+            color: var(--anthropic-dark);
+            font-size: 11px;
+            padding: 5px 8px;
+            margin-top: 2px;
+        }
+
+        .section-add-btn:hover {
+            background: var(--anthropic-blue);
+            color: white;
+            transform: none;
+        }
+
+        /* NumericStepper — compact "minus value plus" control. */
+        .num-stepper {
+            display: inline-flex;
+            align-items: stretch;
+            background: white;
+            border: 1px solid var(--anthropic-light-gray);
+            border-radius: 4px;
+            overflow: hidden;
+            height: 24px;
+            flex: 1;
+            min-width: 0;
+        }
+
+        .stepper-btn {
+            background: transparent;
+            border: none;
+            color: var(--anthropic-dark);
+            font-size: 14px;
+            width: 22px;
+            cursor: pointer;
+            line-height: 1;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: inherit;
+            transition: background 0.12s, color 0.12s;
+        }
+
+        .stepper-btn:hover:not([disabled]) {
+            background: var(--anthropic-orange);
+            color: white;
+        }
+
+        .stepper-btn[disabled] {
+            opacity: 0.3;
+            cursor: not-allowed;
+        }
+
+        .stepper-value {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: 'Courier New', monospace;
+            font-size: 11px;
+            color: var(--anthropic-dark);
+            padding: 0 4px;
+            border-left: 1px solid var(--anthropic-light-gray);
+            border-right: 1px solid var(--anthropic-light-gray);
+            min-width: 50px;
+        }
 
         #canvas-container canvas {
             display: block;
@@ -535,18 +720,6 @@
             </div>
 
             <div class="control-section">
-                <h3>Consensus (F1)</h3>
-
-                <div class="control-group">
-                    <label>Smoothing window</label>
-                    <div class="slider-container">
-                        <input type="range" id="smoothWindow" min="1" max="9" step="2" value="3" oninput="updateParam('smoothWindow', this.value)">
-                        <span class="value-display" id="smoothWindow-value">3</span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="control-section">
                 <h3>Actions</h3>
                 <button class="button" onclick="resetParameters()">Reset</button>
             </div>
@@ -564,7 +737,7 @@
                 <!-- Floating layer panel (replaces the sidebar legend + display block). -->
                 <div class="layer-panel" id="layer-panel">
                     <h4>Layers</h4>
-                    <div class="layer-row on" id="layer-row-points" onclick="toggleLayer('points')">
+                    <div class="layer-row" id="layer-row-points" onclick="toggleLayer('points')">
                         <span class="layer-toggle"></span>
                         <span class="layer-dot" style="background:#b58863"></span>
                         <span class="layer-label">LiDAR points</span>
@@ -577,23 +750,20 @@
                     <div class="layer-row on" id="layer-row-trueAxis" onclick="toggleLayer('trueAxis')">
                         <span class="layer-toggle"></span>
                         <span class="layer-swatch" style="background:#faf9f5"></span>
-                        <span class="layer-label">True axis</span>
+                        <span class="layer-label">Axis unclassified</span>
                     </div>
-                    <div class="layer-row on" id="layer-row-rawCenterline" onclick="toggleLayer('rawCenterline')">
+                    <div class="layer-row" id="layer-row-rawCenterline" onclick="toggleLayer('rawCenterline')">
                         <span class="layer-toggle"></span>
-                        <span class="layer-swatch" style="background:#cf3a8a"></span>
-                        <span class="layer-label">Raw centerline</span>
-                    </div>
-                    <div class="layer-row on" id="layer-row-smoothCenterline" onclick="toggleLayer('smoothCenterline')">
-                        <span class="layer-toggle"></span>
-                        <span class="layer-swatch" style="background:#788c5d"></span>
-                        <span class="layer-label">Smoothed centerline</span>
+                        <span class="layer-swatch" style="background:linear-gradient(90deg,#6a9bcc 0 25%,#788c5d 25% 50%,#d9b757 50% 75%,#cf3a8a 75%)"></span>
+                        <span class="layer-label">Axis classified</span>
                     </div>
                     <div class="layer-row on" id="layer-row-treeLabels" onclick="toggleLayer('treeLabels')">
                         <span class="layer-toggle"></span>
                         <span class="layer-dot" style="background:#faf9f5"></span>
                         <span class="layer-label">Tree labels</span>
                     </div>
+                    <div class="layer-subheader">Sweep categories</div>
+                    <div id="category-legend"></div>
                     <div class="hint">drag rotate · scroll zoom</div>
                 </div>
                 <div class="loading">Initializing scene…</div>
@@ -612,8 +782,7 @@
             seed: 12345,
             pointsPerSection: 40,
             sectionSpacing: 20,       // cm between adjacent section rings (StemCleaningConfig.section_len)
-            noiseLevel: 2.0,          // cm — sensor noise (size-independent)
-            smoothWindow: 3           // median filter window (odd) — F1
+            noiseLevel: 2.0           // cm — sensor noise (size-independent)
         };
         const defaultParams = {...params};
 
@@ -630,29 +799,106 @@
         };
         const defaultBounds = {...bounds};
 
-        // --- Curvature catalogue ---
-        // Each tree carries an independent LEAN (linear tilt, scale-invariant
-        // angle) AND an independent CURVATURE (sinusoidal, % of tree height).
-        // Setting either to 0 turns that contribution off — the two modifiers
-        // compose additively along the trunk.
-        //
-        // Curvature is parameterised by a single `curvBends` count: the trunk
-        // axis is offset by sin(tFrac · π · curvBends). bends=1 is a
-        // half-sine (consistent one-direction bow: zero at base, max in
-        // middle, zero at top); bends=2 is one full S (back-and-forth ×1);
-        // bends=N gives N/2 full S cycles. Set curvAmp=0 to flatten the
-        // contribution to zero (straight tree).
-        const CURV_AMP_MIN = 0;
-        const CURV_AMP_MAX = 15;
-        const CURV_AMP_STEP = 0.5;
-        const CURV_BENDS_MIN = 1;
-        const CURV_BENDS_MAX = 50;
+        // --- HQP sweep category catalogue ---
+        // Each tree is described by a stack of SECTIONS along the trunk
+        // (base to top). Each section carries one category from the HQP
+        // LiDAR Feature Cruising Dictionary. The category determines:
+        //   - sedDivisor: max axis deviation = SED / sedDivisor
+        //     (SED = small-end diameter of the section, i.e. its top
+        //      diameter, derived from the tree's taper)
+        //   - pattern: how the deviation evolves along the section
+        //       'consistent' = monotonic half-sine (8, L)
+        //       'backForth'  = full-cycle sine, returns to baseline (S)
+        //       'kink'       = sharp deviation localised in the first
+        //                      `charLength` metres, flat afterwards (K)
+        //   - charLength: characteristic length (m) used to scale the
+        //     pattern. For 'consistent' the offset accumulated at the
+        //     end of the section grows linearly with sectionLength /
+        //     charLength. For 'backForth' it sets the spatial period
+        //     (one full cycle per charLength metres). For 'kink' it sets
+        //     how compact the kink is at the bottom of the section.
+        //   - accumulates: does the offset at the end of the section
+        //     persist into the next section's baseline? Convention used
+        //     here (provisional, pending Interpine confirmation):
+        //       (B) — unidirectional patterns (8, L, K) accumulate;
+        //             back-and-forth (S) returns to baseline.
+        //     Flipping any flag here is enough to switch convention.
+        const CATEGORY_KEYS = ['8', 'L', 'S', 'K'];
+        const CATEGORY_CONFIG = {
+            '8': {
+                label: 'Gun-barrel (max SED/8)',
+                sedDivisor: 8,
+                pattern: 'consistent',
+                charLength: 6.0,
+                accumulates: true,
+                color: '#6a9bcc'   // anthropic-blue — straightest, calm
+            },
+            'L': {
+                label: 'Gentle sweep — consistent (SED/5 over 6 m)',
+                sedDivisor: 5,
+                pattern: 'consistent',
+                charLength: 6.0,
+                accumulates: true,
+                color: '#788c5d'   // anthropic-green — gentle monotonic
+            },
+            'S': {
+                label: 'Gentle sweep — back-and-forth (SED/5 over 4 m)',
+                sedDivisor: 5,
+                pattern: 'backForth',
+                charLength: 4.0,
+                accumulates: false,
+                color: '#d9b757'   // amber — oscillating, mid intensity
+            },
+            'K': {
+                // Pipe-elbow model: at the midpoint of the K section the
+                // axis abruptly rotates by an angle θ. The trunk above
+                // continues at the new tilt — all subsequent sections
+                // inherit it. maxAmpCm = (sectionLengthCm/2) · tan(θ),
+                // so SED/2 over a 0.5 m section gives roughly 38°.
+                label: 'Kink — pipe elbow (max 0.5 m)',
+                sedDivisor: 2,
+                pattern: 'kink',
+                charLength: 0.5,
+                accumulates: true,
+                color: '#cf3a8a'   // magenta — sharp local event
+            }
+        };
+
+        // Parse "#rrggbb" into a {r, g, b} triple, cached on the config
+        // entry so the parse runs once per category.
+        function hexToRgb(hex) {
+            const h = hex.replace('#', '');
+            return [
+                parseInt(h.slice(0, 2), 16),
+                parseInt(h.slice(2, 4), 16),
+                parseInt(h.slice(4, 6), 16)
+            ];
+        }
+
+        function categoryColorRgb(catKey) {
+            const cfg = CATEGORY_CONFIG[catKey];
+            if (!cfg) return [255, 255, 255];
+            if (!cfg._rgb) cfg._rgb = hexToRgb(cfg.color);
+            return cfg._rgb;
+        }
 
         // Per-tree taper range — fraction of base radius lost at the top.
         const TAPER_MIN = 0;
         const TAPER_MAX = 0.8;
         const TAPER_STEP = 0.05;
         const TAPER_DEFAULT = 0.4;
+
+        // Minimum section length (m) — enforced when editing toHeight and
+        // when adding a new section. Applies to non-K sections.
+        const MIN_SECTION_LENGTH_M = 0.5;
+
+        // Kink-specific length bounds. A K (pipe elbow) is a SHORT event
+        // by definition (HQP caps it at 0.5 m, we allow [0.4, 0.7] m for
+        // a bit more visual breathing room). Selecting K from a section's
+        // dropdown auto-clamps its length to this range; the section
+        // toHeight stepper enforces it on every step.
+        const KINK_MIN_LENGTH_M = 0.4;
+        const KINK_MAX_LENGTH_M = 0.7;
 
         // --- Per-tree state ---
         // One entry per tree slot. The forest re-roll fills this array
@@ -721,32 +967,105 @@
             const range = dbhRangeFor(heightM);
             const dbhCm = clamp(range.mean + randomGaussian() * DBH_NOISE_CM,
                                 range.lo, range.hi);
-            // Random lean: 50% chance the tree is upright (0°), otherwise
-            // uniform in (0°, 25°]. Avoids every random forest looking like
-            // a windstorm hit it.
-            const leanAngle = random() < 0.5 ? 0 : random() * 25;
-            // Random curvature: 50% chance straight (amp=0); otherwise a
-            // moderate amplitude. Bend count biased toward low values so
-            // most trees show consistent bow or one S, with occasional
-            // higher-frequency wiggle from the long tail.
-            const curvAmp = random() < 0.5 ? 0 : random() * (CURV_AMP_MAX * 0.6);
-            const curvBends = 1 + Math.floor(Math.pow(random(), 2.5) *
-                                             (CURV_BENDS_MAX - 1));  // 1..50, strongly low-biased
             // Taper: jitter a bit around the default so trees don't all look
             // identical in profile. Range ~ [0.25, 0.55].
             const taper = clamp(TAPER_DEFAULT + (random() - 0.5) * 0.30, TAPER_MIN, TAPER_MAX);
-            return {heightM, dbhCm, leanAngle, curvAmp, curvBends, taper};
+            // Random sections: 1..3 sections covering [0, heightM]. Most
+            // trees end up with just one or two sections; only a few
+            // candidates show a K kink or a mid-stem S band.
+            const sections = makeRandomSections(heightM);
+            return {heightM, dbhCm, taper, sections};
+        }
+
+        // Build a random stack of sections covering [0, heightM]. Each
+        // section gets a random category, a random ±1 direction, and a
+        // random ampFactor ∈ [0, 1] (so most trees aren't at the maximum
+        // tolerance for their category). Section boundaries are placed at
+        // random positions, with a minimum length enforced for each piece.
+        function makeRandomSections(heightM) {
+            // Pick how many sections: heavily biased to 1, with occasional
+            // 2 or 3 for variety. A short tree never gets 3 sections.
+            const maxSections = heightM < 4 ? 1 : (heightM < 10 ? 2 : 3);
+            let n = 1;
+            const r1 = random();
+            if (maxSections >= 2 && r1 > 0.55) n = 2;
+            if (maxSections >= 3 && r1 > 0.85) n = 3;
+
+            // Place internal boundaries uniformly, then sort.
+            const boundaries = [0];
+            for (let i = 1; i < n; i++) {
+                boundaries.push(random() * heightM);
+            }
+            boundaries.push(heightM);
+            boundaries.sort((a, b) => a - b);
+            // Enforce minimum section length by collapsing any gap < min.
+            for (let i = 1; i < boundaries.length; i++) {
+                if (boundaries[i] - boundaries[i - 1] < MIN_SECTION_LENGTH_M) {
+                    boundaries[i] = Math.min(heightM,
+                                             boundaries[i - 1] + MIN_SECTION_LENGTH_M);
+                }
+            }
+            // If the enforcement pushed past the top, trim sections.
+            while (boundaries.length > 2 &&
+                   boundaries[boundaries.length - 1] >= heightM) {
+                boundaries.splice(-2, 1);
+            }
+            boundaries[boundaries.length - 1] = heightM;
+
+            const out = [];
+            let prevCat = null;
+            for (let i = 0; i < boundaries.length - 1; i++) {
+                // Re-roll the category until it differs from the previous
+                // section's. Bounded loop: with N=4 categories the expected
+                // number of rolls is ~1.33; we cap at 6 to be defensive
+                // against a degenerate single-category future config.
+                let cat = randomCategoryKey();
+                for (let attempt = 0; attempt < 6 && cat === prevCat; attempt++) {
+                    cat = randomCategoryKey();
+                }
+                if (cat === prevCat) cat = firstAllowedCategory([prevCat]);
+                out.push({
+                    fromHeightM: boundaries[i],
+                    toHeightM:   boundaries[i + 1],
+                    category:    cat,
+                    direction:   random() < 0.5 ? -1 : 1,
+                    ampFactor:   random()    // 0..1 of the category's max
+                });
+                prevCat = cat;
+            }
+            return out;
+        }
+
+        // Choose a category for random rolls. K is INTENTIONALLY excluded:
+        // a K section has tight length constraints ([0.4, 0.7] m) and must
+        // always be followed by another section, so it does not fit cleanly
+        // into the uniform random boundary placement of makeRandomSections.
+        // Users add K manually via the per-section dropdown, which then
+        // enforces both rules.
+        function randomCategoryKey() {
+            const r = random();
+            if (r < 0.45) return '8';
+            if (r < 0.80) return 'L';
+            return 'S';
         }
 
         // Layer visibility — controlled by the floating Layers panel inside
         // the canvas. Each draw() conditionally renders the corresponding glyphs.
+        // Axis is presented in two mutually-exclusive modes:
+        //   trueAxis        = unclassified white line (the synthetic ground
+        //                     truth, used as the clean reference shape).
+        //   rawCenterline   = classified line — the same underlying axis
+        //                     coloured per sweep category, segment by
+        //                     segment. Activating either disables the other.
+        // The smoothed (F1) overlay was retired here because the sketch
+        // now focuses on sweep categories rather than on the F1 demo;
+        // smoothing as a concept lives on in the production pipeline.
         let layers = {
-            points:            true,
-            rings:             true,
-            trueAxis:          true,
-            rawCenterline:     true,
-            smoothCenterline:  true,
-            treeLabels:        true
+            points:            false,   // off by default — noisy and dense
+            rings:             true,    // ON  — primary "fitted circles"
+            trueAxis:          true,    // ON  — unclassified axis (white)
+            rawCenterline:     false,   // off — classified axis (per cat)
+            treeLabels:        true     // ON  — identifiers 1..5 at bases
         };
         const defaultLayers = {...layers};
 
@@ -775,7 +1094,7 @@
         }
 
         // Derived state (recomputed when params change)
-        let scenes = []; // array of {points, fittedCenters, fittedRadii, rawCenterline, smoothCenterline, trueAxisFn}
+        let scenes = []; // array of {points, fittedCenters, trueAxisLine, rawCenterline, treeHeightCm, treeRadiusCm}
 
         // ═══════════════════════════════════════════════════════════════════
         // P5.JS — SCENE
@@ -831,6 +1150,8 @@
             // Once `trees` is populated by the initial roll, materialise the
             // per-tree DOM panels and sync them.
             renderTreePanels();
+            // Populate the static sweep-category legend in the layer panel.
+            renderCategoryLegend();
         }
 
         // Re-fit the canvas drawing surface whenever the browser is resized,
@@ -843,23 +1164,17 @@
         function initializeSystem() {
             randomSeed(params.seed);
             noiseSeed(params.seed);
-            // Roll the forest if it's empty (first call) OR if the seed
-            // changed since the last roll. Manual edits to `trees` are
-            // preserved across param changes that don't touch the seed.
-            if (!trees.length || params.seed !== lastSeedRolled) {
+            // First call only: roll the forest once so the app boots with
+            // five trees. Subsequent seed changes (Prev / Next / Random /
+            // typed seed) only re-seed the RNG used for per-section point
+            // sampling — they do NOT re-roll trees. To regenerate the
+            // forest the user clicks "Re-roll all" or a per-tree 🎲.
+            if (!trees.length) {
                 rollAllStratified();
-                lastSeedRolled = params.seed;
-                // Sync the per-tree panels so the sliders/displays reflect
-                // the new forest. Safe before the panels exist (the helpers
-                // bail out when their DOM nodes are absent).
                 syncAllTreesUI();
             }
             buildScenes();
         }
-
-        // Track the seed used for the last forest roll so we only re-roll
-        // when the seed actually changes (not on every param tweak).
-        let lastSeedRolled = null;
 
         function buildScenes() {
             scenes = [];
@@ -868,37 +1183,152 @@
             }
         }
 
+        // Diameter (cm) of the stem at world height heightM, derived from
+        // the tree's base DBH and its per-tree taper. Linear taper model:
+        //   d(h) = baseDbh · (1 − taper · h/totalHeight)
+        // Used to compute each section's SED (small-end diameter = its
+        // upper diameter), from which the deviation amplitudes are derived.
+        function diameterAtHeight(tree, heightM) {
+            const tFrac = heightM / tree.heightM;
+            return tree.dbhCm * (1 - tree.taper * tFrac);
+        }
+
+        // Find the section whose [fromHeightM, toHeightM] range contains
+        // heightM. Used to tag each centerline control point with its
+        // section's category, so the rendered polyline can switch colour
+        // segment by segment. Falls back to the last section for points
+        // sitting at or beyond the trunk top.
+        function sectionContaining(tree, heightM) {
+            if (!tree || !tree.sections || !tree.sections.length) return null;
+            for (const sec of tree.sections) {
+                if (heightM >= sec.fromHeightM - 1e-9 &&
+                    heightM <= sec.toHeightM   + 1e-9) {
+                    return sec;
+                }
+            }
+            return tree.sections[tree.sections.length - 1];
+        }
+
+        // Compute the local pattern offset inside a section at parameter
+        // t ∈ [0, 1] (0 = section base, 1 = section top). Returns a value
+        // in cm — multiply by section.direction (±1) outside if needed.
+        function sectionPatternOffset(category, t, sectionLength, maxAmpCm) {
+            const cfg = CATEGORY_CONFIG[category];
+            if (!cfg) return 0;
+            const lengthRatio = sectionLength / cfg.charLength;
+            switch (cfg.pattern) {
+                case 'consistent': {
+                    // Monotonic half-sine. Offset grows from 0 at t=0 to a
+                    // maximum that scales with sectionLength / charLength,
+                    // capped so we don't run away on absurdly long sections.
+                    const growth = Math.min(lengthRatio, 4.0);
+                    return maxAmpCm * growth * Math.sin(Math.PI * 0.5 * t);
+                }
+                case 'backForth': {
+                    // Full sine cycles. One complete cycle per charLength
+                    // metres of section length. Returns to ~0 at t=1 only
+                    // when lengthRatio is an integer; otherwise residual.
+                    return maxAmpCm * Math.sin(2 * Math.PI * lengthRatio * t);
+                }
+                // 'kink' is intentionally NOT handled here — it has a
+                // distinct geometry (pipe elbow) that needs access to the
+                // cumulative tilt accumulator and is computed inline in
+                // trueAxisFor.
+                default:
+                    return 0;
+            }
+        }
+
         // True axis offset (cx, cz) at height yh in world cm.
-        // Each tree composes TWO independent modifiers additively:
-        //   - leanAngle (degrees): a linear tilt of the axis from vertical.
-        //     0 = perfectly vertical. Scale-invariant — angle behaves the
-        //     same on tall and short trees.
-        //   - curvAmp + curvBends: a sinusoidal deviation expressed as
-        //     % of tree height, so the curvature scales proportionally
-        //     between short and tall trees. curvBends controls the shape:
-        //       bends=1 → half-sine (consistent bow: zero at base/top,
-        //                 max in the middle)
-        //       bends=2 → one full S (single back-and-forth cycle)
-        //       bends=4 → two full S cycles
-        //       bends=50 → twenty-five cycles (high-frequency wiggle)
-        // Setting either contribution to 0 (lean=0 or amp=0) turns it off.
-        // tFrac runs 0 (base) → 1 (top); yh is negative (up).
+        // Two accumulators run from base to top:
+        //   cumOffsetCm — cumulative LATERAL OFFSET deposited by all prior
+        //     accumulating sections (the section's own pattern end value
+        //     plus the linear drift from the inherited tilt across the
+        //     section's length).
+        //   cumTiltRad — cumulative TILT of the axis from vertical, in
+        //     radians. Each kink section adds Δθ; non-kink sections leave
+        //     the tilt unchanged. The tilt persists upward through every
+        //     subsequent section, manifesting as a linear lateral drift
+        //     proportional to the section's height.
+        //
+        // K (kink) is modelled as a pipe elbow: at the section midpoint
+        // the axis abruptly rotates by θ. Below the midpoint the axis
+        // continues at the inherited tilt; above it, at tilt + θ.
         function trueAxisFor(trunkIdx, yh, treeHeightCm) {
             const tree = trees[trunkIdx];
-            if (!tree) return {cx: 0, cz: 0};
-            const tFrac = -yh / treeHeightCm;
-            let dx = 0;
-            // Lean component (linear).
-            if (tree.leanAngle && tree.leanAngle !== 0) {
-                dx += Math.tan(tree.leanAngle * Math.PI / 180) * (-yh);
+            if (!tree || !tree.sections || !tree.sections.length) {
+                return {cx: 0, cz: 0};
             }
-            // Curvature component (sinusoidal). curvAmp = 0 disables it.
-            if (tree.curvAmp && tree.curvAmp > 0) {
-                const ampCm = tree.curvAmp * 0.01 * treeHeightCm;
-                const bends = tree.curvBends || 1;
-                dx += ampCm * Math.sin(tFrac * Math.PI * bends);
+            const heightM = -yh / 100;   // world Y (negative = up) → metres
+            let cumOffsetCm = 0;
+            let cumTiltRad = 0;
+
+            for (const sec of tree.sections) {
+                const sectionLengthM = sec.toHeightM - sec.fromHeightM;
+                if (sectionLengthM <= 0) continue;
+                const cfg = CATEGORY_CONFIG[sec.category];
+                if (!cfg) continue;
+                const sedCm = diameterAtHeight(tree, sec.toHeightM);
+                const maxAmpCm = (sedCm / cfg.sedDivisor) * sec.ampFactor;
+                const sectionLengthCm = sectionLengthM * 100;
+                const tanCum = Math.tan(cumTiltRad);
+                const inside = heightM <= sec.toHeightM + 1e-9;
+
+                if (cfg.pattern === 'kink') {
+                    // θ chosen so the lateral shift from start to end of
+                    // the kink (under zero inherited tilt) equals maxAmpCm:
+                    //   maxAmpCm = (sectionLengthCm/2) · tan(θ)
+                    // ⇒ θ = atan(2 · maxAmpCm / sectionLengthCm).
+                    const theta = Math.atan(2 * maxAmpCm /
+                                            Math.max(1e-6, sectionLengthCm))
+                                  * sec.direction;
+                    const tanCumPlusKink = Math.tan(cumTiltRad + theta);
+                    const halfLengthCm = sectionLengthCm * 0.5;
+
+                    if (inside) {
+                        const dhCm = (heightM - sec.fromHeightM) * 100;
+                        if (dhCm <= halfLengthCm) {
+                            // Lower half — inherited tilt only.
+                            return {cx: cumOffsetCm + dhCm * tanCum, cz: 0};
+                        } else {
+                            // Upper half — inherited tilt + kink.
+                            const lowerShift = halfLengthCm * tanCum;
+                            const upperDh   = dhCm - halfLengthCm;
+                            return {
+                                cx: cumOffsetCm + lowerShift + upperDh * tanCumPlusKink,
+                                cz: 0
+                            };
+                        }
+                    }
+                    // Past the kink: bank the full elbow geometry and
+                    // promote the tilt for subsequent sections.
+                    cumOffsetCm += halfLengthCm * tanCum
+                                 + halfLengthCm * tanCumPlusKink;
+                    cumTiltRad += theta;
+                    continue;
+                }
+
+                // Non-kink section: pattern offset + linear tilt drift.
+                if (inside) {
+                    const t = (heightM - sec.fromHeightM) / sectionLengthM;
+                    const tiltDrift = (t * sectionLengthCm) * tanCum;
+                    const patternOffset = sectionPatternOffset(
+                        sec.category, t, sectionLengthM, maxAmpCm
+                    ) * sec.direction;
+                    return {cx: cumOffsetCm + tiltDrift + patternOffset, cz: 0};
+                }
+                // Past this section — drift always accumulates; pattern
+                // end value accumulates only if the category sets the flag.
+                cumOffsetCm += sectionLengthCm * tanCum;
+                if (cfg.accumulates) {
+                    cumOffsetCm += sectionPatternOffset(
+                        sec.category, 1.0, sectionLengthM, maxAmpCm
+                    ) * sec.direction;
+                }
             }
-            return {cx: dx, cz: 0};
+
+            // Above the top of the topmost section: clamp to top-section end.
+            return {cx: cumOffsetCm, cz: 0};
         }
 
         function buildOneScene(trunkIdx) {
@@ -949,22 +1379,30 @@
 
                 // Fit circle to slice (algebraic / Kasa).
                 const fit = fitCircleKasa(sliceLocal);
+                // Tag the fit with the section category that owns this Z
+                // height — the centerline rendering will use it to colour
+                // each segment of the polyline.
+                const heightM = zCm / 100;
+                const sec = sectionContaining(tree, heightM);
                 fittedCenters.push({
                     cx: xOff + fit.cx,
                     cy: yh,
                     cz: fit.cz,
-                    r: fit.r
+                    r: fit.r,
+                    category: sec ? sec.category : null
                 });
             }
 
-            // Raw polyline = fittedCenters in order.
-            const rawCenterline = fittedCenters.map(c => ({x: c.cx, y: c.cy, z: c.cz}));
-            // Smoothed = moving median per coordinate.
-            const smoothCenterline = movingMedianPolyline(rawCenterline, params.smoothWindow);
+            // Classified centerline = fittedCenters in order, each point
+            // carrying its sweep category so the rendered polyline can be
+            // coloured segment by segment.
+            const rawCenterline = fittedCenters.map(c => ({
+                x: c.cx, y: c.cy, z: c.cz, category: c.category
+            }));
 
             return {
                 points, fittedCenters, trueAxisLine,
-                rawCenterline, smoothCenterline,
+                rawCenterline,
                 treeHeightCm, treeRadiusCm
             };
         }
@@ -1024,33 +1462,6 @@
         }
 
         // ═══════════════════════════════════════════════════════════════════
-        // MOVING MEDIAN — applies per-coordinate to a polyline.
-        // ═══════════════════════════════════════════════════════════════════
-        function movingMedianPolyline(poly, window) {
-            const n = poly.length;
-            if (window <= 1 || n < 2) return poly.map(p => ({...p}));
-            const half = (window - 1) / 2;
-            const out = [];
-            const buf = new Array(window);
-            for (let i = 0; i < n; i++) {
-                const lo = Math.max(0, i - half);
-                const hi = Math.min(n - 1, i + half);
-                const xs = [], zs = [];
-                for (let j = lo; j <= hi; j++) {
-                    xs.push(poly[j].x); zs.push(poly[j].z);
-                }
-                out.push({x: median(xs), y: poly[i].y, z: median(zs)});
-            }
-            return out;
-        }
-
-        function median(arr) {
-            const a = arr.slice().sort((p, q) => p - q);
-            const m = a.length;
-            return m % 2 ? a[(m - 1) / 2] : 0.5 * (a[m/2 - 1] + a[m/2]);
-        }
-
-        // ═══════════════════════════════════════════════════════════════════
         // DRAW
         // ═══════════════════════════════════════════════════════════════════
         function draw() {
@@ -1077,11 +1488,13 @@
             drawGroundGrid();
 
             for (const scene of scenes) {
-                if (layers.trueAxis)         drawTrueAxis(scene);
-                if (layers.points)           drawPoints(scene);
-                if (layers.rings)            drawFittedRings(scene);
-                if (layers.rawCenterline)    drawPolyline(scene.rawCenterline,    [207, 58, 138], 3);
-                if (layers.smoothCenterline) drawPolyline(scene.smoothCenterline, [120, 140,  93], 4);
+                if (layers.trueAxis)      drawTrueAxis(scene);
+                if (layers.points)        drawPoints(scene);
+                if (layers.rings)         drawFittedRings(scene);
+                // Classified centerline: per-segment colour by sweep
+                // category. Activated as a block via the layer toggle;
+                // mutually exclusive with trueAxis (enforced in toggleLayer).
+                if (layers.rawCenterline) drawCategorizedPolyline(scene.rawCenterline, 3, 240);
             }
         }
 
@@ -1161,19 +1574,19 @@
         }
 
         function drawTrueAxis(scene) {
-            // Dashed white-ish line along the full trunk's true axis,
-            // independent of the section range (so the user can see ground
-            // truth even where no sections are fit).
+            // Continuous white line along the full trunk's true axis.
+            // Now that the unclassified axis is the only single-colour axis
+            // in the scene (smoothed was retired, classified uses category
+            // colours), dashing is unnecessary — it was originally there to
+            // distinguish "ground truth reference" from "data lines".
             push();
-            stroke(220, 218, 205, 90);
-            strokeWeight(1);
+            stroke(240, 238, 225, 220);
+            strokeWeight(2);
+            noFill();
             const tc = scene.trueAxisLine;
-            for (let i = 0; i < tc.length - 1; i++) {
-                if (i % 2 === 0) {
-                    line(tc[i].cx, tc[i].cy, tc[i].cz,
-                         tc[i+1].cx, tc[i+1].cy, tc[i+1].cz);
-                }
-            }
+            beginShape();
+            for (const p of tc) vertex(p.cx, p.cy, p.cz);
+            endShape();
             pop();
         }
 
@@ -1225,6 +1638,26 @@
             pop();
         }
 
+        // Render a polyline as discrete coloured segments, each tinted by
+        // the sweep category of its start point. Used for raw and smoothed
+        // centerlines so the user can read off sweep type directly from
+        // the trunk. Segments straddling a category boundary inherit the
+        // colour of their lower endpoint (the "from" of the transition).
+        function drawCategorizedPolyline(poly, weight, alpha) {
+            if (!poly || poly.length < 2) return;
+            push();
+            strokeWeight(weight);
+            noFill();
+            for (let i = 0; i < poly.length - 1; i++) {
+                const a = poly[i];
+                const b = poly[i + 1];
+                const rgb = categoryColorRgb(a.category);
+                stroke(rgb[0], rgb[1], rgb[2], alpha);
+                line(a.x, a.y, a.z, b.x, b.y, b.z);
+            }
+            pop();
+        }
+
         // ═══════════════════════════════════════════════════════════════════
         // UI HANDLERS
         // ═══════════════════════════════════════════════════════════════════
@@ -1233,7 +1666,6 @@
         const PARAM_UNITS = {
             sectionSpacing:   ' cm',
             noiseLevel:       ' cm',
-            smoothWindow:     '',
             pointsPerSection: ''
         };
 
@@ -1263,12 +1695,9 @@
         // Field → {displayId, unit, step} map used to refresh the value-badge
         // next to each per-tree slider whenever its value changes.
         const TREE_FIELD_DISPLAY = {
-            heightM:   {suffix: 'height-value',  unit: ' m',  step: 0.1},
-            dbhCm:     {suffix: 'dbh-value',     unit: ' cm', step: 1},
-            leanAngle: {suffix: 'lean-value',    unit: ' °',  step: 0.5},
-            curvAmp:   {suffix: 'curvAmp-value', unit: ' %',  step: CURV_AMP_STEP},
-            curvBends: {suffix: 'bends-value',   unit: '',    step: 1},
-            taper:     {suffix: 'taper-value',   unit: '',    step: TAPER_STEP}
+            heightM:   {suffix: 'height-value', unit: ' m',  step: 0.1},
+            dbhCm:     {suffix: 'dbh-value',    unit: ' cm', step: 1},
+            taper:     {suffix: 'taper-value',  unit: '',    step: TAPER_STEP}
         };
 
         // Update one field of one tree from a per-tree control. Also refreshes
@@ -1289,6 +1718,11 @@
                 const newAllo = allometricDBH(numeric);
                 if (oldAllo > 0) t.dbhCm = t.dbhCm * (newAllo / oldAllo);
                 t.heightM = numeric;
+                // Scale section boundaries proportionally so the section
+                // structure survives a height edit (otherwise a tree
+                // shrunken from 30m to 8m would have sections sticking out
+                // beyond its new top).
+                rescaleSectionsForNewHeight(t, t.heightM);
             } else {
                 t[field] = numeric;
             }
@@ -1297,9 +1731,231 @@
                 const el = document.getElementById(`tree-${idx}-${disp.suffix}`);
                 if (el) el.textContent = formatNumber(t[field], disp.step) + disp.unit;
             }
-            // When height changes, the DBH envelope shifts; re-range the
-            // DBH slider, clamp DBH defensively, and refresh its badge.
-            if (field === 'heightM') applyDbhRangeFor(idx);
+            // When height changes, the DBH envelope shifts and the section
+            // list needs to be re-rendered (slider ranges depend on heightM).
+            if (field === 'heightM') {
+                applyDbhRangeFor(idx);
+                renderSectionList(idx);
+            }
+            buildScenes();
+        }
+
+        // Linearly rescale every section so the stack ends exactly at the
+        // new heightM. Preserves each section's relative position along
+        // the trunk and keeps categories / directions intact.
+        function rescaleSectionsForNewHeight(tree, newHeightM) {
+            const oldTotal = tree.sections.length
+                ? tree.sections[tree.sections.length - 1].toHeightM
+                : newHeightM;
+            if (oldTotal <= 0 || !tree.sections.length) {
+                tree.sections = [makeDefaultSection(0, newHeightM)];
+                return;
+            }
+            const k = newHeightM / oldTotal;
+            for (const sec of tree.sections) {
+                sec.fromHeightM = sec.fromHeightM * k;
+                sec.toHeightM   = sec.toHeightM   * k;
+            }
+            // Snap the last section's top to the exact new height to avoid
+            // accumulated floating-point drift.
+            tree.sections[tree.sections.length - 1].toHeightM = newHeightM;
+        }
+
+        // Pick the first category key that isn't in the excluded set,
+        // searching in order. Falls back to '8' if everything's excluded
+        // (which only happens if every category somehow gets banned at once).
+        function firstAllowedCategory(excludeSet) {
+            const exc = excludeSet instanceof Set ? excludeSet : new Set(excludeSet || []);
+            for (const k of CATEGORY_KEYS) {
+                if (!exc.has(k)) return k;
+            }
+            return CATEGORY_KEYS[0];
+        }
+
+        function makeDefaultSection(fromHeightM, toHeightM, excludeCategory) {
+            return {
+                fromHeightM,
+                toHeightM,
+                category: firstAllowedCategory(excludeCategory ? [excludeCategory] : []),
+                direction: random() < 0.5 ? -1 : 1,
+                ampFactor: 0.5
+            };
+        }
+
+        // ---- Section handlers ----
+
+        // Move section[s].toHeightM. The next section's fromHeightM follows
+        // (sections are contiguous). The last section can't be edited — its
+        // toHeight is locked to tree.heightM. Called both from the
+        // NumericStepper buttons and programmatically from elsewhere.
+        function updateSectionToHeight(treeIdx, secIdx, value) {
+            const tree = trees[treeIdx];
+            if (!tree) return;
+            const numeric = Number(value);
+            const sec = tree.sections[secIdx];
+            const nextSec = tree.sections[secIdx + 1];
+            if (!sec || !nextSec) return;   // last section is locked
+            let lowerBound = sec.fromHeightM + MIN_SECTION_LENGTH_M;
+            let upperBound = nextSec.toHeightM - MIN_SECTION_LENGTH_M;
+            // Kink sections have tighter length bounds [KINK_MIN, KINK_MAX]
+            // — override the global min/max so the stepper can't drag a K
+            // out of its valid range. KINK_MIN may be below MIN_SECTION
+            // (0.4 vs 0.5), so we widen the lower bound here.
+            if (sec.category === 'K') {
+                lowerBound = sec.fromHeightM + KINK_MIN_LENGTH_M;
+                upperBound = Math.min(upperBound,
+                                      sec.fromHeightM + KINK_MAX_LENGTH_M);
+            }
+            const clamped = clamp(numeric, lowerBound, upperBound);
+            // Snap to step (0.1 m) to avoid floating-point dust in the badge.
+            const snapped = Math.round(clamped * 10) / 10;
+            sec.toHeightM = snapped;
+            nextSec.fromHeightM = snapped;
+            // Refresh THIS section's toHeight badge and the NEXT section's
+            // from badge.
+            const toBadge = document.getElementById(`tree-${treeIdx}-section-${secIdx}-to-value`);
+            if (toBadge) toBadge.textContent = formatNumber(snapped, 0.1) + ' m';
+            const fromBadge = document.getElementById(`tree-${treeIdx}-section-${secIdx + 1}-from`);
+            if (fromBadge) fromBadge.textContent = formatNumber(snapped, 0.1) + ' m';
+            buildScenes();
+        }
+
+        // NumericStepper handler: ±0.1 m step, clamped by updateSectionToHeight.
+        function stepSectionTo(treeIdx, secIdx, delta) {
+            const tree = trees[treeIdx];
+            if (!tree) return;
+            const sec = tree.sections[secIdx];
+            if (!sec) return;
+            updateSectionToHeight(treeIdx, secIdx, sec.toHeightM + delta);
+        }
+
+        function updateSectionCategory(treeIdx, secIdx, newCategory) {
+            const tree = trees[treeIdx];
+            if (!tree || !CATEGORY_CONFIG[newCategory]) return;
+            const sec = tree.sections[secIdx];
+            const oldCategory = sec.category;
+
+            if (newCategory === 'K' && oldCategory !== 'K') {
+                // Entering K: enforce that a K section has a follower (auto-
+                // add one if K is currently last) AND clamp K's length to
+                // [KINK_MIN_LENGTH_M, KINK_MAX_LENGTH_M], leaving room for
+                // the follower to satisfy MIN_SECTION_LENGTH_M.
+                const isLast = (secIdx === tree.sections.length - 1);
+                const upperBound = isLast
+                    ? tree.heightM
+                    : tree.sections[secIdx + 1].toHeightM;
+                const availableForK = (upperBound - sec.fromHeightM)
+                                      - MIN_SECTION_LENGTH_M;
+                if (availableForK < KINK_MIN_LENGTH_M) {
+                    // Not enough room for K + min-length follower. Reject
+                    // the change and roll the dropdown back to its old value.
+                    const sel = document.getElementById(`tree-${treeIdx}-section-${secIdx}-cat`);
+                    if (sel) sel.value = oldCategory;
+                    return;
+                }
+                const desiredLength = sec.toHeightM - sec.fromHeightM;
+                const newLength = clamp(desiredLength, KINK_MIN_LENGTH_M,
+                                        Math.min(KINK_MAX_LENGTH_M, availableForK));
+                sec.category = 'K';
+                sec.toHeightM = sec.fromHeightM + newLength;
+                if (isLast) {
+                    // Add a follower section spanning K → tree top.
+                    tree.sections.push({
+                        fromHeightM: sec.toHeightM,
+                        toHeightM:   tree.heightM,
+                        category:    firstAllowedCategory(['K']),
+                        direction:   random() < 0.5 ? -1 : 1,
+                        ampFactor:   0.5
+                    });
+                } else {
+                    // Existing follower: pull its fromHeight to K's toHeight.
+                    tree.sections[secIdx + 1].fromHeightM = sec.toHeightM;
+                }
+                renderSectionList(treeIdx);
+            } else if (newCategory !== 'K' && oldCategory === 'K') {
+                // Leaving K: the new category is bound by the global
+                // MIN_SECTION_LENGTH_M (0.5 m), not by the looser K range.
+                // If K was below 0.5 m, push toHeight up to the global min,
+                // shrinking the follower (clamped so the follower stays
+                // ≥ MIN_SECTION_LENGTH_M).
+                sec.category = newCategory;
+                const currentLength = sec.toHeightM - sec.fromHeightM;
+                if (currentLength < MIN_SECTION_LENGTH_M) {
+                    const nextSec = tree.sections[secIdx + 1];
+                    const upperBound = nextSec
+                        ? nextSec.toHeightM - MIN_SECTION_LENGTH_M
+                        : tree.heightM;
+                    const newToHeight = Math.min(
+                        upperBound,
+                        sec.fromHeightM + MIN_SECTION_LENGTH_M
+                    );
+                    sec.toHeightM = newToHeight;
+                    if (nextSec) nextSec.fromHeightM = newToHeight;
+                }
+                renderSectionList(treeIdx);
+            } else {
+                // No K transition: just update the category and refresh
+                // the next section's dropdown for the adjacency rule.
+                sec.category = newCategory;
+                const nextIdx = secIdx + 1;
+                if (nextIdx < tree.sections.length) {
+                    const nextSel = document.getElementById(`tree-${treeIdx}-section-${nextIdx}-cat`);
+                    const nextSec = tree.sections[nextIdx];
+                    if (nextSel && nextSec) {
+                        nextSel.innerHTML = categoryOptionsHTML(nextSec.category, [newCategory]);
+                    }
+                }
+            }
+            buildScenes();
+        }
+
+        // Append a new section to the END of the stack. Splits the last
+        // section in two: its `toHeightM` moves down to the midpoint, and
+        // a new section takes over from there to the tree's top. The new
+        // section defaults to category '8' (straightest).
+        function addSection(treeIdx) {
+            const tree = trees[treeIdx];
+            if (!tree) return;
+            const last = tree.sections[tree.sections.length - 1];
+            const remainingLength = last.toHeightM - last.fromHeightM;
+            if (remainingLength < 2 * MIN_SECTION_LENGTH_M) {
+                // Not enough room to split — silently no-op.
+                return;
+            }
+            const splitAt = last.fromHeightM + remainingLength * 0.5;
+            // Pass the (formerly last) section's category as excluded so
+            // the new section never shares the category of its neighbour.
+            const newSec = makeDefaultSection(splitAt, last.toHeightM, last.category);
+            last.toHeightM = splitAt;
+            tree.sections.push(newSec);
+            renderSectionList(treeIdx);
+            buildScenes();
+        }
+
+        function removeSection(treeIdx, secIdx) {
+            const tree = trees[treeIdx];
+            if (!tree || tree.sections.length <= 1) return;
+            // Business rule: a K (kink) section must always be followed by
+            // another section. Reject any removal that would leave a K as
+            // the last entry in the stack.
+            const simulated = tree.sections.filter((_, i) => i !== secIdx);
+            if (simulated.length &&
+                simulated[simulated.length - 1].category === 'K') {
+                return;
+            }
+            const removed = tree.sections[secIdx];
+            tree.sections.splice(secIdx, 1);
+            // Whichever neighbour absorbs the removed range. Prefer to
+            // extend the section BEFORE (so the tree top stays anchored to
+            // the LAST section). If we removed the FIRST section, extend
+            // the new first section down to 0.
+            if (secIdx === 0) {
+                tree.sections[0].fromHeightM = 0;
+            } else {
+                tree.sections[secIdx - 1].toHeightM = removed.toHeightM;
+                // The (formerly next) section's fromHeightM doesn't change.
+            }
+            renderSectionList(treeIdx);
             buildScenes();
         }
 
@@ -1314,14 +1970,18 @@
             buildScenes();
         }
 
-        // Re-roll the entire forest. Bumps the seed so the new state is
-        // reproducible from the Seed input (and so successive clicks land
-        // on different forests).
+        // Re-roll the entire forest. Bumps the seed so the noise pattern
+        // also changes (otherwise two clicks on the same RNG state would
+        // produce the same forest). Explicitly re-seeds + re-rolls, since
+        // initializeSystem no longer re-rolls on seed change.
         function rollAll() {
             params.seed = Math.floor(Math.random() * 999999) + 1;
             updateSeedDisplay();
-            initializeSystem();
+            randomSeed(params.seed);
+            noiseSeed(params.seed);
+            rollAllStratified();
             syncAllTreesUI();
+            buildScenes();
         }
 
         // --- Tree panel rendering ---
@@ -1354,32 +2014,6 @@
                             </div>
                         </div>
                         <div class="control-group">
-                            <label>Lean angle (°)</label>
-                            <div class="slider-container">
-                                <input type="range" id="tree-${i}-lean" min="0" max="30" step="0.5"
-                                       oninput="updateTreeField(${i}, 'leanAngle', this.value)">
-                                <span class="value-display" id="tree-${i}-lean-value"></span>
-                            </div>
-                        </div>
-                        <div class="control-group">
-                            <label>Curvature amplitude (% h)</label>
-                            <div class="slider-container">
-                                <input type="range" id="tree-${i}-curvAmp"
-                                       min="${CURV_AMP_MIN}" max="${CURV_AMP_MAX}" step="${CURV_AMP_STEP}"
-                                       oninput="updateTreeField(${i}, 'curvAmp', this.value)">
-                                <span class="value-display" id="tree-${i}-curvAmp-value"></span>
-                            </div>
-                        </div>
-                        <div class="control-group">
-                            <label>Bends (1 = consistent, 2+ = back-and-forth)</label>
-                            <div class="slider-container">
-                                <input type="range" id="tree-${i}-bends"
-                                       min="${CURV_BENDS_MIN}" max="${CURV_BENDS_MAX}" step="1"
-                                       oninput="updateTreeField(${i}, 'curvBends', this.value)">
-                                <span class="value-display" id="tree-${i}-bends-value"></span>
-                            </div>
-                        </div>
-                        <div class="control-group">
                             <label>Taper (fraction lost at top)</label>
                             <div class="slider-container">
                                 <input type="range" id="tree-${i}-taper"
@@ -1388,11 +2022,83 @@
                                 <span class="value-display" id="tree-${i}-taper-value"></span>
                             </div>
                         </div>
+                        <div class="sections-block" id="tree-${i}-sections"></div>
+                        <button class="button section-add-btn" onclick="addSection(${i})">+ Add section</button>
                     </div>
                 `);
             }
             container.innerHTML = parts.join('');
             syncAllTreesUI();
+        }
+
+        // Build the HTML for a single tree's section list. Re-rendered any
+        // time the section count changes (add/remove) or any time the tree's
+        // total height changes (which can rescale section boundaries). The
+        // from/to value badges are populated directly in the template so
+        // they are correct immediately after a rebuild — no separate sync
+        // pass is required.
+        function renderSectionList(treeIdx) {
+            const tree = trees[treeIdx];
+            const host = document.getElementById(`tree-${treeIdx}-sections`);
+            if (!tree || !host) return;
+            const parts = [];
+            for (let s = 0; s < tree.sections.length; s++) {
+                const sec = tree.sections[s];
+                const isLast = (s === tree.sections.length - 1);
+                const isOnly = (tree.sections.length === 1);
+                const fromText = formatNumber(sec.fromHeightM, 0.1) + ' m';
+                const toText   = formatNumber(sec.toHeightM,   0.1) + ' m';
+                // The NumericStepper +/- buttons are disabled for the last
+                // section (its top is locked to tree.heightM) and when only
+                // one section exists.
+                const stepperDisabled = isLast ? 'disabled' : '';
+                parts.push(`
+                    <div class="section-card" id="tree-${treeIdx}-section-${s}">
+                        <div class="section-card-header">
+                            <span class="section-card-title">Section ${s + 1}</span>
+                            <button class="section-remove-btn" ${isOnly ? 'disabled' : ''}
+                                    onclick="removeSection(${treeIdx}, ${s})" title="Remove this section">×</button>
+                        </div>
+                        <div class="control-group section-row">
+                            <label>From → To (m)</label>
+                            <div class="section-range">
+                                <span class="value-display" id="tree-${treeIdx}-section-${s}-from">${fromText}</span>
+                                <span class="section-range-arrow">→</span>
+                                <div class="num-stepper">
+                                    <button class="stepper-btn" ${stepperDisabled}
+                                            onclick="stepSectionTo(${treeIdx}, ${s}, -0.1)" title="Decrease 0.1 m">−</button>
+                                    <span class="stepper-value" id="tree-${treeIdx}-section-${s}-to-value">${toText}</span>
+                                    <button class="stepper-btn" ${stepperDisabled}
+                                            onclick="stepSectionTo(${treeIdx}, ${s}, +0.1)" title="Increase 0.1 m">+</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="control-group">
+                            <label>Sweep category</label>
+                            <select id="tree-${treeIdx}-section-${s}-cat"
+                                    onchange="updateSectionCategory(${treeIdx}, ${s}, this.value)">
+                                ${categoryOptionsHTML(sec.category, s > 0 ? [tree.sections[s - 1].category] : [])}
+                            </select>
+                        </div>
+                    </div>
+                `);
+            }
+            host.innerHTML = parts.join('');
+        }
+
+        // Build the <option> set for a section's category dropdown.
+        // Keys in `disabledKeys` are rendered with the disabled attribute
+        // so the user can't choose them — this is how we enforce the
+        // "two adjacent sections can't share a category" rule. The
+        // currently-selected key is never disabled (browsers still need
+        // to display it as the chosen value).
+        function categoryOptionsHTML(selected, disabledKeys) {
+            const exc = new Set(disabledKeys || []);
+            return CATEGORY_KEYS.map(key => {
+                const sel = key === selected ? ' selected' : '';
+                const dis = (exc.has(key) && key !== selected) ? ' disabled' : '';
+                return `<option value="${key}"${sel}${dis}>${key} — ${CATEGORY_CONFIG[key].label}</option>`;
+            }).join('');
         }
 
         // Format a value to the number of decimals implied by the slider step.
@@ -1411,12 +2117,9 @@
             if (!document.getElementById(`tree-${idx}-height`)) return;
 
             const FIELDS = [
-                {name: 'heightM',   sliderId: `tree-${idx}-height`},
-                {name: 'dbhCm',     sliderId: `tree-${idx}-dbh`},
-                {name: 'leanAngle', sliderId: `tree-${idx}-lean`},
-                {name: 'curvAmp',   sliderId: `tree-${idx}-curvAmp`},
-                {name: 'curvBends', sliderId: `tree-${idx}-bends`},
-                {name: 'taper',     sliderId: `tree-${idx}-taper`}
+                {name: 'heightM', sliderId: `tree-${idx}-height`},
+                {name: 'dbhCm',   sliderId: `tree-${idx}-dbh`},
+                {name: 'taper',   sliderId: `tree-${idx}-taper`}
             ];
             // Sync DBH slider min/max to the proportionality envelope
             // for the tree's current height BEFORE setting the DBH value,
@@ -1431,6 +2134,28 @@
                     const el = document.getElementById(`tree-${idx}-${disp.suffix}`);
                     if (el) el.textContent = formatNumber(t[f.name], disp.step) + disp.unit;
                 }
+            }
+            // Re-render the section list and refresh per-section badges.
+            renderSectionList(idx);
+            syncSectionBadges(idx);
+        }
+
+        // Refresh every from/to height badge and the category dropdown in
+        // one tree's section cards. Called after data-only updates that
+        // don't rebuild the DOM (e.g., re-roll). renderSectionList already
+        // populates the same fields directly from its template, so a fresh
+        // render does not need this pass.
+        function syncSectionBadges(idx) {
+            const t = trees[idx];
+            if (!t || !t.sections) return;
+            for (let s = 0; s < t.sections.length; s++) {
+                const sec = t.sections[s];
+                const fromEl = document.getElementById(`tree-${idx}-section-${s}-from`);
+                if (fromEl) fromEl.textContent = formatNumber(sec.fromHeightM, 0.1) + ' m';
+                const toBadge = document.getElementById(`tree-${idx}-section-${s}-to-value`);
+                if (toBadge) toBadge.textContent = formatNumber(sec.toHeightM, 0.1) + ' m';
+                const catSel = document.getElementById(`tree-${idx}-section-${s}-cat`);
+                if (catSel) catSel.value = sec.category;
             }
         }
 
@@ -1463,16 +2188,59 @@
             if (el) el.textContent = formatNumber(t.dbhCm, disp.step) + disp.unit;
         }
 
-        // Toggle a layer on/off and reflect the state in its DOM row.
-        function toggleLayer(name) {
-            if (!(name in layers)) return;
-            layers[name] = !layers[name];
-            const row = document.getElementById('layer-row-' + name);
-            if (row) row.classList.toggle('on', layers[name]);
+        // Populate the static sweep-category legend inside the floating
+        // layer panel. Categories are activated as a BLOCK through the
+        // "Raw centerline classified" layer toggle — these rows are
+        // legend-only (no checkbox, no click). Generated from
+        // CATEGORY_CONFIG so adding W / 3 / 1 / X later only needs a new
+        // entry with its `color` field.
+        function renderCategoryLegend() {
+            const host = document.getElementById('category-legend');
+            if (!host) return;
+            const parts = [];
+            for (const key of CATEGORY_KEYS) {
+                const cfg = CATEGORY_CONFIG[key];
+                if (!cfg) continue;
+                parts.push(`
+                    <div class="legend-row-static">
+                        <span class="layer-swatch" style="background:${cfg.color}"></span>
+                        <span class="legend-key">${key}</span>
+                        <span class="legend-desc">${cfg.label}</span>
+                    </div>
+                `);
+            }
+            host.innerHTML = parts.join('');
         }
 
-        // Keyboard shortcuts: p=points, c=circles, a=axis, r=raw,
-        // s=smoothed, l=tree labels.
+        // Pairs of layers that cannot be ON at the same time. Activating
+        // one member of a pair automatically deactivates the other.
+        const MUTUALLY_EXCLUSIVE = {
+            trueAxis:      'rawCenterline',
+            rawCenterline: 'trueAxis'
+        };
+
+        // Toggle a layer on/off and reflect the state in its DOM row.
+        // When the layer is part of a mutually-exclusive pair and is being
+        // turned ON, the partner layer is turned OFF in the same operation.
+        function toggleLayer(name) {
+            if (!(name in layers)) return;
+            const newVal = !layers[name];
+            layers[name] = newVal;
+            const row = document.getElementById('layer-row-' + name);
+            if (row) row.classList.toggle('on', newVal);
+            if (newVal && MUTUALLY_EXCLUSIVE[name]) {
+                const other = MUTUALLY_EXCLUSIVE[name];
+                if (layers[other]) {
+                    layers[other] = false;
+                    const otherRow = document.getElementById('layer-row-' + other);
+                    if (otherRow) otherRow.classList.remove('on');
+                }
+            }
+        }
+
+        // Keyboard shortcuts: p=points, c=circles, a=axis (unclassified),
+        // r=raw (classified), l=tree labels. trueAxis and rawCenterline
+        // are mutually exclusive — activating one disables the other.
         window.addEventListener('keydown', (e) => {
             if (e.target.tagName === 'INPUT') return;
             const k = e.key.toLowerCase();
@@ -1480,7 +2248,6 @@
             else if (k === 'c') toggleLayer('rings');
             else if (k === 'a') toggleLayer('trueAxis');
             else if (k === 'r') toggleLayer('rawCenterline');
-            else if (k === 's') toggleLayer('smoothCenterline');
             else if (k === 'l') toggleLayer('treeLabels');
         });
 
@@ -1521,8 +2288,7 @@
             bounds = {...defaultBounds};
 
             // Sync the global algorithm sliders + their value badges.
-            const paramFields = ['pointsPerSection', 'sectionSpacing',
-                                 'noiseLevel', 'smoothWindow'];
+            const paramFields = ['pointsPerSection', 'sectionSpacing', 'noiseLevel'];
             for (const f of paramFields) {
                 const el = document.getElementById(f);
                 if (!el) continue;
@@ -1548,12 +2314,15 @@
                 if (row) row.classList.toggle('on', layers[name]);
             }
 
-            // Force a re-roll of the forest (since the seed may have come
-            // back to the default) and refresh the per-tree panels.
-            lastSeedRolled = null;
+            // Reset semantics: bring the forest back to a clean state by
+            // explicitly re-seeding and re-rolling. initializeSystem alone
+            // wouldn't touch trees (it only re-seeds the noise RNG now).
             updateSeedDisplay();
-            initializeSystem();
+            randomSeed(params.seed);
+            noiseSeed(params.seed);
+            rollAllStratified();
             syncAllTreesUI();
+            buildScenes();
         }
 
         window.addEventListener('load', updateSeedDisplay);
