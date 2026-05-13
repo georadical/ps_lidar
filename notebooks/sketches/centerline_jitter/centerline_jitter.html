@@ -823,7 +823,7 @@
         //       (B) — unidirectional patterns (8, L, K) accumulate;
         //             back-and-forth (S) returns to baseline.
         //     Flipping any flag here is enough to switch convention.
-        const CATEGORY_KEYS = ['8', 'L', 'S', 'K'];
+        const CATEGORY_KEYS = ['8', 'L', 'S', 'W', '3', '1', 'X', 'K'];
         const CATEGORY_CONFIG = {
             '8': {
                 label: 'Gun-barrel (max SED/8)',
@@ -849,6 +849,61 @@
                 accumulates: false,
                 color: '#d9b757'   // amber — oscillating, mid intensity
             },
+            'W': {
+                // Wobble: back-and-forth with a clearly irregular character.
+                // Same base amplitude as cat 3 (SED/3) but with a strong
+                // 4× harmonic at 70 % of the fundamental — adds visible
+                // high-frequency bumps so the trunk reads as agitated, not
+                // a clean S. Peak combined excursion ~ 1.7 · SED/3, so W
+                // is more pronounced than 3 even though their HQP severity
+                // is roughly equivalent (both pulp quality).
+                label: 'Wobble — back-and-forth > 5 cm over 4 m',
+                sedDivisor: 3,
+                pattern: 'wobble',
+                charLength: 4.0,
+                accumulates: false,
+                color: '#9b7bc8'   // lavender — distinct from amber/orange/red
+            },
+            '3': {
+                // Moderate back-and-forth: same plumbing as S, just
+                // higher amplitude (SED/3 vs SED/5). Marks the upper
+                // edge of "good quality" before the pulp-quality band
+                // in the HQP quickcard.
+                label: '4 m of moderate sweep (SED/3)',
+                sedDivisor: 3,
+                pattern: 'backForth',
+                charLength: 4.0,
+                accumulates: false,
+                color: '#d97757'   // anthropic-orange — between S and pulp
+            },
+            '1': {
+                // Excessive back-and-forth: same wavelength as S / 3 but
+                // the amplitude equals the SED itself (sedDivisor = 1).
+                // The trunk wiggles by roughly its own diameter — a
+                // pulp-quality flag in the HQP quickcard.
+                label: 'Excessive sweep (SED/1)',
+                sedDivisor: 1,
+                pattern: 'backForth',
+                charLength: 4.0,
+                accumulates: false,
+                color: '#b04a4a'   // brick red — pulp quality, severe
+            },
+            'X': {
+                // Severe localised sweep: short section (0.3–1.0 m) with
+                // amplitude greater than the SED itself (sedDivisor = 0.5
+                // → amp = 2·SED). charLength = 0.5 m so a 1 m section
+                // shows ~2 back-and-forth cycles, making the "too
+                // excessive to put on a truck" character obvious. Like K,
+                // X requires a follower (length-constrained event).
+                label: 'Severe sweep (>SED/1, 0.3–1.0 m)',
+                sedDivisor: 0.5,
+                pattern: 'backForth',
+                charLength: 0.5,
+                accumulates: false,
+                color: '#7a1e1e',  // dark maroon — most severe
+                minLengthM: 0.3,
+                maxLengthM: 1.0
+            },
             'K': {
                 // Pipe-elbow model: at the midpoint of the K section the
                 // axis abruptly rotates by an angle θ. The trunk above
@@ -860,7 +915,9 @@
                 pattern: 'kink',
                 charLength: 0.5,
                 accumulates: true,
-                color: '#cf3a8a'   // magenta — sharp local event
+                color: '#cf3a8a',  // magenta — sharp local event
+                minLengthM: 0.4,
+                maxLengthM: 0.7
             }
         };
 
@@ -892,13 +949,10 @@
         // when adding a new section. Applies to non-K sections.
         const MIN_SECTION_LENGTH_M = 0.5;
 
-        // Kink-specific length bounds. A K (pipe elbow) is a SHORT event
-        // by definition (HQP caps it at 0.5 m, we allow [0.4, 0.7] m for
-        // a bit more visual breathing room). Selecting K from a section's
-        // dropdown auto-clamps its length to this range; the section
-        // toHeight stepper enforces it on every step.
-        const KINK_MIN_LENGTH_M = 0.4;
-        const KINK_MAX_LENGTH_M = 0.7;
+        // Per-category length bounds live inside each CATEGORY_CONFIG
+        // entry as `minLengthM` / `maxLengthM` (see K and X below).
+        // Categories without those fields fall back to the global
+        // MIN_SECTION_LENGTH_M floor and no explicit cap.
 
         // --- Per-tree state ---
         // One entry per tree slot. The forest re-roll fills this array
@@ -1036,17 +1090,24 @@
             return out;
         }
 
-        // Choose a category for random rolls. K is INTENTIONALLY excluded:
-        // a K section has tight length constraints ([0.4, 0.7] m) and must
-        // always be followed by another section, so it does not fit cleanly
-        // into the uniform random boundary placement of makeRandomSections.
-        // Users add K manually via the per-section dropdown, which then
-        // enforces both rules.
+        // Choose a category for random rolls. Categories with length-
+        // constraints (K, and later X) are INTENTIONALLY excluded:
+        // they don't fit the uniform random boundary placement of
+        // makeRandomSections. The user introduces them manually through
+        // the per-section dropdown, which then enforces the length
+        // and follower rules.
+        //
+        // Distribution biased toward straighter categories so most random
+        // trees look plausible: most stems sit at 8 or L, with occasional
+        // S and a sprinkle of 3 (moderate sweep).
         function randomCategoryKey() {
             const r = random();
-            if (r < 0.45) return '8';
-            if (r < 0.80) return 'L';
-            return 'S';
+            if (r < 0.40) return '8';
+            if (r < 0.70) return 'L';
+            if (r < 0.85) return 'S';
+            if (r < 0.90) return 'W';
+            if (r < 0.95) return '3';
+            return '1';
         }
 
         // Layer visibility — controlled by the floating Layers panel inside
@@ -1229,6 +1290,20 @@
                     // metres of section length. Returns to ~0 at t=1 only
                     // when lengthRatio is an integer; otherwise residual.
                     return maxAmpCm * Math.sin(2 * Math.PI * lengthRatio * t);
+                }
+                case 'wobble': {
+                    // Two superimposed sine waves: the fundamental matches
+                    // the backForth pattern; a 4× harmonic at 70 % of the
+                    // amplitude adds prominent high-frequency bumps so the
+                    // trunk reads as agitated, distinctly different from
+                    // a clean S. Both components end at ~0 when length-
+                    // ratio is integer, so the section still returns to its
+                    // baseline (accumulates: false stays correct).
+                    const fundamental = maxAmpCm
+                        * Math.sin(2 * Math.PI * lengthRatio * t);
+                    const harmonic    = maxAmpCm * 0.7
+                        * Math.sin(2 * Math.PI * lengthRatio * 4 * t);
+                    return fundamental + harmonic;
                 }
                 // 'kink' is intentionally NOT handled here — it has a
                 // distinct geometry (pipe elbow) that needs access to the
@@ -1797,14 +1872,16 @@
             if (!sec || !nextSec) return;   // last section is locked
             let lowerBound = sec.fromHeightM + MIN_SECTION_LENGTH_M;
             let upperBound = nextSec.toHeightM - MIN_SECTION_LENGTH_M;
-            // Kink sections have tighter length bounds [KINK_MIN, KINK_MAX]
-            // — override the global min/max so the stepper can't drag a K
-            // out of its valid range. KINK_MIN may be below MIN_SECTION
-            // (0.4 vs 0.5), so we widen the lower bound here.
-            if (sec.category === 'K') {
-                lowerBound = sec.fromHeightM + KINK_MIN_LENGTH_M;
+            // Length-constrained categories (K, X, …) override the global
+            // bounds with their own [minLengthM, maxLengthM] so the stepper
+            // can never drag the section out of its valid range. Their
+            // minLengthM may sit below MIN_SECTION (e.g. K = 0.4, X = 0.3),
+            // so the lower bound is widened, not narrowed.
+            const cfg = CATEGORY_CONFIG[sec.category];
+            if (cfg && cfg.minLengthM !== undefined) {
+                lowerBound = sec.fromHeightM + cfg.minLengthM;
                 upperBound = Math.min(upperBound,
-                                      sec.fromHeightM + KINK_MAX_LENGTH_M);
+                                      sec.fromHeightM + cfg.maxLengthM);
             }
             const clamped = clamp(numeric, lowerBound, upperBound);
             // Snap to step (0.1 m) to avoid floating-point dust in the badge.
@@ -1829,55 +1906,66 @@
             updateSectionToHeight(treeIdx, secIdx, sec.toHeightM + delta);
         }
 
+        // A "length-constrained" category (K, X) carries its own
+        // [minLengthM, maxLengthM] bounds in CATEGORY_CONFIG. The rules
+        // that govern these — auto-clamp on assignment, auto-add follower
+        // if last, refuse removal that would strand them as last — all
+        // key off this single property rather than off the category code.
+        function isLengthConstrained(category) {
+            const cfg = CATEGORY_CONFIG[category];
+            return !!(cfg && cfg.minLengthM !== undefined
+                          && cfg.maxLengthM !== undefined);
+        }
+
         function updateSectionCategory(treeIdx, secIdx, newCategory) {
             const tree = trees[treeIdx];
-            if (!tree || !CATEGORY_CONFIG[newCategory]) return;
+            const newCfg = CATEGORY_CONFIG[newCategory];
+            if (!tree || !newCfg) return;
             const sec = tree.sections[secIdx];
             const oldCategory = sec.category;
+            const newConstrained = isLengthConstrained(newCategory);
+            const oldConstrained = isLengthConstrained(oldCategory);
 
-            if (newCategory === 'K' && oldCategory !== 'K') {
-                // Entering K: enforce that a K section has a follower (auto-
-                // add one if K is currently last) AND clamp K's length to
-                // [KINK_MIN_LENGTH_M, KINK_MAX_LENGTH_M], leaving room for
-                // the follower to satisfy MIN_SECTION_LENGTH_M.
+            if (newConstrained) {
+                // Entering or transitioning between length-constrained
+                // categories: re-clamp the section to the new [min, max]
+                // length, and make sure there is a follower (auto-add
+                // one if the section was last).
                 const isLast = (secIdx === tree.sections.length - 1);
                 const upperBound = isLast
                     ? tree.heightM
                     : tree.sections[secIdx + 1].toHeightM;
-                const availableForK = (upperBound - sec.fromHeightM)
-                                      - MIN_SECTION_LENGTH_M;
-                if (availableForK < KINK_MIN_LENGTH_M) {
-                    // Not enough room for K + min-length follower. Reject
-                    // the change and roll the dropdown back to its old value.
+                const availableForSec = (upperBound - sec.fromHeightM)
+                                        - MIN_SECTION_LENGTH_M;
+                if (availableForSec < newCfg.minLengthM) {
+                    // Not enough room for this category's minimum length
+                    // plus a follower. Roll the dropdown back.
                     const sel = document.getElementById(`tree-${treeIdx}-section-${secIdx}-cat`);
                     if (sel) sel.value = oldCategory;
                     return;
                 }
                 const desiredLength = sec.toHeightM - sec.fromHeightM;
-                const newLength = clamp(desiredLength, KINK_MIN_LENGTH_M,
-                                        Math.min(KINK_MAX_LENGTH_M, availableForK));
-                sec.category = 'K';
+                const newLength = clamp(desiredLength, newCfg.minLengthM,
+                                        Math.min(newCfg.maxLengthM, availableForSec));
+                sec.category = newCategory;
                 sec.toHeightM = sec.fromHeightM + newLength;
                 if (isLast) {
-                    // Add a follower section spanning K → tree top.
                     tree.sections.push({
                         fromHeightM: sec.toHeightM,
                         toHeightM:   tree.heightM,
-                        category:    firstAllowedCategory(['K']),
+                        category:    firstAllowedCategory([newCategory]),
                         direction:   random() < 0.5 ? -1 : 1,
                         ampFactor:   0.5
                     });
                 } else {
-                    // Existing follower: pull its fromHeight to K's toHeight.
                     tree.sections[secIdx + 1].fromHeightM = sec.toHeightM;
                 }
                 renderSectionList(treeIdx);
-            } else if (newCategory !== 'K' && oldCategory === 'K') {
-                // Leaving K: the new category is bound by the global
-                // MIN_SECTION_LENGTH_M (0.5 m), not by the looser K range.
-                // If K was below 0.5 m, push toHeight up to the global min,
-                // shrinking the follower (clamped so the follower stays
-                // ≥ MIN_SECTION_LENGTH_M).
+            } else if (oldConstrained) {
+                // Leaving a length-constrained category: the section is
+                // now bound by the global MIN_SECTION_LENGTH_M (0.5 m).
+                // If the old length sat below that, push toHeight up
+                // (shrinking the follower, clamped to keep it ≥ 0.5 m).
                 sec.category = newCategory;
                 const currentLength = sec.toHeightM - sec.fromHeightM;
                 if (currentLength < MIN_SECTION_LENGTH_M) {
@@ -1894,8 +1982,9 @@
                 }
                 renderSectionList(treeIdx);
             } else {
-                // No K transition: just update the category and refresh
-                // the next section's dropdown for the adjacency rule.
+                // Both old and new are unconstrained: just update the
+                // category and refresh the next section's dropdown for
+                // the adjacency rule.
                 sec.category = newCategory;
                 const nextIdx = secIdx + 1;
                 if (nextIdx < tree.sections.length) {
@@ -1935,12 +2024,13 @@
         function removeSection(treeIdx, secIdx) {
             const tree = trees[treeIdx];
             if (!tree || tree.sections.length <= 1) return;
-            // Business rule: a K (kink) section must always be followed by
-            // another section. Reject any removal that would leave a K as
-            // the last entry in the stack.
+            // Business rule: any length-constrained category (K, X, …)
+            // must always be followed by another section. Reject any
+            // removal that would leave such a section as the last entry
+            // in the stack.
             const simulated = tree.sections.filter((_, i) => i !== secIdx);
             if (simulated.length &&
-                simulated[simulated.length - 1].category === 'K') {
+                isLengthConstrained(simulated[simulated.length - 1].category)) {
                 return;
             }
             const removed = tree.sections[secIdx];
