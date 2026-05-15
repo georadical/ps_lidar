@@ -336,3 +336,132 @@ def _sampson_distance(
     grad_norm = np.maximum(grad_norm, 1e-300)
 
     return np.abs(f_val) / grad_norm
+
+
+# ===========================================================================
+# EL.3 — RANSAC ellipse fit (robust to outliers via consensus sampling)
+# ===========================================================================
+
+def _fit_ellipse_ransac(
+    X: np.ndarray, Y: np.ndarray,
+    n_iters: int = 200,
+    tau_sampson: float = 0.005,
+    min_inliers: int = 5,
+    rng: Optional[np.random.Generator] = None,
+) -> Optional[Tuple[np.ndarray, np.ndarray, int]]:
+    """
+    Fit an ellipse robustly via RANSAC + Sampson-distance inlier scoring.
+
+    Repeatedly draws minimal samples of 5 points, fits an algebraic
+    ellipse on each sample via :func:`_fit_ellipse_algebraic`, scores
+    **all** points with :func:`_sampson_distance` against the hypothesis,
+    and keeps the hypothesis with the most inliers (Sampson distance
+    below ``tau_sampson``). After the loop, refits the algebraic ellipse
+    on the consensus set to use the full inlier information.
+
+    Parameters
+    ----------
+    X, Y : array_like
+        1D arrays of point coordinates of equal length. Must contain at
+        least 5 points (the minimum to define an ellipse).
+    n_iters : int, default 200
+        Number of RANSAC iterations. With inlier ratio ~0.5, 200 iters
+        give >99.9% probability of drawing at least one all-inlier sample.
+    tau_sampson : float, default 0.005
+        Inlier threshold on Sampson distance, in the same units as
+        ``X``, ``Y`` (e.g. metres for LiDAR slices). A point is an inlier
+        if its Sampson distance to the hypothesis is strictly less than
+        this value.
+    min_inliers : int, default 5
+        Minimum number of inliers for the result to be returned.
+        Below this threshold the function returns ``None`` (the data
+        does not support any non-trivial ellipse).
+    rng : np.random.Generator, optional
+        Random number generator for reproducibility. If ``None``, a
+        fresh default generator is used (non-deterministic across calls).
+
+    Returns
+    -------
+    (coefs, inlier_mask, n_inliers) : tuple or None
+        ``coefs`` : ndarray of shape (6,), the conic coefficients of the
+        best (refitted) ellipse.
+        ``inlier_mask`` : ndarray of shape (N,), boolean mask of inliers
+        with respect to the refitted ellipse.
+        ``n_inliers`` : int, ``inlier_mask.sum()``.
+
+        Returns ``None`` if fewer than 5 points are supplied, if no
+        sampled minimal set produces a valid ellipse over ``n_iters``
+        iterations (extreme degeneracy), or if the best hypothesis has
+        fewer than ``min_inliers`` inliers.
+
+    Raises
+    ------
+    ValueError
+        If ``X`` and ``Y`` have different lengths, ``n_iters < 1``, or
+        ``tau_sampson <= 0``.
+
+    Notes
+    -----
+    A final refit step is performed on the consensus set to exploit the
+    information from all inliers (the minimal-sample fit only used 5
+    points). The refit is in algebraic form via the same Halíř-Flusser
+    primitive; the geometric refit on orthogonal distance is sub-fase
+    EL.4 and consumes the inlier mask returned here.
+
+    The refit is only accepted if it does not lose inliers relative to
+    the minimal-sample hypothesis — this guards against rare cases where
+    the refit, while a better LS fit on the consensus, ends up slightly
+    further from a few borderline inliers.
+    """
+    X = np.asarray(X, dtype=np.float64).ravel()
+    Y = np.asarray(Y, dtype=np.float64).ravel()
+    if X.size != Y.size:
+        raise ValueError(
+            f"X and Y must have the same length; got {X.size} and {Y.size}"
+        )
+    if n_iters < 1:
+        raise ValueError(f"n_iters must be >= 1; got {n_iters}")
+    if tau_sampson <= 0.0:
+        raise ValueError(f"tau_sampson must be positive; got {tau_sampson}")
+    n = X.size
+    if n < 5:
+        return None
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    best_n_inliers = -1
+    best_inlier_mask: Optional[np.ndarray] = None
+    best_coefs: Optional[np.ndarray] = None
+
+    indices = np.arange(n)
+
+    for _ in range(n_iters):
+        sample_idx = rng.choice(indices, size=5, replace=False)
+        coefs = _fit_ellipse_algebraic(X[sample_idx], Y[sample_idx])
+        if coefs is None:
+            continue
+
+        d = _sampson_distance(X, Y, coefs)
+        inlier_mask = d < tau_sampson
+        n_inliers = int(inlier_mask.sum())
+
+        if n_inliers > best_n_inliers:
+            best_n_inliers = n_inliers
+            best_inlier_mask = inlier_mask
+            best_coefs = coefs
+
+    if best_coefs is None or best_n_inliers < min_inliers:
+        return None
+
+    # --- Refit on the consensus set ---
+    refit_coefs = _fit_ellipse_algebraic(X[best_inlier_mask], Y[best_inlier_mask])
+    if refit_coefs is not None:
+        d_refit = _sampson_distance(X, Y, refit_coefs)
+        refit_mask = d_refit < tau_sampson
+        n_refit = int(refit_mask.sum())
+        # Accept refit only if it does not regress on inlier count.
+        if n_refit >= best_n_inliers:
+            return refit_coefs, refit_mask, n_refit
+
+    return best_coefs, best_inlier_mask, best_n_inliers

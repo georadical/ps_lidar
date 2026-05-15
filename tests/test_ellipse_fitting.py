@@ -17,6 +17,7 @@ from src.core.ellipse_fitting import (
     _fit_ellipse_algebraic,
     _conic_to_geometric,
     _sampson_distance,
+    _fit_ellipse_ransac,
 )
 
 
@@ -317,3 +318,108 @@ class TestSampsonDistance:
     def test_invalid_coefs_length_raises(self):
         with pytest.raises(ValueError):
             _sampson_distance(np.array([1.0]), np.array([1.0]), np.array([1.0, 2.0]))
+
+
+# ===========================================================================
+# EL.3 — _fit_ellipse_ransac, robust ellipse fit via consensus sampling
+# ===========================================================================
+
+class TestRansacEllipseFit:
+
+    def test_clean_data_recovers_parameters(self):
+        # No outliers, no noise → RANSAC should match the algebraic fit.
+        xc_t, yc_t, a_t, b_t, theta_t = 1.0, 2.0, 5.0, 3.0, np.pi / 6.0
+        X, Y = _make_ellipse_points(xc_t, yc_t, a_t, b_t, theta_t, n=60)
+
+        rng = np.random.default_rng(seed=42)
+        result = _fit_ellipse_ransac(
+            X, Y, n_iters=50, tau_sampson=1e-6, rng=rng,
+        )
+        assert result is not None
+        coefs, inliers, n_in = result
+        assert n_in == 60  # all points are inliers on noise-free data
+
+        geom = _conic_to_geometric(coefs)
+        assert geom is not None
+        xc, yc, a, b, theta = geom
+        assert abs(xc - xc_t) < 1e-6
+        assert abs(yc - yc_t) < 1e-6
+        assert abs(a - a_t) < 1e-6
+        assert abs(b - b_t) < 1e-6
+        assert _theta_diff_mod_pi(theta, theta_t) < 1e-6
+
+    def test_30_percent_outliers_rejected(self):
+        # 70 inliers on an ellipse + 30 outliers in a lateral cluster.
+        # RANSAC must lock onto the ellipse, not be pulled by the cluster.
+        # Pure LS on the same data would shift the centre toward the cluster.
+        rng = np.random.default_rng(seed=42)
+        xc_t, yc_t, a_t, b_t = 0.0, 0.0, 1.0, 0.6
+        X_in, Y_in = _make_ellipse_points(xc_t, yc_t, a_t, b_t, 0.0, n=70)
+
+        # Tight outlier cluster centred at (1.5, 0) — well outside the
+        # ellipse (right edge at x=1.0) so outliers cannot be near-inliers.
+        outlier_xy = rng.normal(loc=[1.5, 0.0], scale=0.05, size=(30, 2))
+        X = np.concatenate([X_in, outlier_xy[:, 0]])
+        Y = np.concatenate([Y_in, outlier_xy[:, 1]])
+
+        result = _fit_ellipse_ransac(
+            X, Y, n_iters=200, tau_sampson=0.005, rng=rng,
+        )
+        assert result is not None
+        coefs, inliers, n_in = result
+
+        geom = _conic_to_geometric(coefs)
+        assert geom is not None
+        xc, yc, a, b, _theta = geom
+
+        # Centre must stay at the true centre — not pulled to (1.5, 0).
+        assert abs(xc - xc_t) < 0.005, f"xc drifted: got {xc}"
+        assert abs(yc - yc_t) < 0.005, f"yc drifted: got {yc}"
+
+        # Inliers should be (almost) all 70 true points and (almost) no
+        # outliers. Allow a bit of slack for borderline-sample noise.
+        true_inlier_recall = inliers[:70].sum() / 70
+        outlier_false_positive = inliers[70:].sum() / 30
+        assert true_inlier_recall >= 0.95
+        assert outlier_false_positive <= 0.05
+
+    def test_reproducible_with_seed(self):
+        rng_a = np.random.default_rng(seed=123)
+        rng_b = np.random.default_rng(seed=123)
+        X, Y = _make_ellipse_points(0.0, 0.0, 4.0, 2.0, np.pi / 8.0, n=40)
+
+        res_a = _fit_ellipse_ransac(X, Y, n_iters=30, tau_sampson=1e-4, rng=rng_a)
+        res_b = _fit_ellipse_ransac(X, Y, n_iters=30, tau_sampson=1e-4, rng=rng_b)
+        assert res_a is not None and res_b is not None
+        np.testing.assert_array_equal(res_a[1], res_b[1])
+        np.testing.assert_allclose(res_a[0], res_b[0], rtol=0, atol=0)
+
+    def test_too_few_points_returns_none(self):
+        X = np.array([0.0, 1.0, 2.0])
+        Y = np.array([0.0, 1.0, 0.5])
+        assert _fit_ellipse_ransac(X, Y) is None
+
+    def test_mismatched_lengths_raises(self):
+        with pytest.raises(ValueError):
+            _fit_ellipse_ransac(np.array([1.0, 2.0]), np.array([1.0]))
+
+    def test_invalid_iter_count_raises(self):
+        X, Y = _make_ellipse_points(0, 0, 1, 0.5, 0, n=20)
+        with pytest.raises(ValueError):
+            _fit_ellipse_ransac(X, Y, n_iters=0)
+
+    def test_invalid_tau_raises(self):
+        X, Y = _make_ellipse_points(0, 0, 1, 0.5, 0, n=20)
+        with pytest.raises(ValueError):
+            _fit_ellipse_ransac(X, Y, tau_sampson=0.0)
+
+    def test_min_inliers_floor_enforced(self):
+        # Pure noise → no real consensus → min_inliers floor should bite.
+        rng = np.random.default_rng(seed=7)
+        X = rng.uniform(-1, 1, size=30)
+        Y = rng.uniform(-1, 1, size=30)
+        # Demand more inliers than the data could ever produce.
+        result = _fit_ellipse_ransac(
+            X, Y, n_iters=50, tau_sampson=1e-6, min_inliers=25, rng=rng,
+        )
+        assert result is None
