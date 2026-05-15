@@ -21,6 +21,8 @@ from src.core.ellipse_fitting import (
     _geometric_to_conic,
     _orthogonal_distance_to_ellipse,
     _refit_ellipse_geometric,
+    EllipseFitConfig,
+    _fit_ellipse_check,
 )
 
 
@@ -630,3 +632,140 @@ class TestRefitEllipseGeometric:
         # Sub-mm centre recovery on 2 mm noise after the full pipeline.
         assert abs(xc - xc_t) < 1e-3
         assert abs(yc - yc_t) < 1e-3
+
+
+# ===========================================================================
+# EL.5 — _fit_ellipse_check, production wrapper with quality checks
+# ===========================================================================
+
+def _make_stem_section_config(**overrides) -> EllipseFitConfig:
+    """Default config tuned for a typical stem section (radius ~0.15 m,
+    moderate noise). Overrides let individual tests tweak the bits they
+    care about without spelling out every field."""
+    base = dict(
+        min_points_section=40,
+        r_min=0.05,
+        r_max=0.40,
+        inner_ratio=0.5,
+        max_inner_points=5,
+        n_sectors=16,
+        min_sectors=9,
+        sector_width=0.02,
+        ransac_n_iters=200,
+        ransac_tau_sampson=0.005,
+        min_inlier_fraction=0.6,
+        min_aspect_ratio=0.5,
+        cluster_eps=0.02,
+    )
+    base.update(overrides)
+    return EllipseFitConfig(**base)
+
+
+class TestFitEllipseCheck:
+
+    def test_clean_stem_section_returns_status_0(self):
+        # Synthetic stem section: ~circular cross-section, radius 0.15 m
+        # with a slight ovality (a=0.16, b=0.14), no noise, no outliers.
+        rng = np.random.default_rng(seed=42)
+        xc_t, yc_t, a_t, b_t, theta_t = 0.5, 0.5, 0.16, 0.14, np.pi / 8.0
+        X, Y = _make_ellipse_points(xc_t, yc_t, a_t, b_t, theta_t, n=120)
+
+        cfg = _make_stem_section_config()
+        xc, yc, a, b, theta, status, sector_pct = _fit_ellipse_check(
+            X, Y, cfg, rng=rng,
+        )
+
+        assert status == 0
+        assert abs(xc - xc_t) < 1e-4
+        assert abs(yc - yc_t) < 1e-4
+        assert abs(a - a_t) < 1e-4
+        assert abs(b - b_t) < 1e-4
+        assert _theta_diff_mod_pi(theta, theta_t) < 1e-4
+        assert sector_pct > 80.0  # well-covered curve
+
+    def test_too_few_points_returns_status_2(self):
+        # 10 points, min_points_section=40 → status 2 immediately.
+        X = np.array([0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+        Y = np.array([0.0, 0.1, 0.0, 0.1, 0.0, 0.1, 0.0, 0.1, 0.0, 0.1])
+        cfg = _make_stem_section_config()
+        xc, yc, a, b, theta, status, sector_pct = _fit_ellipse_check(X, Y, cfg)
+        assert status == 2
+        assert (xc, yc, a, b, theta, sector_pct) == (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+    def test_outliers_handled_by_ransac(self):
+        # 80 inliers on a clean stem section + 20 lateral outliers.
+        # RANSAC inside _fit_ellipse_check must absorb them.
+        rng = np.random.default_rng(seed=2026)
+        xc_t, yc_t, a_t, b_t = 0.0, 0.0, 0.18, 0.14
+        X_in, Y_in = _make_ellipse_points(xc_t, yc_t, a_t, b_t, 0.0, n=80)
+        out_xy = rng.normal(loc=[0.4, 0.0], scale=0.02, size=(20, 2))
+        X = np.concatenate([X_in, out_xy[:, 0]])
+        Y = np.concatenate([Y_in, out_xy[:, 1]])
+
+        cfg = _make_stem_section_config()
+        xc, yc, a, b, theta, status, sector_pct = _fit_ellipse_check(
+            X, Y, cfg, rng=rng,
+        )
+
+        # Status 0 OR 1 acceptable — both indicate a recovered fit.
+        # What matters is the centre stays near the truth.
+        assert status in (0, 1)
+        assert abs(xc - xc_t) < 0.003
+        assert abs(yc - yc_t) < 0.003
+        assert abs(a - a_t) < 0.005
+        assert abs(b - b_t) < 0.005
+
+    def test_radius_out_of_range_rejected(self):
+        # Generate a HUGE ellipse (a=2, b=1.5) but config r_max=0.40.
+        # √(a·b) = √3 ≈ 1.73 > 0.40 → must fail the radius check.
+        rng = np.random.default_rng(seed=42)
+        X, Y = _make_ellipse_points(0.0, 0.0, 2.0, 1.5, 0.0, n=120)
+
+        cfg = _make_stem_section_config()
+        xc, yc, a, b, theta, status, _ = _fit_ellipse_check(X, Y, cfg, rng=rng)
+
+        # Status must be 1 (rejected; retry didn't recover either).
+        assert status == 1
+        # All zeros surfaced.
+        assert (xc, yc, a, b, theta) == (0.0, 0.0, 0.0, 0.0, 0.0)
+
+    def test_extreme_aspect_ratio_rejected(self):
+        # Highly elongated ellipse a=0.2, b=0.02 → aspect 0.1 << 0.5 min.
+        # _fit_ellipse_check must reject (status 1).
+        rng = np.random.default_rng(seed=42)
+        X, Y = _make_ellipse_points(0.0, 0.0, 0.2, 0.02, 0.0, n=120)
+
+        cfg = _make_stem_section_config()
+        xc, yc, a, b, theta, status, _ = _fit_ellipse_check(X, Y, cfg, rng=rng)
+        assert status == 1
+
+    def test_pure_noise_returns_status_1(self):
+        # 100 random points uniformly in a 0.3 m × 0.3 m square.
+        # RANSAC may find some hypothesis, but the inlier_fraction or
+        # sector check will fail it → status 1.
+        rng = np.random.default_rng(seed=7)
+        X = rng.uniform(-0.15, 0.15, size=100)
+        Y = rng.uniform(-0.15, 0.15, size=100)
+
+        cfg = _make_stem_section_config()
+        _xc, _yc, _a, _b, _theta, status, _ = _fit_ellipse_check(
+            X, Y, cfg, rng=rng,
+        )
+        assert status == 1
+
+    def test_reproducible_with_seed(self):
+        # Same seed → same output (the RNG flows through to RANSAC).
+        rng_a = np.random.default_rng(seed=999)
+        rng_b = np.random.default_rng(seed=999)
+        X, Y = _make_ellipse_points(0.0, 0.0, 0.15, 0.12, np.pi / 9.0, n=80)
+        # Add a few outliers so RANSAC has actual decisions to make.
+        outliers_rng = np.random.default_rng(seed=1)
+        out = outliers_rng.normal(loc=[0.3, 0.0], scale=0.01, size=(10, 2))
+        X = np.concatenate([X, out[:, 0]])
+        Y = np.concatenate([Y, out[:, 1]])
+
+        cfg = _make_stem_section_config()
+        res_a = _fit_ellipse_check(X, Y, cfg, rng=rng_a)
+        res_b = _fit_ellipse_check(X, Y, cfg, rng=rng_b)
+
+        assert res_a == res_b

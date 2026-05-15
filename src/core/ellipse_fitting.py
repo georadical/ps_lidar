@@ -30,6 +30,7 @@ References
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
@@ -657,3 +658,231 @@ def _refit_ellipse_geometric(
         theta = theta + 0.5 * np.pi
 
     return _geometric_to_conic(float(xc), float(yc), float(a), float(b), float(theta))
+
+
+# ===========================================================================
+# EL.5 — _fit_ellipse_check: production wrapper analogous to
+#         _fit_circle_check in src/core/trunk_validation.py
+# ===========================================================================
+
+@dataclass(frozen=True)
+class EllipseFitConfig:
+    """Configuration for :func:`_fit_ellipse_check`.
+
+    Mirrors the relevant section of ``StemCleaningConfig`` used by
+    ``_fit_circle_check`` in ``src/core/trunk_validation.py``, extended
+    with RANSAC and aspect-ratio parameters specific to ellipses.
+
+    All length-like parameters are in the same units as the input
+    coordinates (typically metres for forestry LiDAR).
+    """
+
+    # --- Geometry constraints (same role as in StemCleaningConfig) ---
+    min_points_section: int = 80
+    r_min: float = 0.05               # min equivalent radius √(a·b)
+    r_max: float = 0.40               # max equivalent radius √(a·b)
+    inner_ratio: float = 0.5          # inner-empty check threshold
+    max_inner_points: int = 5         # max points inside the inner ellipse
+
+    # --- Sector occupancy (curve-arc coverage check) ---
+    n_sectors: int = 16
+    min_sectors: int = 9
+    sector_width: float = 0.02        # band around the curve, orthogonal
+
+    # --- RANSAC ---
+    ransac_n_iters: int = 200
+    ransac_tau_sampson: float = 0.005
+    min_inlier_fraction: float = 0.6
+
+    # --- Ellipse-specific ---
+    min_aspect_ratio: float = 0.5     # b / a must be ≥ this (rejects
+                                      # degenerate elongated fits, e.g.
+                                      # branches + a few stem points)
+
+    # --- Retry path (DBSCAN clustering) ---
+    cluster_eps: float = 0.02
+
+
+# --- Helpers used by _fit_ellipse_check -----------------------------------
+
+def _inner_ellipse_count(
+    X: np.ndarray, Y: np.ndarray,
+    xc: float, yc: float, a: float, b: float, theta: float,
+    ratio: float,
+) -> int:
+    """Count points strictly inside the **inner** ellipse — the same
+    ellipse with semi-axes scaled by ``ratio``.
+
+    Geometric analogue of ``_inner_circle_count``. A healthy stem
+    section has very few points inside the inner ellipse: stems are
+    hollow shapes seen from above (we see the perimeter, not the wood).
+    Lots of inner points signal that the fit absorbed a noisy interior
+    cluster instead of locking onto the outer perimeter.
+    """
+    cos_th, sin_th = np.cos(theta), np.sin(theta)
+    p = (X - xc) * cos_th + (Y - yc) * sin_th
+    q = -(X - xc) * sin_th + (Y - yc) * cos_th
+    a_inner = a * ratio
+    b_inner = b * ratio
+    inside = (p / a_inner) ** 2 + (q / b_inner) ** 2 < 1.0
+    return int(inside.sum())
+
+
+def _sector_occupancy_ellipse(
+    X: np.ndarray, Y: np.ndarray,
+    xc: float, yc: float, a: float, b: float, theta: float,
+    n_sectors: int, min_sectors: int, width: float,
+) -> Tuple[float, bool]:
+    """Sector-occupancy check around the ellipse.
+
+    Counts how many angular sectors around the centre contain at least
+    one point lying within ``width`` of the ellipse curve (orthogonal
+    distance). Returns ``(percent_occupied, is_ok)`` where ``is_ok`` is
+    ``n_occupied >= min_sectors``.
+
+    Mirrors ``_sector_occupancy`` for circles. The angular bin uses
+    ``arctan2(Δx, Δy)`` (same swap convention as the circle helper) and
+    the "near-curve" band uses true orthogonal distance (more robust
+    on highly eccentric ellipses than the radial band used for circles).
+    """
+    d = _orthogonal_distance_to_ellipse(X, Y, xc, yc, a, b, theta)
+    near = d < width
+    if not near.any():
+        return 0.0, False
+
+    dx = X[near] - xc
+    dy = Y[near] - yc
+    # Same convention as _sector_occupancy in trunk_validation.py:
+    # arctan2(dx, dy) — a 90° rotation of the standard angle, but for
+    # sector binning this is irrelevant (any rotation preserves the
+    # number of occupied sectors).
+    angular = np.arctan2(dx, dy)
+    sectors = np.floor(angular / (2.0 * np.pi / n_sectors))
+    n_occupied = int(np.unique(sectors).size)
+    pct = 100.0 * n_occupied / n_sectors
+    return pct, n_occupied >= min_sectors
+
+
+def _point_clustering_largest(
+    X: np.ndarray, Y: np.ndarray, eps: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Return points of the largest DBSCAN cluster on XY.
+
+    Duplicated from ``trunk_validation._point_clustering_largest`` to
+    keep ``ellipse_fitting.py`` standalone — avoids a future circular
+    import once ``trunk_validation`` consumes ``_fit_ellipse_check``.
+    """
+    from sklearn.cluster import DBSCAN
+
+    xy = np.column_stack([X, Y])
+    labels = DBSCAN(eps=eps, min_samples=3).fit_predict(xy)
+    if labels.max() < 0:
+        return X, Y
+    unique, counts = np.unique(labels[labels >= 0], return_counts=True)
+    largest = unique[np.argmax(counts)]
+    mask = labels == largest
+    return X[mask], Y[mask]
+
+
+# --- Main wrapper ---------------------------------------------------------
+
+def _fit_ellipse_check(
+    X: np.ndarray, Y: np.ndarray,
+    config: EllipseFitConfig,
+    is_retry: bool = False,
+    rng: Optional[np.random.Generator] = None,
+) -> Tuple[float, float, float, float, float, int, float]:
+    """Fit an ellipse with quality checks; production wrapper around the
+    EL.1–EL.4 primitives. Analogue of ``_fit_circle_check`` in
+    ``src/core/trunk_validation.py``.
+
+    Pipeline:
+        1. Reject sections with too few points (status 2).
+        2. :func:`_fit_ellipse_ransac` produces a candidate + inliers.
+        3. :func:`_refit_ellipse_geometric` polishes on the consensus set.
+        4. Quality checks: equivalent radius √(a·b) in [r_min, r_max],
+           inner-ellipse-empty, sector occupancy, aspect ratio b/a,
+           inlier fraction.
+        5. If the fit fails any check (or RANSAC found nothing), retry
+           once on the largest DBSCAN cluster.
+
+    Returns
+    -------
+    (xc, yc, a, b, theta, check_status, sector_pct) : tuple
+        Geometric ellipse parameters. ``a ≥ b``; ``theta`` is the
+        rotation (radians) of the semi-major axis from the +x axis.
+
+        ``check_status``:
+            * 0 → valid first-attempt fit
+            * 1 → fit returned after a retry attempt
+                  (either the retry succeeded, or the retry failed but
+                   we surface zeros — same convention as the circle helper)
+            * 2 → not enough points in the input slice
+
+        ``sector_pct`` is the percentage of sectors occupied around the
+        fitted ellipse (used as a quality indicator downstream).
+    """
+    n = len(X)
+    if n < config.min_points_section:
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 2, 0.0
+
+    # --- RANSAC + geometric refit + quality checks ---
+    min_inliers = max(5, int(config.min_inlier_fraction * n))
+    ransac_result = _fit_ellipse_ransac(
+        X, Y,
+        n_iters=config.ransac_n_iters,
+        tau_sampson=config.ransac_tau_sampson,
+        min_inliers=min_inliers,
+        rng=rng,
+    )
+
+    fit_bad = ransac_result is None
+    xc = yc = a = b = theta = 0.0
+    sector_pct = 0.0
+
+    if not fit_bad:
+        coefs, inlier_mask, n_inliers = ransac_result
+        refit_coefs = _refit_ellipse_geometric(
+            X[inlier_mask], Y[inlier_mask], coefs,
+        )
+        if refit_coefs is not None:
+            coefs = refit_coefs
+
+        geom = _conic_to_geometric(coefs)
+        if geom is None:
+            fit_bad = True
+        else:
+            xc, yc, a, b, theta = geom
+            r_equiv = float(np.sqrt(a * b))
+            inlier_fraction = n_inliers / n
+
+            n_inner = _inner_ellipse_count(
+                X, Y, xc, yc, a, b, theta, config.inner_ratio,
+            )
+            sector_pct, sectors_ok = _sector_occupancy_ellipse(
+                X, Y, xc, yc, a, b, theta,
+                config.n_sectors, config.min_sectors, config.sector_width,
+            )
+            aspect_ratio = b / a
+
+            fit_bad = (
+                n_inner > config.max_inner_points
+                or r_equiv < config.r_min
+                or r_equiv > config.r_max
+                or not sectors_ok
+                or aspect_ratio < config.min_aspect_ratio
+                or inlier_fraction < config.min_inlier_fraction
+            )
+
+    # --- Retry path (mirrors _fit_circle_check) ---
+    if fit_bad and not is_retry:
+        Xg, Yg = _point_clustering_largest(X, Y, config.cluster_eps)
+        if len(Xg) >= config.min_points_section:
+            return _fit_ellipse_check(Xg, Yg, config, is_retry=True, rng=rng)
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 1, 0.0
+
+    if fit_bad:
+        # is_retry and still bad: surface zeros + status 1
+        return 0.0, 0.0, 0.0, 0.0, 0.0, 1, 0.0
+
+    return xc, yc, a, b, theta, (1 if is_retry else 0), sector_pct
