@@ -246,3 +246,93 @@ def _conic_to_geometric(
     theta = theta % np.pi
 
     return float(xc), float(yc), a_axis, b_axis, theta
+
+
+# ===========================================================================
+# EL.2 — Sampson distance (point-to-conic, scale-corrected approximation
+#         to the true orthogonal distance)
+# ===========================================================================
+
+def _sampson_distance(
+    X: np.ndarray, Y: np.ndarray,
+    coefs: np.ndarray,
+) -> np.ndarray:
+    """
+    Compute the Sampson distance from 2D points to a conic.
+
+    The Sampson distance is the first-order approximation to the
+    geometric (orthogonal) distance between a point and a conic. For
+    the general conic ``F(x, y) = A·x² + B·x·y + C·y² + D·x + E·y + F``,
+
+        d_Sampson(x, y) = |F(x, y)| / sqrt((∂F/∂x)² + (∂F/∂y)²)
+
+    where the gradient components are
+
+        ∂F/∂x = 2·A·x + B·y + D
+        ∂F/∂y = B·x + 2·C·y + E.
+
+    Parameters
+    ----------
+    X, Y : array_like
+        1D arrays of point coordinates of equal length.
+    coefs : ndarray of shape (6,)
+        Conic coefficients ``[A, B, C, D, E, F]`` (typically the output
+        of :func:`_fit_ellipse_algebraic`).
+
+    Returns
+    -------
+    d : ndarray of shape (N,)
+        Non-negative Sampson distance for each point.
+
+    Raises
+    ------
+    ValueError
+        If ``X`` and ``Y`` have different lengths, or ``coefs`` does not
+        have length 6.
+
+    Notes
+    -----
+    Sampson distance is the metric of choice for RANSAC scoring against
+    a conic hypothesis (Hartley & Zisserman, *Multiple View Geometry*,
+    §11.4). It corrects the **scale bias** of the raw algebraic distance
+    ``|F(x, y)|`` — for two geometrically similar ellipses differing only
+    in scale, the algebraic distance to a point at the same physical
+    offset scales with the conic's size, while Sampson does not.
+
+    The approximation degrades as the point moves further from the curve:
+    Sampson under-estimates the true orthogonal distance by an amount
+    proportional to ``d²·κ`` where ``κ`` is the local curvature. For
+    inlier scoring in RANSAC this is typically negligible (offsets of
+    millimetres compared to centimetre-scale curvatures); for outliers
+    the under-estimate makes the metric *more* discriminative, not less.
+
+    Singular points where ``∇F = 0`` (e.g. the geometric centre of an
+    ellipse) have ``d_Sampson`` undefined geometrically. To keep the
+    function total, the gradient norm is floored at ``1e-300`` before
+    division, returning a very large value at the singular set rather
+    than ``NaN``.
+    """
+    X = np.asarray(X, dtype=np.float64).ravel()
+    Y = np.asarray(Y, dtype=np.float64).ravel()
+    if X.size != Y.size:
+        raise ValueError(
+            f"X and Y must have the same length; got {X.size} and {Y.size}"
+        )
+    coefs = np.asarray(coefs, dtype=np.float64).ravel()
+    if coefs.size != 6:
+        raise ValueError(f"coefs must have length 6; got {coefs.size}")
+    A, B, C, D, E, F = coefs
+
+    # Algebraic conic value F(x, y)
+    f_val = A * X * X + B * X * Y + C * Y * Y + D * X + E * Y + F
+
+    # Gradient components
+    fx = 2.0 * A * X + B * Y + D
+    fy = B * X + 2.0 * C * Y + E
+
+    grad_norm = np.sqrt(fx * fx + fy * fy)
+    # Floor at a sub-normal value to avoid div-by-zero at singular points
+    # without contaminating well-defined results.
+    grad_norm = np.maximum(grad_norm, 1e-300)
+
+    return np.abs(f_val) / grad_norm

@@ -16,6 +16,7 @@ import pytest
 from src.core.ellipse_fitting import (
     _fit_ellipse_algebraic,
     _conic_to_geometric,
+    _sampson_distance,
 )
 
 
@@ -199,3 +200,120 @@ class TestConicToGeometricDegenerate:
         # y² − x = 0:  A=0, B=0, C=1, D=−1, E=0, F=0; discriminant = 0.
         coefs = np.array([0.0, 0.0, 1.0, -1.0, 0.0, 0.0])
         assert _conic_to_geometric(coefs) is None
+
+
+# ===========================================================================
+# EL.2 — _sampson_distance, scale-corrected point-to-conic distance
+# ===========================================================================
+
+def _axis_aligned_ellipse_coefs(a: float, b: float) -> np.ndarray:
+    """Conic coefficients for the canonical axis-aligned ellipse
+    centred at the origin: ``(x/a)² + (y/b)² − 1 = 0``."""
+    return np.array([1.0 / (a * a), 0.0, 1.0 / (b * b), 0.0, 0.0, -1.0])
+
+
+class TestSampsonDistance:
+
+    def test_points_exactly_on_ellipse_have_zero_distance(self):
+        # Points on a known ellipse → Sampson must be ~0 (numerical noise)
+        xc, yc, a, b, theta = 1.0, 2.0, 5.0, 3.0, np.pi / 6.0
+        X, Y = _make_ellipse_points(xc, yc, a, b, theta, n=30)
+        coefs = _fit_ellipse_algebraic(X, Y)
+        assert coefs is not None
+
+        d = _sampson_distance(X, Y, coefs)
+        assert np.all(d < 1e-9)
+
+    def test_known_orthogonal_offset_recovered_to_first_order(self):
+        # Generate points exactly on an axis-aligned ellipse, then offset
+        # each one along the outward unit normal by a small known distance.
+        # Sampson distance should recover the offset to first order in d.
+        a, b = 4.0, 2.5
+        coefs = _axis_aligned_ellipse_coefs(a, b)
+        X_on, Y_on = _make_ellipse_points(0.0, 0.0, a, b, 0.0, n=20)
+
+        # Outward unit normal = ∇F / |∇F|  (∇F points outward when F is
+        # negative inside the ellipse, which it is for our convention).
+        A, B, C, D, E, F = coefs
+        fx = 2.0 * A * X_on + B * Y_on + D
+        fy = B * X_on + 2.0 * C * Y_on + E
+        gnorm = np.sqrt(fx * fx + fy * fy)
+        nx, ny = fx / gnorm, fy / gnorm
+
+        d_known = 0.01  # 1 cm — small relative to min curvature radius b²/a = 1.56
+        X_off = X_on + d_known * nx
+        Y_off = Y_on + d_known * ny
+
+        d_sampson = _sampson_distance(X_off, Y_off, coefs)
+        # First-order error is O(d²·κ); with d=0.01 and κ ≈ b/a² ≈ 0.156 at
+        # the major-axis end, expected error per point is ≲ 1e-4. Use 1e-3
+        # to absorb worst-case curvature on the minor-axis end too.
+        assert np.all(np.abs(d_sampson - d_known) < 1e-3)
+
+    def test_corrects_scale_bias_of_algebraic_distance(self):
+        # Two similar ellipses differing only in scale, evaluated at a
+        # point at the same physical offset (d=0.01) along the +x axis.
+        # Algebraic |F| should differ by ≈ scale ratio; Sampson should not.
+        d_known = 0.01
+
+        # Small ellipse: a=1, b=0.6
+        a_s, b_s = 1.0, 0.6
+        coefs_small = _axis_aligned_ellipse_coefs(a_s, b_s)
+        # Large ellipse: a=10, b=6
+        a_l, b_l = 10.0, 6.0
+        coefs_large = _axis_aligned_ellipse_coefs(a_l, b_l)
+
+        pt_small_x = np.array([a_s + d_known])
+        pt_small_y = np.array([0.0])
+        pt_large_x = np.array([a_l + d_known])
+        pt_large_y = np.array([0.0])
+
+        # Raw algebraic value |F|: should reveal the bias
+        def _F(x, y, c):
+            A, B, C, D, E, F = c
+            return abs(A * x * x + B * x * y + C * y * y + D * x + E * y + F)
+
+        f_small = float(_F(pt_small_x[0], pt_small_y[0], coefs_small))
+        f_large = float(_F(pt_large_x[0], pt_large_y[0], coefs_large))
+        # Algebraic |F| ratio should be roughly (a_l / a_s) = 10
+        # because |F| ≈ 2d/a for an axis-aligned ellipse at its major-axis tip.
+        assert f_small / f_large > 5.0  # well above the Sampson ratio (≈1)
+
+        # Sampson should give ≈ d for both
+        d_samp_small = float(_sampson_distance(pt_small_x, pt_small_y, coefs_small)[0])
+        d_samp_large = float(_sampson_distance(pt_large_x, pt_large_y, coefs_large)[0])
+        assert abs(d_samp_small - d_known) < 1e-3
+        assert abs(d_samp_large - d_known) < 1e-3
+
+    def test_circle_unit_offset_matches_closed_form(self):
+        # Unit circle F = x² + y² − 1; point at (1+d, 0) has closed-form
+        # Sampson = d·(2+d)/(2+2d). Verify exact agreement.
+        coefs = np.array([1.0, 0.0, 1.0, 0.0, 0.0, -1.0])
+        d_known = 0.01
+        X = np.array([1.0 + d_known])
+        Y = np.array([0.0])
+        expected = d_known * (2.0 + d_known) / (2.0 + 2.0 * d_known)
+
+        d_samp = float(_sampson_distance(X, Y, coefs)[0])
+        assert abs(d_samp - expected) < 1e-12
+
+    def test_vectorised_returns_per_point_distances(self):
+        # Unit circle, four points: shape (4,) output, all non-negative,
+        # point at (1,0) on the curve has zero distance.
+        coefs = np.array([1.0, 0.0, 1.0, 0.0, 0.0, -1.0])
+        X = np.array([1.0, 2.0, 0.5, 1.5])
+        Y = np.array([0.0, 0.0, 0.5, 1.5])
+
+        d = _sampson_distance(X, Y, coefs)
+        assert d.shape == (4,)
+        assert np.all(d >= 0.0)
+        assert d[0] < 1e-12  # exactly on the unit circle
+
+    def test_mismatched_input_lengths_raises(self):
+        coefs = np.array([1.0, 0.0, 1.0, 0.0, 0.0, -1.0])
+        with pytest.raises(ValueError):
+            _sampson_distance(np.array([1.0, 2.0]), np.array([1.0]), coefs)
+
+    def test_invalid_coefs_length_raises(self):
+        with pytest.raises(ValueError):
+            _sampson_distance(np.array([1.0]), np.array([1.0]), np.array([1.0, 2.0]))
