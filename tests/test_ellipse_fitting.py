@@ -18,6 +18,9 @@ from src.core.ellipse_fitting import (
     _conic_to_geometric,
     _sampson_distance,
     _fit_ellipse_ransac,
+    _geometric_to_conic,
+    _orthogonal_distance_to_ellipse,
+    _refit_ellipse_geometric,
 )
 
 
@@ -423,3 +426,207 @@ class TestRansacEllipseFit:
             X, Y, n_iters=50, tau_sampson=1e-6, min_inliers=25, rng=rng,
         )
         assert result is None
+
+
+# ===========================================================================
+# EL.4 — _geometric_to_conic, _orthogonal_distance_to_ellipse,
+#        _refit_ellipse_geometric (LM precision refit)
+# ===========================================================================
+
+class TestGeometricToConic:
+
+    def test_unit_circle(self):
+        coefs = _geometric_to_conic(0.0, 0.0, 1.0, 1.0, 0.0)
+        # x² + y² − 1 = 0
+        np.testing.assert_allclose(coefs, [1.0, 0.0, 1.0, 0.0, 0.0, -1.0])
+
+    def test_axis_aligned_major_y(self):
+        # x²/4 + y²/9 − 1 = 0  ⇒  A=1/4, C=1/9
+        coefs = _geometric_to_conic(0.0, 0.0, 3.0, 2.0, np.pi / 2.0)
+        np.testing.assert_allclose(coefs[0], 1.0 / 4.0, atol=1e-12)
+        np.testing.assert_allclose(coefs[1], 0.0, atol=1e-12)
+        np.testing.assert_allclose(coefs[2], 1.0 / 9.0, atol=1e-12)
+        np.testing.assert_allclose(coefs[3:5], [0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(coefs[5], -1.0, atol=1e-12)
+
+    def test_round_trip_geometric_to_conic_to_geometric(self):
+        # Random parameters → geometric_to_conic → conic_to_geometric
+        # must recover the original parameters (within numerical noise).
+        rng = np.random.default_rng(seed=11)
+        for _ in range(8):
+            xc_t = rng.uniform(-5, 5)
+            yc_t = rng.uniform(-5, 5)
+            a_t = rng.uniform(1.0, 5.0)
+            b_t = rng.uniform(0.3, a_t)  # ensure b ≤ a
+            theta_t = rng.uniform(0.0, np.pi)
+
+            coefs = _geometric_to_conic(xc_t, yc_t, a_t, b_t, theta_t)
+            geom = _conic_to_geometric(coefs)
+            assert geom is not None
+            xc, yc, a, b, theta = geom
+            assert abs(xc - xc_t) < 1e-9
+            assert abs(yc - yc_t) < 1e-9
+            assert abs(a - a_t) < 1e-9
+            assert abs(b - b_t) < 1e-9
+            assert _theta_diff_mod_pi(theta, theta_t) < 1e-9
+
+
+class TestOrthogonalDistanceToEllipse:
+
+    def test_unit_circle_radial_offset(self):
+        # Point at distance d outside the unit circle along +x: distance = d
+        d = 0.05
+        X = np.array([1.0 + d])
+        Y = np.array([0.0])
+        dist = _orthogonal_distance_to_ellipse(X, Y, 0.0, 0.0, 1.0, 1.0, 0.0)
+        assert abs(float(dist[0]) - d) < 1e-9
+
+    def test_axis_aligned_offsets_at_axis_ends(self):
+        # Ellipse a=4, b=2 centred at origin. Points at (4+d, 0), (0, 2+d),
+        # (−4−d, 0), (0, −2−d) — all at orthogonal distance d.
+        d = 0.1
+        a, b = 4.0, 2.0
+        X = np.array([a + d, 0.0, -a - d, 0.0])
+        Y = np.array([0.0, b + d, 0.0, -b - d])
+        dist = _orthogonal_distance_to_ellipse(X, Y, 0.0, 0.0, a, b, 0.0)
+        np.testing.assert_allclose(dist, d, atol=1e-9)
+
+    def test_point_on_ellipse_returns_zero(self):
+        # Points generated parametrically on the ellipse → distance ≈ 0
+        a, b, theta = 5.0, 3.0, np.pi / 5.0
+        X, Y = _make_ellipse_points(0.0, 0.0, a, b, theta, n=20)
+        dist = _orthogonal_distance_to_ellipse(X, Y, 0.0, 0.0, a, b, theta)
+        assert np.all(dist < 1e-9)
+
+    def test_rotated_ellipse_known_normal_offset(self):
+        # Generate points on ellipse, push each one outward along the
+        # outward normal by a known d. Orthogonal distance must recover d
+        # exactly (within Newton tolerance).
+        xc, yc, a, b, theta = 1.0, -2.0, 4.0, 2.0, np.pi / 3.0
+        X_on, Y_on = _make_ellipse_points(xc, yc, a, b, theta, n=24)
+
+        # Compute outward normal at each point via the ellipse gradient
+        # in canonical frame, then rotate back.
+        cos_th, sin_th = np.cos(theta), np.sin(theta)
+        p = (X_on - xc) * cos_th + (Y_on - yc) * sin_th
+        q = -(X_on - xc) * sin_th + (Y_on - yc) * cos_th
+        # ∇(p²/a² + q²/b²) = (2p/a², 2q/b²) ⇒ unit outward normal in canon
+        nx_c = 2.0 * p / (a * a)
+        ny_c = 2.0 * q / (b * b)
+        norm = np.sqrt(nx_c * nx_c + ny_c * ny_c)
+        nx_c /= norm
+        ny_c /= norm
+        # Rotate back to world frame
+        nx = nx_c * cos_th - ny_c * sin_th
+        ny = nx_c * sin_th + ny_c * cos_th
+
+        d = 0.03
+        X = X_on + d * nx
+        Y = Y_on + d * ny
+
+        dist = _orthogonal_distance_to_ellipse(X, Y, xc, yc, a, b, theta)
+        np.testing.assert_allclose(dist, d, atol=1e-7)
+
+
+class TestRefitEllipseGeometric:
+
+    def test_clean_data_idempotent(self):
+        # Starting from a perfect algebraic fit on noise-free data, the
+        # geometric refit must not move the parameters appreciably.
+        xc_t, yc_t, a_t, b_t, theta_t = 0.5, -0.3, 0.15, 0.12, np.pi / 7.0
+        X, Y = _make_ellipse_points(xc_t, yc_t, a_t, b_t, theta_t, n=80)
+        coefs_alg = _fit_ellipse_algebraic(X, Y)
+        assert coefs_alg is not None
+
+        coefs_geom = _refit_ellipse_geometric(X, Y, coefs_alg)
+        assert coefs_geom is not None
+
+        geom = _conic_to_geometric(coefs_geom)
+        assert geom is not None
+        xc, yc, a, b, theta = geom
+        # Tolerance: scipy LM convergence + Newton inner-iter noise.
+        assert abs(xc - xc_t) < 1e-6
+        assert abs(yc - yc_t) < 1e-6
+        assert abs(a - a_t) < 1e-6
+        assert abs(b - b_t) < 1e-6
+        assert _theta_diff_mod_pi(theta, theta_t) < 1e-6
+
+    def test_noisy_data_refit_matches_or_improves_algebraic(self):
+        # Noisy points on a known ellipse: the geometric refit's centre
+        # error must be no worse than the algebraic fit's centre error.
+        # On expectation the geometric refit removes the algebraic bias
+        # toward the conic singular set, but on a single random draw it
+        # may already be very close.
+        rng = np.random.default_rng(seed=2026)
+        xc_t, yc_t, a_t, b_t, theta_t = 1.0, -2.0, 0.5, 0.35, np.pi / 6.0
+        X_on, Y_on = _make_ellipse_points(xc_t, yc_t, a_t, b_t, theta_t, n=120)
+        noise = rng.normal(scale=0.005, size=(X_on.size, 2))  # σ = 5 mm
+        X = X_on + noise[:, 0]
+        Y = Y_on + noise[:, 1]
+
+        coefs_alg = _fit_ellipse_algebraic(X, Y)
+        assert coefs_alg is not None
+        coefs_geom = _refit_ellipse_geometric(X, Y, coefs_alg)
+        assert coefs_geom is not None
+
+        g_alg = _conic_to_geometric(coefs_alg)
+        g_geom = _conic_to_geometric(coefs_geom)
+        assert g_alg is not None and g_geom is not None
+
+        err_alg = np.hypot(g_alg[0] - xc_t, g_alg[1] - yc_t)
+        err_geom = np.hypot(g_geom[0] - xc_t, g_geom[1] - yc_t)
+        # Geometric refit must not make the centre estimate worse —
+        # within numerical slack of 0.5 mm.
+        assert err_geom <= err_alg + 5e-4
+
+    def test_invalid_initial_returns_none(self):
+        # Hyperbola coefs: the conic_to_geometric returns None, so refit
+        # must too.
+        X = np.linspace(-1, 1, 20)
+        Y = np.linspace(-1, 1, 20)
+        bad_coefs = np.array([1.0, 0.0, -1.0, 0.0, 0.0, -1.0])  # x²−y²−1=0
+        assert _refit_ellipse_geometric(X, Y, bad_coefs) is None
+
+    def test_too_few_points_returns_none(self):
+        X = np.array([0.0, 1.0, 2.0, 3.0])
+        Y = np.array([0.0, 1.0, 0.5, 1.5])
+        coefs = np.array([1.0, 0.0, 1.0, 0.0, 0.0, -1.0])  # unit circle
+        assert _refit_ellipse_geometric(X, Y, coefs) is None
+
+    def test_mismatched_lengths_raises(self):
+        coefs = np.array([1.0, 0.0, 1.0, 0.0, 0.0, -1.0])
+        with pytest.raises(ValueError):
+            _refit_ellipse_geometric(np.array([1.0, 2.0]), np.array([1.0]), coefs)
+
+    def test_ransac_then_refit_pipeline(self):
+        # Full pipeline integration: noisy ellipse + 20% outliers.
+        # RANSAC selects inliers, geometric refit polishes. Final centre
+        # error must be small.
+        rng = np.random.default_rng(seed=2026)
+        xc_t, yc_t, a_t, b_t = 0.0, 0.0, 0.15, 0.12
+        X_in, Y_in = _make_ellipse_points(xc_t, yc_t, a_t, b_t, 0.0, n=80)
+        noise = rng.normal(scale=0.002, size=(X_in.size, 2))  # 2 mm noise
+        X_in = X_in + noise[:, 0]
+        Y_in = Y_in + noise[:, 1]
+        # 20 lateral outliers
+        out_xy = rng.normal(loc=[0.4, 0.0], scale=0.02, size=(20, 2))
+        X = np.concatenate([X_in, out_xy[:, 0]])
+        Y = np.concatenate([Y_in, out_xy[:, 1]])
+
+        ransac_result = _fit_ellipse_ransac(
+            X, Y, n_iters=200, tau_sampson=0.006, rng=rng,
+        )
+        assert ransac_result is not None
+        coefs_ransac, inlier_mask, _ = ransac_result
+
+        coefs_refit = _refit_ellipse_geometric(
+            X[inlier_mask], Y[inlier_mask], coefs_ransac,
+        )
+        assert coefs_refit is not None
+
+        g_refit = _conic_to_geometric(coefs_refit)
+        assert g_refit is not None
+        xc, yc, _a, _b, _theta = g_refit
+        # Sub-mm centre recovery on 2 mm noise after the full pipeline.
+        assert abs(xc - xc_t) < 1e-3
+        assert abs(yc - yc_t) < 1e-3

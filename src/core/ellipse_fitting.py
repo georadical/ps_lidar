@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import Optional, Tuple
 
 import numpy as np
+from scipy import optimize
 
 
 # ===========================================================================
@@ -465,3 +466,194 @@ def _fit_ellipse_ransac(
             return refit_coefs, refit_mask, n_refit
 
     return best_coefs, best_inlier_mask, best_n_inliers
+
+
+# ===========================================================================
+# EL.4 — Geometric LS refit on inliers (true orthogonal distance)
+# ===========================================================================
+
+def _geometric_to_conic(
+    xc: float, yc: float, a: float, b: float, theta: float,
+) -> np.ndarray:
+    """Inverse of :func:`_conic_to_geometric`: build the 6 conic
+    coefficients from geometric parameters of an ellipse.
+
+    The output is the conic ``A·x² + B·x·y + C·y² + D·x + E·y + F`` such
+    that the equation ``= 0`` holds on the ellipse defined by
+    ``(xc, yc, a, b, theta)``. The overall scale of the coefficients is
+    normalised so that ``F = A·xc² + B·xc·yc + C·yc² − 1`` — i.e. the
+    canonical-frame equation is ``u²/a² + v²/b² = 1``.
+    """
+    c, s = np.cos(theta), np.sin(theta)
+    inv_a2 = 1.0 / (a * a)
+    inv_b2 = 1.0 / (b * b)
+
+    A = c * c * inv_a2 + s * s * inv_b2
+    B = 2.0 * c * s * (inv_a2 - inv_b2)
+    C = s * s * inv_a2 + c * c * inv_b2
+    D = -2.0 * A * xc - B * yc
+    E = -2.0 * C * yc - B * xc
+    F = A * xc * xc + B * xc * yc + C * yc * yc - 1.0
+
+    return np.array([A, B, C, D, E, F], dtype=np.float64)
+
+
+def _orthogonal_distance_to_ellipse(
+    X: np.ndarray, Y: np.ndarray,
+    xc: float, yc: float, a: float, b: float, theta: float,
+    n_newton_iter: int = 20,
+) -> np.ndarray:
+    """Compute the true orthogonal (Euclidean) distance from each
+    ``(X, Y)`` to the ellipse defined by geometric parameters.
+
+    For each query point, transforms to the ellipse's canonical frame
+    and Newton-iterates on the parametric angle ``t`` such that the
+    foot of perpendicular sits at ``(a·cos t, b·sin t)``. The condition
+    ``f(t) = 0`` is
+
+        f(t) = −a·p·sin t + b·q·cos t + (a² − b²)·cos t · sin t
+
+    with derivative
+
+        f′(t) = −a·p·cos t − b·q·sin t + (a² − b²)·(cos²t − sin²t).
+
+    Convergence is quadratic once ``t`` is within the basin of attraction
+    of the foot of perpendicular; for inlier-class points (already close
+    to the curve) the default 20 iterations are far more than needed.
+
+    Returns an array of non-negative distances of shape ``(N,)``.
+    """
+    cos_th, sin_th = np.cos(theta), np.sin(theta)
+    dx_orig = X - xc
+    dy_orig = Y - yc
+    # Canonical-frame coordinates (rotation by −theta, then translation
+    # has already been applied).
+    p = dx_orig * cos_th + dy_orig * sin_th
+    q = -dx_orig * sin_th + dy_orig * cos_th
+
+    # Initial parametric guess: scaled angle of (p, q).
+    t = np.arctan2(q * a, p * b)
+
+    a2_minus_b2 = a * a - b * b
+    for _ in range(n_newton_iter):
+        cos_t = np.cos(t)
+        sin_t = np.sin(t)
+        f = -a * p * sin_t + b * q * cos_t + a2_minus_b2 * cos_t * sin_t
+        fp = (
+            -a * p * cos_t
+            - b * q * sin_t
+            + a2_minus_b2 * (cos_t * cos_t - sin_t * sin_t)
+        )
+        # Safe Newton step: floor |f'| to avoid div-by-zero. The sign
+        # is preserved via np.where rather than np.maximum so the
+        # iteration direction is correct.
+        safe_fp = np.where(np.abs(fp) > 1e-12, fp, 1e-12 * np.sign(fp + 1e-30))
+        t = t - f / safe_fp
+
+    x_foot = a * np.cos(t)
+    y_foot = b * np.sin(t)
+
+    # Rigid transformation preserves distance, so we can compute it in
+    # canonical frame.
+    dx = p - x_foot
+    dy = q - y_foot
+    return np.sqrt(dx * dx + dy * dy)
+
+
+def _refit_ellipse_geometric(
+    X: np.ndarray, Y: np.ndarray,
+    initial_coefs: np.ndarray,
+    n_newton_iter: int = 20,
+    max_lm_iter: int = 50,
+) -> Optional[np.ndarray]:
+    """Geometric LS refit of an ellipse on a (typically inlier) point set.
+
+    Refines an existing algebraic fit (e.g. the consensus refit returned
+    by :func:`_fit_ellipse_ransac`) by minimising the **true orthogonal
+    distance** of each point to the ellipse, parameterised geometrically
+    as ``(xc, yc, a, b, theta)``. Levenberg-Marquardt via
+    :func:`scipy.optimize.least_squares` is used, with the Jacobian
+    estimated by finite differences (default).
+
+    This is the precision pass of the RANSAC pipeline: the algebraic
+    LS refit on inliers (inside RANSAC) is biased toward the conic's
+    singular set; the geometric refit eliminates that bias and typically
+    moves the centre and radii by sub-millimetre on noise-free data,
+    and 1–3 mm on data with ~mm-scale noise.
+
+    Parameters
+    ----------
+    X, Y : array_like
+        Inlier 2D coordinates. Must contain at least 5 points.
+    initial_coefs : ndarray of shape (6,)
+        Initial conic coefficients (typically from
+        :func:`_fit_ellipse_ransac`). Must represent a non-degenerate
+        ellipse — :func:`_conic_to_geometric` is applied to extract
+        the starting geometric parameters, and the function returns
+        ``None`` if that conversion fails.
+    n_newton_iter : int, default 20
+        Newton iterations inside each orthogonal-distance evaluation.
+        20 is generous; 5–10 suffice for inlier-class points.
+    max_lm_iter : int, default 50
+        Soft cap on Levenberg-Marquardt iterations
+        (``max_nfev = 6 · max_lm_iter`` since each LM iteration costs
+        roughly one Jacobian evaluation = 5 forward passes + 1 residual,
+        for the 5 parameters).
+
+    Returns
+    -------
+    coefs : ndarray of shape (6,) or None
+        Refitted conic coefficients in the same convention as the
+        algebraic primitive. ``None`` if the initial coefs do not
+        represent a valid ellipse, fewer than 5 points are supplied,
+        the LM optimisation fails, or the optimiser drifts to a
+        non-positive semi-axis.
+    """
+    X = np.asarray(X, dtype=np.float64).ravel()
+    Y = np.asarray(Y, dtype=np.float64).ravel()
+    if X.size != Y.size:
+        raise ValueError(
+            f"X and Y must have the same length; got {X.size} and {Y.size}"
+        )
+    if X.size < 5:
+        return None
+
+    geom0 = _conic_to_geometric(initial_coefs)
+    if geom0 is None:
+        return None
+    xc0, yc0, a0, b0, theta0 = geom0
+
+    # Sentinel residual used when the LM optimiser briefly steps into
+    # an invalid region (a or b ≤ 0). Returning a finite but very large
+    # value lets LM bounce back rather than failing the whole run.
+    big = 1e10
+
+    def residual(params: np.ndarray) -> np.ndarray:
+        xc, yc, a, b, theta = params
+        if a <= 0.0 or b <= 0.0:
+            return np.full(X.size, big, dtype=np.float64)
+        return _orthogonal_distance_to_ellipse(
+            X, Y, xc, yc, a, b, theta, n_newton_iter=n_newton_iter,
+        )
+
+    try:
+        result = optimize.least_squares(
+            residual,
+            x0=np.array([xc0, yc0, a0, b0, theta0], dtype=np.float64),
+            method="lm",
+            max_nfev=6 * max_lm_iter,
+        )
+    except (ValueError, RuntimeError):
+        return None
+
+    xc, yc, a, b, theta = result.x
+    if a <= 0.0 or b <= 0.0:
+        return None
+
+    # Convention: a (semi-major) ≥ b (semi-minor). If LM has settled
+    # with them swapped, swap and rotate theta by π/2 to compensate.
+    if a < b:
+        a, b = b, a
+        theta = theta + 0.5 * np.pi
+
+    return _geometric_to_conic(float(xc), float(yc), float(a), float(b), float(theta))
