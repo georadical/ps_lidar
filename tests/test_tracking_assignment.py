@@ -23,10 +23,13 @@ from src.core.tracking_assignment import (
     Cluster2D,
     ClusterEllipse,
     HorizontalSlice,
+    Track,
+    TrackNode,
     cluster_slice,
     filter_by_verticality,
     fit_ellipses_in_slice,
     slice_horizontal_global,
+    track_clusters_vertical,
 )
 
 
@@ -604,3 +607,173 @@ class TestFitEllipsesInSliceBehaviour:
         ra = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng_a)
         rb = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng_b)
         assert ra == rb
+
+
+# ===========================================================================
+# GS.5 — track_clusters_vertical (vertical greedy matching)
+# ===========================================================================
+
+def _mock_ellipse(xc: float, yc: float, a: float = 0.15, b: float = 0.15,
+                   theta: float = 0.0) -> ClusterEllipse:
+    """Construct a minimal ClusterEllipse for tracking-only tests
+    (without going through RANSAC). Indices are a placeholder; tracking
+    only reads ``xc, yc``."""
+    return ClusterEllipse(
+        indices=np.empty(0, dtype=np.int64),
+        xc=xc, yc=yc, a=a, b=b, theta=theta,
+        sector_pct=100.0, check_status=0, n_points=200,
+    )
+
+
+class TestTrackClustersVerticalContract:
+
+    def test_empty_input_returns_empty_list(self):
+        assert track_clusters_vertical([], []) == []
+
+    def test_rejects_mismatched_lengths(self):
+        with pytest.raises(ValueError):
+            track_clusters_vertical([1.0, 2.0], [[_mock_ellipse(0, 0)]])
+
+    def test_rejects_non_positive_params(self):
+        with pytest.raises(ValueError):
+            track_clusters_vertical(
+                [1.0], [[_mock_ellipse(0, 0)]], max_xy_jump=0.0,
+            )
+        with pytest.raises(ValueError):
+            track_clusters_vertical(
+                [1.0], [[_mock_ellipse(0, 0)]], max_gap_slabs=0,
+            )
+
+
+class TestTrackClustersVerticalBehaviour:
+
+    def test_single_aligned_stem_becomes_one_track(self):
+        # Same ellipse position at every slab → one track with all nodes.
+        z_centres = [1.0, 2.0, 3.0, 4.0, 5.0]
+        slabs = [[_mock_ellipse(0.0, 0.0)] for _ in z_centres]
+
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 1
+        t = tracks[0]
+        assert t.n_nodes == 5
+        # Nodes are ordered by z ascending
+        node_z = [n.z for n in t.nodes]
+        assert node_z == z_centres
+
+    def test_two_parallel_stems_become_two_tracks(self):
+        # Two pillars 2 m apart in XY, both consistent across slabs.
+        z_centres = [1.0, 2.0, 3.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0), _mock_ellipse(2.0, 0.0)]
+            for _ in z_centres
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 2
+        assert all(t.n_nodes == 3 for t in tracks)
+
+    def test_tolerates_one_missing_slab(self):
+        # Same stem at z=1, no ellipse at z=2, same stem at z=3 →
+        # one track of 2 nodes (skip z=2). max_gap_slabs=1 (default).
+        z_centres = [1.0, 2.0, 3.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [],  # gap
+            [_mock_ellipse(0.0, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        # max_gap_slabs default is 1 → gap of exactly 1 IS allowed.
+        # (slab idx jumps from 0 → 2, gap = 2; just over the budget).
+        # We need max_gap_slabs=2 to bridge it.
+        tracks_relaxed = track_clusters_vertical(
+            z_centres, slabs, max_gap_slabs=2,
+        )
+        assert len(tracks_relaxed) == 1
+        assert tracks_relaxed[0].n_nodes == 2
+
+    def test_does_not_bridge_excessive_gap(self):
+        # Gap exceeds budget → two separate tracks.
+        z_centres = [1.0, 2.0, 3.0, 4.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [],
+            [],
+            [_mock_ellipse(0.0, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs, max_gap_slabs=2)
+        assert len(tracks) == 2
+
+    def test_jump_above_threshold_breaks_track(self):
+        # Same nominal stem but XY jumps by 1 m between adjacent slabs —
+        # exceeds default max_xy_jump=0.30 → two separate tracks.
+        z_centres = [1.0, 2.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [_mock_ellipse(1.0, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 2
+        # Each track has one node.
+        assert all(t.n_nodes == 1 for t in tracks)
+
+    def test_inclined_stem_tracked_when_jump_under_threshold(self):
+        # Stem inclined by ~10 cm per slab → well below max_xy_jump=0.30
+        # → single track.
+        z_centres = [1.0, 2.0, 3.0, 4.0]
+        slabs = [
+            [_mock_ellipse(0.0 + 0.1 * i, 0.0)]
+            for i in range(4)
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 1
+        assert tracks[0].n_nodes == 4
+
+    def test_greedy_picks_closest_when_multiple_candidates(self):
+        # Slab 1 has one ellipse at (0, 0).
+        # Slab 2 has two candidates: (0.05, 0) very close, and
+        # (0.20, 0) further. The track must claim the closer one
+        # (0.05); the further one starts its own track.
+        z_centres = [1.0, 2.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [_mock_ellipse(0.05, 0.0), _mock_ellipse(0.20, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 2
+        # The longer track is the original one extended.
+        long_track = max(tracks, key=lambda t: t.n_nodes)
+        assert long_track.n_nodes == 2
+        # And its top node is the close ellipse.
+        assert long_track.nodes[-1].ellipse.xc == pytest.approx(0.05)
+
+    def test_global_cost_sort_avoids_pathological_greedy(self):
+        # Two tracks competing for the same ellipse: a per-track greedy
+        # would let the first-seen track claim it; the global-cost sort
+        # prefers the track whose match is closer.
+        # Slab 1: two ellipses at (0,0) and (0.20,0).
+        # Slab 2: one ellipse at (0.18, 0).
+        # Per-track greedy in order [0,0]→(0.18) might claim it
+        # (distance 0.18). But the (0.20,0) track has distance 0.02 —
+        # it should win.
+        z_centres = [1.0, 2.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0), _mock_ellipse(0.20, 0.0)],
+            [_mock_ellipse(0.18, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs, max_xy_jump=0.30)
+        # 3 tracks total: (0,0) singleton, (0.20,0)→(0.18,0) extended,
+        # because slabs above only had one match-able ellipse.
+        # Actually it's 2 tracks: (0,0) alone, and (0.20)→(0.18) chained.
+        # The (0.20,0)→(0.18,0) track wins the match.
+        long_track = max(tracks, key=lambda t: t.n_nodes)
+        assert long_track.n_nodes == 2
+        assert long_track.nodes[0].ellipse.xc == pytest.approx(0.20)
+        assert long_track.nodes[1].ellipse.xc == pytest.approx(0.18)
+
+    def test_track_properties(self):
+        z_centres = [1.0, 2.0, 3.0]
+        slabs = [[_mock_ellipse(0.0, 0.0)] for _ in z_centres]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        t = tracks[0]
+        assert t.z_bottom == 1.0
+        assert t.z_top == 3.0
+        assert t.n_nodes == 3

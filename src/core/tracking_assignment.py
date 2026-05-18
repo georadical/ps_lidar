@@ -40,8 +40,8 @@ sub-fase.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -435,3 +435,166 @@ def fit_ellipses_in_slice(
                 n_points=cluster.n_points,
             ))
     return results
+
+
+# ===========================================================================
+# GS.5 — Vertical tracking (greedy adjacent matching)
+# ===========================================================================
+
+@dataclass(frozen=True)
+class TrackNode:
+    """A single node of a vertical track: an ellipse stamped with its
+    slab z. The ellipse remains slab-agnostic in :class:`ClusterEllipse`;
+    z lives on the node."""
+    z: float
+    ellipse: "ClusterEllipse"
+
+
+@dataclass(frozen=True)
+class Track:
+    """A vertical sequence of ellipses presumed to belong to one tree.
+
+    ``nodes`` are ordered by ascending z (bottom of the stem first).
+    A track may have a single node (a basal ellipse with no upward
+    continuation) or many. Bifurcations are NOT resolved here — they
+    are handled in GS.6 / GS.7 once basal seeding is layered on top.
+    """
+    nodes: List[TrackNode]
+
+    @property
+    def n_nodes(self) -> int:
+        return len(self.nodes)
+
+    @property
+    def z_bottom(self) -> float:
+        return self.nodes[0].z
+
+    @property
+    def z_top(self) -> float:
+        return self.nodes[-1].z
+
+
+def track_clusters_vertical(
+    slab_centres: Sequence[float],
+    slab_ellipses: List[List[ClusterEllipse]],
+    max_xy_jump: float = 0.30,
+    max_gap_slabs: int = 1,
+) -> List[Track]:
+    """Build vertical tracks by greedy XY matching across adjacent slabs.
+
+    Walks the slabs bottom-to-top. At each new slab, each *open* track
+    (one whose most recent node sits within ``max_gap_slabs`` slabs of
+    the current one) tries to claim an ellipse in the current slab by
+    minimum XY distance from its last node. Matches with distance above
+    ``max_xy_jump`` are rejected. Ellipses left unclaimed start a new
+    track each.
+
+    The matching strategy is **greedy on a global cost sort** rather
+    than per-track: we compute all (eligible track, current ellipse)
+    XY distances, sort ascending, and consume in order — each side at
+    most once per slab. This avoids the pathological case where one
+    track greedily grabs a "good enough" match while another track had
+    a much better option for the same ellipse. It is not globally
+    optimal (Hungarian would be) but is fast and good enough on the
+    well-separated-stems case Jorge's plots present; we can upgrade
+    later if it becomes a bottleneck.
+
+    Parameters
+    ----------
+    slab_centres : sequence of float
+        Z-centres of the slabs, in ascending order. Length must match
+        ``slab_ellipses``.
+    slab_ellipses : list of list of ClusterEllipse
+        Per-slab outputs of :func:`fit_ellipses_in_slice`, indexed the
+        same as ``slab_centres``. Inner lists may be empty (slab with
+        no successful fits) — those slabs are skipped, but they still
+        count toward the gap budget for adjacent matching.
+    max_xy_jump : float, default 0.30
+        Maximum XY distance between a track's last node and a candidate
+        ellipse in the current slab to consider them the same stem
+        (metres). At 1 m slab spacing this allows ~17° of stem
+        inclination per metre — comfortably above what we see in plots.
+    max_gap_slabs : int, default 1
+        Allow extending a track over a gap of up to this many empty
+        slabs (e.g. ``1`` = adjacent-only; ``2`` = may skip one slab).
+        Higher values tolerate occlusion at the cost of stitching
+        unrelated stems together when they happen to be vertically
+        aligned.
+
+    Returns
+    -------
+    list of Track
+        One ``Track`` per detected stem candidate. Tracks of length 1
+        (singletons) are returned too — GS.6 will filter or seed them
+        based on whether they originate at the basal stripe. Order in
+        the returned list is the chronological creation order (oldest
+        track first), not sorted by size.
+
+    Raises
+    ------
+    ValueError
+        If ``slab_centres`` and ``slab_ellipses`` have different lengths,
+        or ``max_xy_jump`` / ``max_gap_slabs`` are non-positive.
+    """
+    if len(slab_centres) != len(slab_ellipses):
+        raise ValueError(
+            f"slab_centres and slab_ellipses must have the same length; "
+            f"got {len(slab_centres)} and {len(slab_ellipses)}"
+        )
+    if max_xy_jump <= 0.0:
+        raise ValueError(f"max_xy_jump must be positive; got {max_xy_jump}")
+    if max_gap_slabs < 1:
+        raise ValueError(f"max_gap_slabs must be >= 1; got {max_gap_slabs}")
+
+    # `tracks[i]` is a list of TrackNode; `track_last_slab[i]` is the
+    # slab index where its last node lives. Parallel lists keep the
+    # access pattern simple.
+    tracks: List[List[TrackNode]] = []
+    track_last_slab: List[int] = []
+
+    for slab_idx, (z_centre, ellipses) in enumerate(
+        zip(slab_centres, slab_ellipses)
+    ):
+        if not ellipses:
+            continue  # nothing to match or start
+
+        # Eligible tracks: their last node is in a slab within the gap
+        # budget. A gap of 0 means same slab (we never match within),
+        # so the minimum eligible gap is 1.
+        eligible = [
+            ti for ti, ls in enumerate(track_last_slab)
+            if 1 <= (slab_idx - ls) <= max_gap_slabs
+        ]
+
+        used_tracks: set = set()
+        used_ellipses: set = set()
+
+        if eligible:
+            # Build (distance, track_index, ellipse_index) candidate list.
+            costs: List[Tuple[float, int, int]] = []
+            for ti in eligible:
+                last_ell = tracks[ti][-1].ellipse
+                lx, ly = last_ell.xc, last_ell.yc
+                for ei, ell in enumerate(ellipses):
+                    d = float(np.hypot(ell.xc - lx, ell.yc - ly))
+                    if d <= max_xy_jump:
+                        costs.append((d, ti, ei))
+            # Sort by distance ascending; consume greedily.
+            costs.sort(key=lambda c: c[0])
+            for d, ti, ei in costs:
+                if ti in used_tracks or ei in used_ellipses:
+                    continue
+                # Extend track ti with ellipse ei.
+                tracks[ti].append(TrackNode(z=z_centre, ellipse=ellipses[ei]))
+                track_last_slab[ti] = slab_idx
+                used_tracks.add(ti)
+                used_ellipses.add(ei)
+
+        # Unmatched ellipses → new tracks.
+        for ei, ell in enumerate(ellipses):
+            if ei in used_ellipses:
+                continue
+            tracks.append([TrackNode(z=z_centre, ellipse=ell)])
+            track_last_slab.append(slab_idx)
+
+    return [Track(nodes=list(t)) for t in tracks]
