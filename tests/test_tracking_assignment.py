@@ -25,15 +25,20 @@ from src.core.tracking_assignment import (
     HorizontalSlice,
     Track,
     TrackNode,
+    TrackingAssignmentConfig,
     TrackingAssignmentResult,
     assign_tree_ids_from_tracks,
+    assign_trees_by_tracking,
     bootstrap_tracks_from_basal_stripe,
+    build_tree_axes_from_tracks,
     cluster_slice,
     filter_by_verticality,
     fit_ellipses_in_slice,
     slice_horizontal_global,
     track_clusters_vertical,
+    tracking_result_to_trunk_extraction_result,
 )
+from src.core.trunk_extraction import TrunkExtractionResult
 
 
 # ===========================================================================
@@ -1020,3 +1025,155 @@ class TestAssignTreeIdsBehaviour:
         mask_other = np.ones(10, dtype=bool)
         mask_other[3] = False
         assert np.all(res.tree_ids[mask_other] == -1)
+
+
+# ===========================================================================
+# GS.8 — assign_trees_by_tracking (orchestrator) + compatibility shim
+# ===========================================================================
+
+def _tall_cylinder(
+    n_per_m: int = 300,
+    radius: float = 0.15,
+    height: float = 8.0,
+    centre_xy=(0.0, 0.0),
+    rng_seed: int = 0,
+) -> np.ndarray:
+    """A dense vertical cylinder for end-to-end orchestrator tests."""
+    rng = np.random.default_rng(seed=rng_seed)
+    n = int(n_per_m * height)
+    z = rng.uniform(0.0, height, size=n)
+    a = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    x = centre_xy[0] + radius * np.cos(a)
+    y = centre_xy[1] + radius * np.sin(a)
+    return np.column_stack([x, y, z]).astype(np.float64)
+
+
+class TestAssignTreesByTrackingContract:
+
+    def test_rejects_invalid_xyz_shape(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_tracking(np.zeros((10, 2)))
+
+    def test_returns_tracking_assignment_result(self):
+        xyz = _tall_cylinder()
+        result = assign_trees_by_tracking(xyz)
+        assert isinstance(result, TrackingAssignmentResult)
+        assert result.tree_ids.shape == (xyz.shape[0],)
+        assert result.stem_ids.shape == (xyz.shape[0],)
+
+
+class TestAssignTreesByTrackingBehaviour:
+
+    def test_single_cylinder_assigned_to_one_tree(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            # Basal stripe must cover where the cylinder starts (z ~ 0).
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        assert result.n_trees == 1
+        # Assigned point fraction should be substantial (a vertical
+        # cylinder is exactly the inlier shape).
+        assigned_frac = (result.tree_ids >= 0).mean()
+        assert assigned_frac > 0.20, (
+            f"too few points assigned: {assigned_frac:.2%}"
+        )
+
+    def test_two_parallel_cylinders_assigned_to_two_trees(self):
+        a = _tall_cylinder(centre_xy=(0.0, 0.0), height=8.0, rng_seed=1)
+        b = _tall_cylinder(centre_xy=(2.5, 0.0), height=8.0, rng_seed=2)
+        xyz = np.vstack([a, b])
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        assert result.n_trees == 2
+
+        # Each cylinder should map to one tree id. The first cylinder
+        # is indices [0, n_a), the second [n_a, n_total).
+        n_a = a.shape[0]
+        first_ids = np.unique(result.tree_ids[:n_a])
+        second_ids = np.unique(result.tree_ids[n_a:])
+        # Drop -1 (unassigned)
+        first_assigned = set(int(i) for i in first_ids if i >= 0)
+        second_assigned = set(int(i) for i in second_ids if i >= 0)
+        # The two cylinders end up with disjoint tree IDs.
+        assert first_assigned and second_assigned
+        assert first_assigned.isdisjoint(second_assigned)
+
+    def test_empty_cloud_produces_zero_trees(self):
+        xyz = np.empty((0, 3), dtype=np.float64)
+        result = assign_trees_by_tracking(xyz)
+        assert result.n_trees == 0
+        assert result.tree_ids.shape == (0,)
+
+
+class TestBuildTreeAxesFromTracks:
+
+    def test_axes_match_tracks_count(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        axes = build_tree_axes_from_tracks(xyz, result)
+        assert len(axes) == result.n_trees
+
+    def test_axis_fields_present(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0, basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        if result.n_trees == 0:
+            pytest.skip("no trees recovered — calibration drift, not the contract")
+        ax = build_tree_axes_from_tracks(xyz, result)[0]
+        assert "tree_id" in ax
+        assert "centroid" in ax
+        assert "direction" in ax
+        assert "line_point" in ax
+        assert "z_min" in ax
+        assert "z_max" in ax
+        # Direction unit norm and z-positive (sign convention).
+        d = ax["direction"]
+        assert d[2] > 0.0
+        assert abs(np.linalg.norm(d) - 1.0) < 1e-9
+        # Centroid is 3D
+        assert np.asarray(ax["centroid"]).shape == (3,)
+
+    def test_vertical_cylinder_direction_is_near_z(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0, basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        if result.n_trees == 0:
+            pytest.skip("no trees recovered — calibration drift, not the contract")
+        ax = build_tree_axes_from_tracks(xyz, result)[0]
+        d = ax["direction"]
+        # A perfectly vertical cylinder must produce a direction within
+        # a few degrees of +z.
+        assert d[2] > 0.95
+
+
+class TestTrackingResultToTrunkExtractionResult:
+
+    def test_shim_returns_compatible_trunk_extraction_result(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0, basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        shim = tracking_result_to_trunk_extraction_result(xyz, result)
+
+        assert isinstance(shim, TrunkExtractionResult)
+        assert shim.tree_ids.shape == (xyz.shape[0],)
+        assert shim.trunk_mask.shape == (xyz.shape[0],)
+        assert shim.trunk_mask.dtype == bool
+        # trunk_mask == (tree_ids >= 0) by construction.
+        np.testing.assert_array_equal(shim.trunk_mask, result.tree_ids >= 0)
+        assert shim.n_trees == result.n_trees
+        assert len(shim.tree_axes) == result.n_trees

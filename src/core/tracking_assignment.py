@@ -47,6 +47,7 @@ import numpy as np
 
 from src.core.ellipse_fitting import EllipseFitConfig, _fit_ellipse_check
 from src.core.features import compute_verticality_mask_early_exit
+from src.core.trunk_extraction import TrunkExtractionConfig, TrunkExtractionResult
 
 
 # ===========================================================================
@@ -786,4 +787,316 @@ def assign_tree_ids_from_tracks(
         stem_ids=stem_ids,
         n_trees=len(tracks),
         tracks=list(tracks),
+    )
+
+
+# ===========================================================================
+# GS.8 — Orchestrator + compatibility shim
+# ===========================================================================
+
+@dataclass
+class TrackingAssignmentConfig:
+    """End-to-end configuration for :func:`assign_trees_by_tracking`.
+
+    Groups the per-sub-fase knobs into one object so the notebook (and
+    other top-level callers) can tune the pipeline without importing
+    seven different functions.
+
+    Defaults follow the Phase 1B plan and have been smoke-tested on
+    synthetic clouds; calibration on a real plot may need to widen
+    ``max_xy_jump`` (for plots with strong inclination), tighten
+    ``dbscan_eps`` (in dense plantations), or shift
+    ``basal_stripe_z_*`` to wherever the basal cross-section is clean
+    on the user's data.
+    """
+    # --- GS.1 verticality filter ---
+    verticality_threshold: float = 0.7
+    verticality_scale: float = 0.10
+    voxel_resolution_xy: float = 0.05
+    voxel_resolution_z: float = 0.05
+    coarse_resolution: float = 0.10
+    coarse_margin: float = 0.10
+
+    # --- GS.2 horizontal slicing ---
+    z_min: float = 0.3
+    z_max: float = 40.0
+    slab_step: float = 1.0
+    slab_half_thickness: float = 0.5
+
+    # --- GS.3 DBSCAN per slice ---
+    dbscan_eps: float = 0.10
+    dbscan_min_samples: int = 10
+
+    # --- GS.4 ellipse fit (delegated to EllipseFitConfig) ---
+    ellipse: EllipseFitConfig = field(default_factory=EllipseFitConfig)
+
+    # --- GS.5 vertical tracking ---
+    max_xy_jump: float = 0.30
+    max_gap_slabs: int = 1
+
+    # --- GS.6 basal-stripe bootstrap ---
+    basal_stripe_z_low: float = 0.5
+    basal_stripe_z_high: float = 2.0
+    min_track_length: int = 1
+
+
+def assign_trees_by_tracking(
+    xyz: np.ndarray,
+    config: Optional[TrackingAssignmentConfig] = None,
+    rng: Optional[np.random.Generator] = None,
+    verbose: bool = False,
+) -> TrackingAssignmentResult:
+    """Run the full GS.1 → GS.7 chain and return per-point assignment.
+
+    The orchestrator preserves the **original-cloud index space**
+    throughout: GS.1 returns a mask into the input cloud; we record
+    that mapping and remap GS.2's slice indices into the original
+    coordinate system before passing them downstream. Every
+    ``ClusterEllipse.indices``, ``TrackNode.ellipse.indices``, and
+    the final ``tree_ids`` array therefore points to the SAME cloud
+    the caller fed in — no per-stage re-indexing needed.
+
+    Parameters
+    ----------
+    xyz : ndarray of shape (N, 3)
+        Height-normalised vegetation point cloud.
+    config : TrackingAssignmentConfig, optional
+        Pipeline configuration. Defaults to a fresh
+        ``TrackingAssignmentConfig()``.
+    rng : np.random.Generator, optional
+        Forwarded to the RANSAC ellipse fits. Pin a seed for
+        reproducible runs (recommended for gate comparisons).
+    verbose : bool, default False
+        Print per-stage progress to stdout.
+
+    Returns
+    -------
+    TrackingAssignmentResult
+        With ``tree_ids`` / ``stem_ids`` of length ``N``,
+        ``n_trees`` and the list of surviving Tracks.
+    """
+    if config is None:
+        config = TrackingAssignmentConfig()
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must have shape (N, 3); got {xyz.shape}")
+    n_orig = xyz.shape[0]
+
+    if verbose:
+        print("\n=== GS.8: tracking-based tree_id assignment ===")
+        print(f"  Input: {n_orig:,} points")
+
+    # GS.1 — verticality filter on the FULL cloud.
+    filtered_xyz, keep_mask = filter_by_verticality(
+        xyz,
+        threshold=config.verticality_threshold,
+        scale=config.verticality_scale,
+        voxel_resolution_xy=config.voxel_resolution_xy,
+        voxel_resolution_z=config.voxel_resolution_z,
+        coarse_resolution=config.coarse_resolution,
+        margin=config.coarse_margin,
+    )
+    original_indices = np.where(keep_mask)[0]  # filtered → original mapping
+    if verbose:
+        print(
+            f"  GS.1 verticality filter: {filtered_xyz.shape[0]:,} / "
+            f"{n_orig:,} kept ({100.0 * keep_mask.mean():.1f}%)"
+        )
+
+    # GS.2 — slice the filtered cloud horizontally.
+    slices_filtered = slice_horizontal_global(
+        filtered_xyz,
+        z_min=config.z_min,
+        z_max=config.z_max,
+        slab_step=config.slab_step,
+        slab_half_thickness=config.slab_half_thickness,
+    )
+    # Remap each slab's indices into the ORIGINAL cloud's coordinate
+    # system. Downstream stages then carry original-cloud indices end
+    # to end — no surprise re-indexing at GS.7.
+    slices = [
+        HorizontalSlice(
+            z_centre=s.z_centre,
+            z_low=s.z_low,
+            z_high=s.z_high,
+            indices=(
+                original_indices[s.indices]
+                if s.indices.size else s.indices
+            ),
+        )
+        for s in slices_filtered
+    ]
+    if verbose:
+        n_non_empty = sum(1 for s in slices if s.indices.size > 0)
+        print(
+            f"  GS.2 slicing: {len(slices)} slabs total, "
+            f"{n_non_empty} non-empty"
+        )
+
+    # GS.3 + GS.4 per slab — passing the ORIGINAL `xyz` since the
+    # remapped slice indices point there.
+    slab_ellipses: List[List[ClusterEllipse]] = []
+    n_clusters_total = 0
+    n_ellipses_total = 0
+    for s in slices:
+        clusters = cluster_slice(
+            xyz, s,
+            eps=config.dbscan_eps,
+            min_samples=config.dbscan_min_samples,
+        )
+        n_clusters_total += len(clusters)
+        ellipses = fit_ellipses_in_slice(
+            xyz, clusters, config.ellipse, rng=rng,
+        )
+        n_ellipses_total += len(ellipses)
+        slab_ellipses.append(ellipses)
+    if verbose:
+        print(
+            f"  GS.3 + GS.4: {n_clusters_total} DBSCAN clusters → "
+            f"{n_ellipses_total} valid ellipse fits"
+        )
+
+    # GS.5 — vertical tracking.
+    slab_centres = [s.z_centre for s in slices]
+    tracks = track_clusters_vertical(
+        slab_centres, slab_ellipses,
+        max_xy_jump=config.max_xy_jump,
+        max_gap_slabs=config.max_gap_slabs,
+    )
+    if verbose:
+        print(f"  GS.5 tracking: {len(tracks)} candidate tracks")
+
+    # GS.6 — basal-stripe bootstrap.
+    survivors = bootstrap_tracks_from_basal_stripe(
+        tracks,
+        config.basal_stripe_z_low,
+        config.basal_stripe_z_high,
+        min_track_length=config.min_track_length,
+    )
+    if verbose:
+        print(
+            f"  GS.6 basal bootstrap: {len(survivors)} surviving tracks "
+            f"(= n_trees)"
+        )
+
+    # GS.7 — assign on the full-size cloud.
+    result = assign_tree_ids_from_tracks(survivors, n_points=n_orig)
+    if verbose:
+        n_assigned = int((result.tree_ids >= 0).sum())
+        print(
+            f"  GS.7 assignment: {n_assigned:,} / {n_orig:,} points "
+            f"labelled ({100.0 * n_assigned / max(n_orig, 1):.1f}%)"
+        )
+        print(f"=== Done. n_trees = {result.n_trees} ===\n")
+
+    return result
+
+
+def build_tree_axes_from_tracks(
+    xyz: np.ndarray,
+    tracking_result: TrackingAssignmentResult,
+) -> List[dict]:
+    """Build a list of ``tree_axes`` dicts compatible with
+    :class:`TrunkExtractionResult.tree_axes`.
+
+    Downstream stages (``clean_stems`` suspicious scoring, the audit
+    table, the inventory export) read a handful of fields from each
+    axis: ``tree_id``, ``centroid``, ``direction``, ``line_point``,
+    ``z_min``, ``z_max``. This shim populates them from the track
+    geometry:
+
+    - ``centroid``: the basal node's ellipse centre in 3D (x, y, z).
+    - ``direction``: dominant PCA direction over the track's node
+      positions, sign-flipped to keep ``z > 0``. Singletons fall back
+      to ``[0, 0, 1]``.
+    - ``line_point``: same as ``centroid`` (fallback for code that
+      reads ``ax.get("line_point", ax["centroid"])``).
+    - ``z_min`` / ``z_max``: actual z-extent of all points labelled
+      with this ``tree_id``.
+
+    The straight-cylinder-only fields (``basal_anchor_*``) are NOT
+    populated; consumers must use ``.get(..., default)`` to read them.
+
+    Parameters
+    ----------
+    xyz : ndarray of shape (N, 3)
+        The original cloud (same as fed to ``assign_trees_by_tracking``).
+    tracking_result : TrackingAssignmentResult
+        Output of ``assign_trees_by_tracking``.
+
+    Returns
+    -------
+    list of dict
+        One dict per tree, in the same order as
+        ``tracking_result.tracks``.
+    """
+    axes: List[dict] = []
+    for i, track in enumerate(tracking_result.tracks):
+        # z-extent from the actual labelled points (not from the track
+        # nodes — the points usually reach above the topmost node).
+        tree_mask = tracking_result.tree_ids == i
+        if int(tree_mask.sum()) > 0:
+            tree_z = xyz[tree_mask, 2]
+            z_min = float(tree_z.min())
+            z_max = float(tree_z.max())
+        else:
+            z_min = float(track.z_bottom)
+            z_max = float(track.z_top)
+
+        basal = track.nodes[0]
+        centroid = np.array(
+            [basal.ellipse.xc, basal.ellipse.yc, float(basal.z)],
+            dtype=np.float64,
+        )
+
+        if track.n_nodes >= 2:
+            nodes_xyz = np.array(
+                [(n.ellipse.xc, n.ellipse.yc, n.z) for n in track.nodes],
+                dtype=np.float64,
+            )
+            centred = nodes_xyz - nodes_xyz.mean(axis=0)
+            _, _, vt = np.linalg.svd(centred, full_matrices=False)
+            direction = vt[0]
+            if direction[2] < 0.0:
+                direction = -direction
+        else:
+            direction = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        axes.append({
+            "tree_id": i,
+            "centroid": centroid,
+            "direction": direction,
+            "line_point": centroid,
+            "z_min": z_min,
+            "z_max": z_max,
+        })
+
+    return axes
+
+
+def tracking_result_to_trunk_extraction_result(
+    xyz: np.ndarray,
+    tracking_result: TrackingAssignmentResult,
+) -> TrunkExtractionResult:
+    """Wrap a :class:`TrackingAssignmentResult` as a drop-in
+    :class:`TrunkExtractionResult` so existing downstream consumers
+    (``clean_stems``, ``compute_stem_sections``, the audit table, the
+    inventory export) keep working without modification.
+
+    ``trunk_mask`` becomes ``tree_ids >= 0`` (any point with an assigned
+    tree is considered a trunk point).
+    """
+    trunk_mask = tracking_result.tree_ids >= 0
+    tree_axes = build_tree_axes_from_tracks(xyz, tracking_result)
+    # `cluster_points` is the stripe-clusters output of the legacy
+    # pipeline. Tracking has no equivalent (its "stripe" is the whole
+    # basal-mask intersected with valid tracks), so we surface an
+    # empty array. No downstream consumer in the active notebook
+    # cells reads this field.
+    return TrunkExtractionResult(
+        trunk_mask=trunk_mask,
+        tree_ids=tracking_result.tree_ids,
+        n_trees=tracking_result.n_trees,
+        tree_axes=tree_axes,
+        cluster_points=np.empty((0, 3), dtype=np.float64),
+        config=TrunkExtractionConfig(),
     )
