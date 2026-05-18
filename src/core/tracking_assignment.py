@@ -671,3 +671,119 @@ def bootstrap_tracks_from_basal_stripe(
             survivors.append(track)
 
     return survivors
+
+
+# ===========================================================================
+# GS.7 — Assign tree_id to original-cloud points from surviving tracks
+# ===========================================================================
+
+@dataclass
+class TrackingAssignmentResult:
+    """Per-point ``tree_id`` / ``stem_id`` assignment, produced by
+    :func:`assign_tree_ids_from_tracks` (GS.7).
+
+    Mirrors the shape of :class:`TrunkExtractionResult.tree_ids` so it
+    can replace the straight-cylinder assignment downstream without
+    touching `clean_stems` or `compute_stem_sections`.
+
+    Fields
+    ------
+    tree_ids : ndarray (N,) int32
+        Per-point tree index in ``range(n_trees)``, or ``-1`` for
+        unassigned points (everything outside any successful track:
+        understory, foliage, canopy, ground noise, sparse fits that
+        failed quality checks).
+    stem_ids : ndarray (N,) int32
+        Per-point stem index within the tree. ``0`` is the main stem;
+        values ``>= 1`` mark bifurcated secondary stems whose DBH is
+        measured at 1.30 m above the bifurcation point (PlotSafe
+        schema). GS.7 leaves all assigned points at ``stem_id == 0``;
+        bifurcation handling is a later sub-fase.
+    n_trees : int
+        Number of distinct tree IDs assigned (== number of surviving
+        tracks fed in).
+    tracks : list of Track
+        The exact tracks used, in the same order as the assigned IDs
+        (``tree_id == k`` corresponds to ``tracks[k]``). Kept on the
+        result so downstream code can read the per-tree centerline
+        directly without re-deriving it.
+    """
+    tree_ids: np.ndarray
+    stem_ids: np.ndarray
+    n_trees: int
+    tracks: List[Track] = field(default_factory=list)
+
+
+def assign_tree_ids_from_tracks(
+    tracks: List[Track],
+    n_points: int,
+) -> TrackingAssignmentResult:
+    """Stamp ``tree_id`` on every point that belongs to a surviving track.
+
+    For each track in input order, collects the original-cloud indices
+    from every node's ellipse (``node.ellipse.indices``) and assigns
+    ``tree_id = track_index`` to those points. Points belonging to no
+    track remain at ``-1``.
+
+    **First-write-wins** when two tracks share an index (which only
+    happens with overlapping slabs, ``slab_half_thickness > slab_step
+    / 2``): the earlier track keeps the point. This is deterministic
+    and idempotent; in the default no-overlap configuration the
+    conflict path never fires.
+
+    Bifurcations are **not** handled here. Every assigned point gets
+    ``stem_id == 0``. A later sub-fase will detect orphan tracks
+    near a parent track and reassign them to ``stem_id >= 1`` of the
+    parent's tree, following the PlotSafe field-data schema.
+
+    Parameters
+    ----------
+    tracks : list of Track
+        Surviving tracks from :func:`bootstrap_tracks_from_basal_stripe`
+        (GS.6). The function trusts these are the trees to keep;
+        filtering is a GS.6 responsibility.
+    n_points : int
+        Length of the original input cloud. The returned arrays are
+        allocated to this length so downstream code can use them as
+        per-point labels without any re-indexing.
+
+    Returns
+    -------
+    TrackingAssignmentResult
+        With ``tree_ids`` / ``stem_ids`` arrays of length ``n_points``
+        and ``n_trees == len(tracks)``.
+
+    Raises
+    ------
+    ValueError
+        If ``n_points`` is negative, or any track contains an index
+        out of range for ``n_points``.
+    """
+    if n_points < 0:
+        raise ValueError(f"n_points must be >= 0; got {n_points}")
+
+    tree_ids = np.full(n_points, -1, dtype=np.int32)
+    stem_ids = np.zeros(n_points, dtype=np.int32)
+
+    for track_idx, track in enumerate(tracks):
+        for node in track.nodes:
+            indices = node.ellipse.indices
+            if indices.size == 0:
+                continue
+            # Defensive bounds check — catches mocks or upstream bugs.
+            if int(indices.max()) >= n_points or int(indices.min()) < 0:
+                raise ValueError(
+                    f"track {track_idx} has indices out of range "
+                    f"[0, {n_points}); got min={int(indices.min())}, "
+                    f"max={int(indices.max())}"
+                )
+            # First-write-wins: only stamp tree_id where still unassigned.
+            unassigned = tree_ids[indices] == -1
+            tree_ids[indices[unassigned]] = track_idx
+
+    return TrackingAssignmentResult(
+        tree_ids=tree_ids,
+        stem_ids=stem_ids,
+        n_trees=len(tracks),
+        tracks=list(tracks),
+    )

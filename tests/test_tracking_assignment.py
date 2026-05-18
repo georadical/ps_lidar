@@ -25,6 +25,8 @@ from src.core.tracking_assignment import (
     HorizontalSlice,
     Track,
     TrackNode,
+    TrackingAssignmentResult,
+    assign_tree_ids_from_tracks,
     bootstrap_tracks_from_basal_stripe,
     cluster_slice,
     filter_by_verticality,
@@ -887,3 +889,134 @@ class TestBootstrapTracksFromBasalStripeBehaviour:
         survivors = bootstrap_tracks_from_basal_stripe(mixed, 0.5, 2.0)
         # Survivors are exactly the rooted ones, in input order.
         assert survivors == rooted
+
+
+# ===========================================================================
+# GS.7 — assign_tree_ids_from_tracks
+# ===========================================================================
+
+def _ellipse_with_indices(indices: np.ndarray) -> ClusterEllipse:
+    """Build a ClusterEllipse carrying the given indices (xy/a/b/theta
+    irrelevant for the assignment test)."""
+    return ClusterEllipse(
+        indices=np.asarray(indices, dtype=np.int64),
+        xc=0.0, yc=0.0, a=0.15, b=0.15, theta=0.0,
+        sector_pct=100.0, check_status=0, n_points=int(len(indices)),
+    )
+
+
+def _track_with_indices(per_node_indices: list, z_values: list) -> Track:
+    """Build a Track whose nodes carry the given index arrays."""
+    nodes = [
+        TrackNode(z=z, ellipse=_ellipse_with_indices(idx))
+        for z, idx in zip(z_values, per_node_indices)
+    ]
+    return Track(nodes=nodes)
+
+
+class TestAssignTreeIdsContract:
+
+    def test_empty_tracks_returns_all_unassigned(self):
+        res = assign_tree_ids_from_tracks([], n_points=10)
+        assert isinstance(res, TrackingAssignmentResult)
+        assert res.n_trees == 0
+        assert res.tree_ids.shape == (10,)
+        assert res.stem_ids.shape == (10,)
+        assert np.all(res.tree_ids == -1)
+        assert np.all(res.stem_ids == 0)
+        assert res.tracks == []
+
+    def test_arrays_have_correct_dtypes(self):
+        res = assign_tree_ids_from_tracks([], n_points=5)
+        assert res.tree_ids.dtype == np.int32
+        assert res.stem_ids.dtype == np.int32
+
+    def test_rejects_negative_n_points(self):
+        with pytest.raises(ValueError):
+            assign_tree_ids_from_tracks([], n_points=-1)
+
+    def test_rejects_out_of_range_indices(self):
+        t = _track_with_indices(
+            per_node_indices=[np.array([100, 200])], z_values=[1.0],
+        )
+        with pytest.raises(ValueError):
+            assign_tree_ids_from_tracks([t], n_points=50)
+
+    def test_zero_n_points_with_empty_tracks(self):
+        res = assign_tree_ids_from_tracks([], n_points=0)
+        assert res.tree_ids.shape == (0,)
+        assert res.stem_ids.shape == (0,)
+
+
+class TestAssignTreeIdsBehaviour:
+
+    def test_single_track_single_node(self):
+        # 20 points, one track owns indices [3, 7, 11].
+        t = _track_with_indices(
+            per_node_indices=[np.array([3, 7, 11])], z_values=[1.0],
+        )
+        res = assign_tree_ids_from_tracks([t], n_points=20)
+        assert res.n_trees == 1
+        expected = np.full(20, -1, dtype=np.int32)
+        expected[[3, 7, 11]] = 0
+        np.testing.assert_array_equal(res.tree_ids, expected)
+        # stem_id stays 0 everywhere (no bifurcations yet).
+        assert np.all(res.stem_ids == 0)
+
+    def test_multiple_tracks_get_consecutive_ids(self):
+        ta = _track_with_indices([np.array([0, 1, 2])], [1.0])
+        tb = _track_with_indices([np.array([5, 6])], [1.0])
+        tc = _track_with_indices([np.array([10])], [1.0])
+        res = assign_tree_ids_from_tracks([ta, tb, tc], n_points=12)
+        assert res.n_trees == 3
+        assert list(res.tree_ids[[0, 1, 2]]) == [0, 0, 0]
+        assert list(res.tree_ids[[5, 6]]) == [1, 1]
+        assert int(res.tree_ids[10]) == 2
+        # Unassigned points stay at -1.
+        assert int(res.tree_ids[3]) == -1
+        assert int(res.tree_ids[11]) == -1
+
+    def test_indices_from_multiple_nodes_aggregated(self):
+        # A multi-node track: its tree_id covers ALL indices from
+        # every node.
+        t = _track_with_indices(
+            per_node_indices=[
+                np.array([0, 1]),
+                np.array([10, 11]),
+                np.array([20, 21]),
+            ],
+            z_values=[1.0, 2.0, 3.0],
+        )
+        res = assign_tree_ids_from_tracks([t], n_points=30)
+        assigned = np.where(res.tree_ids == 0)[0]
+        np.testing.assert_array_equal(assigned, [0, 1, 10, 11, 20, 21])
+
+    def test_first_write_wins_on_conflict(self):
+        # Two tracks share index 5. First track stamps tree_id=0; the
+        # second tries to stamp tree_id=1 but is denied.
+        ta = _track_with_indices([np.array([5, 6])], [1.0])
+        tb = _track_with_indices([np.array([5, 7])], [1.0])
+        res = assign_tree_ids_from_tracks([ta, tb], n_points=10)
+        assert int(res.tree_ids[5]) == 0   # first writer
+        assert int(res.tree_ids[6]) == 0
+        assert int(res.tree_ids[7]) == 1   # tb claimed this one cleanly
+
+    def test_result_carries_input_tracks(self):
+        ta = _track_with_indices([np.array([0])], [1.0])
+        tb = _track_with_indices([np.array([1])], [1.0])
+        res = assign_tree_ids_from_tracks([ta, tb], n_points=5)
+        assert res.tracks == [ta, tb]
+
+    def test_empty_node_indices_dont_break(self):
+        # A track whose node carries no indices (defensive case;
+        # shouldn't happen post-GS.4 since failed fits are dropped).
+        t = _track_with_indices(
+            per_node_indices=[np.empty(0, dtype=np.int64), np.array([3])],
+            z_values=[1.0, 2.0],
+        )
+        res = assign_tree_ids_from_tracks([t], n_points=10)
+        assert int(res.tree_ids[3]) == 0
+        # Other points still -1.
+        mask_other = np.ones(10, dtype=bool)
+        mask_other[3] = False
+        assert np.all(res.tree_ids[mask_other] == -1)
