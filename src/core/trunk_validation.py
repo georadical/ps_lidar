@@ -37,6 +37,7 @@ from src.core.features import (
     compute_verticality_mask_early_exit,
 )
 from src.core.trunk_extraction import TrunkExtractionResult
+from src.core.ellipse_fitting import EllipseFitConfig, _fit_ellipse_check
 
 
 # ---------------------------------------------------------------------------
@@ -897,6 +898,155 @@ def compute_stem_sections(
         if verbose:
             mean_r = np.mean(radii_valid) if radii_valid else 0
             mean_d = mean_r * 2
+            print(f"    Tree {tid:3d}: {n_valid}/{n_sections} valid sections, "
+                  f"mean_diam={mean_d:.3f}m")
+
+    return SectionResult(
+        X_c=X_c,
+        Y_c=Y_c,
+        R=R,
+        check=check,
+        sector_pct=sector_pct,
+        sections=sections,
+        tree_ids=unique_trees,
+        config=config,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Step 2 (variant): RANSAC ellipse sections (Mejora 1, Phase 1C — EF.1)
+# ---------------------------------------------------------------------------
+
+def _stem_config_to_ellipse_config(config: StemCleaningConfig) -> EllipseFitConfig:
+    """Map the relevant fields of ``StemCleaningConfig`` (used by the
+    circle-fit path) onto an :class:`EllipseFitConfig` (used by the
+    ellipse-fit path). RANSAC and aspect-ratio knobs fall back to the
+    sensible defaults declared on ``EllipseFitConfig`` itself.
+    """
+    return EllipseFitConfig(
+        min_points_section=config.min_points_section,
+        r_min=config.r_min,
+        r_max=config.r_max,
+        inner_ratio=config.inner_circle_ratio,
+        max_inner_points=config.max_inner_points,
+        n_sectors=config.n_sectors,
+        min_sectors=config.min_sectors,
+        sector_width=config.sector_width,
+        cluster_eps=config.cluster_eps,
+        # ransac_n_iters, ransac_tau_sampson, min_inlier_fraction,
+        # min_aspect_ratio: kept at EllipseFitConfig defaults — they have
+        # no equivalent in StemCleaningConfig and changing them requires
+        # an explicit override at the caller.
+    )
+
+
+def compute_stem_sections_ellipse(
+    xyz: np.ndarray,
+    stem_mask: np.ndarray,
+    tree_ids: np.ndarray,
+    config: StemCleaningConfig,
+    verbose: bool = True,
+    rng: Optional[np.random.Generator] = None,
+) -> SectionResult:
+    """RANSAC-ellipse drop-in alternative to :func:`compute_stem_sections`.
+
+    Same loop structure (per-tree, per-section horizontal slice), same
+    output dataclass, but the per-section fit is the ellipse pipeline
+    from ``src.core.ellipse_fitting``:
+
+      1. Fitzgibbon-Halíř-Flusser algebraic hypothesis (EL.1) inside a
+         RANSAC loop with Sampson scoring (EL.2, EL.3).
+      2. Levenberg-Marquardt refit on the orthogonal distance over the
+         consensus set (EL.4).
+      3. Quality checks (radius range, inner-empty, sector occupancy,
+         aspect ratio, inlier fraction) and a DBSCAN-retry path identical
+         to the circle wrapper (EL.5 — ``_fit_ellipse_check``).
+
+    The ``SectionResult.R`` field stores the **equivalent radius**
+    ``√(a · b)`` of each section's ellipse so that
+    :func:`build_centerline_from_sections` and any downstream code that
+    consumes ``R`` continues to work unchanged. The full geometric
+    description ``(a, b, theta)`` per section is not yet stored on
+    ``SectionResult`` — that extension is sub-fase EF.2.
+
+    Parameters
+    ----------
+    xyz, stem_mask, tree_ids, config : same as :func:`compute_stem_sections`.
+    verbose : bool, default True
+        Print per-tree progress to stdout.
+    rng : np.random.Generator, optional
+        Random number generator forwarded to the RANSAC loop. Pass a
+        seeded generator for reproducibility (recommended for the
+        notebook gate comparisons).
+
+    Returns
+    -------
+    SectionResult
+        Same dataclass as the circle-fit path; ``R = √(a·b)`` per
+        section. Sections with no valid fit have ``R = 0``.
+    """
+    ellipse_cfg = _stem_config_to_ellipse_config(config)
+
+    sections = np.arange(
+        config.minimum_height,
+        config.maximum_height,
+        config.section_len,
+    )
+    n_sections = len(sections)
+
+    unique_trees = sorted(set(tree_ids[stem_mask]) - {-1})
+    n_trees = len(unique_trees)
+
+    if verbose:
+        print(f"\nStem sectioning (RANSAC ellipse, Mejora 1 Phase 1C — EF.1):")
+        print(f"  Trees: {n_trees}")
+        print(f"  Sections: {n_sections} "
+              f"({config.minimum_height}m → {config.maximum_height}m, "
+              f"step={config.section_len}m, width=±{config.section_wid}m)")
+        print(f"  Per-section fit: RANSAC ellipse "
+              f"(n_iters={ellipse_cfg.ransac_n_iters}, "
+              f"τ_Sampson={ellipse_cfg.ransac_tau_sampson}m)")
+
+    X_c = np.zeros((n_trees, n_sections))
+    Y_c = np.zeros((n_trees, n_sections))
+    R = np.zeros((n_trees, n_sections))
+    check = np.zeros((n_trees, n_sections))
+    sector_pct = np.zeros((n_trees, n_sections))
+
+    for i, tid in enumerate(unique_trees):
+        tree_mask = stem_mask & (tree_ids == tid)
+        tree_pts = xyz[tree_mask]
+
+        n_valid = 0
+        radii_valid: List[float] = []
+
+        for j, sh in enumerate(sections):
+            z_low = sh - config.section_wid
+            z_high = sh + config.section_wid
+            sec_mask = (tree_pts[:, 2] >= z_low) & (tree_pts[:, 2] < z_high)
+
+            sec_X = tree_pts[sec_mask, 0]
+            sec_Y = tree_pts[sec_mask, 1]
+
+            xc, yc, a, b, _theta, chk, spct = _fit_ellipse_check(
+                sec_X, sec_Y, ellipse_cfg, rng=rng,
+            )
+
+            r_equiv = float(np.sqrt(a * b)) if (a > 0.0 and b > 0.0) else 0.0
+
+            X_c[i, j] = xc
+            Y_c[i, j] = yc
+            R[i, j] = r_equiv
+            check[i, j] = chk
+            sector_pct[i, j] = spct
+
+            if r_equiv > 0.0:
+                n_valid += 1
+                radii_valid.append(r_equiv)
+
+        if verbose:
+            mean_r = float(np.mean(radii_valid)) if radii_valid else 0.0
+            mean_d = mean_r * 2.0
             print(f"    Tree {tid:3d}: {n_valid}/{n_sections} valid sections, "
                   f"mean_diam={mean_d:.3f}m")
 
