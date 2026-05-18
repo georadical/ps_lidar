@@ -208,3 +208,77 @@ class TestComputeStemSectionsEllipse:
 
         assert result.X_c.shape[0] == 0
         assert result.tree_ids == []
+
+
+# ===========================================================================
+# EF.2 — SectionResult.(a, b, theta) population in both fit paths
+# ===========================================================================
+
+class TestEllipseFieldsPopulation:
+    """The ``a``, ``b`` and ``theta`` arrays must be populated by both
+    ``compute_stem_sections`` (circle) and ``compute_stem_sections_ellipse``
+    (ellipse) so downstream code can compute ovality uniformly."""
+
+    def test_circle_path_populates_a_equal_b_equal_R(self):
+        # The circle fit is the degenerate ellipse a = b = R, theta = 0.
+        xyz, mask, tids = _synthetic_cylinder(radius=0.15)
+        cfg = _section_config()
+
+        r = compute_stem_sections(xyz, mask, tids, cfg, verbose=False)
+
+        assert r.a is not None
+        assert r.b is not None
+        assert r.theta is not None
+        assert r.a.shape == r.R.shape
+        np.testing.assert_array_equal(r.a, r.R)
+        np.testing.assert_array_equal(r.b, r.R)
+        np.testing.assert_array_equal(r.theta, np.zeros_like(r.R))
+
+    def test_ellipse_path_populates_ab_theta_from_fit(self):
+        xyz, mask, tids = _synthetic_cylinder(radius=0.15)
+        cfg = _section_config()
+        rng = np.random.default_rng(seed=42)
+
+        r = compute_stem_sections_ellipse(
+            xyz, mask, tids, cfg, verbose=False, rng=rng,
+        )
+
+        assert r.a is not None and r.b is not None and r.theta is not None
+        assert r.a.shape == r.R.shape
+
+        valid = r.R[0] > 0
+        # On a perfectly circular cross-section the ellipse fit should
+        # return a ≈ b ≈ 0.15 m.
+        np.testing.assert_allclose(r.a[0, valid], 0.15, atol=3e-3)
+        np.testing.assert_allclose(r.b[0, valid], 0.15, atol=3e-3)
+        # Convention: a ≥ b on every valid section.
+        assert np.all(r.a[0, valid] >= r.b[0, valid])
+        # √(a · b) must equal the equivalent radius stored in R.
+        np.testing.assert_allclose(
+            np.sqrt(r.a[0, valid] * r.b[0, valid]),
+            r.R[0, valid],
+            atol=1e-9,
+        )
+
+    def test_ellipse_path_invalid_sections_have_zero_ab_theta(self):
+        # If a section has too few points or fails the quality check,
+        # R is 0 and a, b, theta must also be 0 (consistent invalid marker).
+        # Force this by passing a config with an impossibly high
+        # min_points_section so every section is rejected.
+        xyz, mask, tids = _synthetic_cylinder(radius=0.15, height=2.0)
+        cfg = _section_config(maximum_height=2.0)
+        # Override min_points to reject every slice.
+        cfg = StemCleaningConfig(
+            **{**cfg.__dict__, "min_points_section": 100_000_000},
+        )
+        rng = np.random.default_rng(seed=42)
+
+        r = compute_stem_sections_ellipse(
+            xyz, mask, tids, cfg, verbose=False, rng=rng,
+        )
+
+        # Every section invalid → R, a, b, theta all zeros.
+        assert np.all(r.R == 0.0)
+        assert np.all(r.a == 0.0)
+        assert np.all(r.b == 0.0)
+        assert np.all(r.theta == 0.0)

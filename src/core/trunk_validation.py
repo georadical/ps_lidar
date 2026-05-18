@@ -151,15 +151,37 @@ class StemCleaningResult:
 
 @dataclass
 class SectionResult:
-    """Result of stem sectioning (circle fitting)."""
+    """Result of stem sectioning (circle or ellipse fitting).
+
+    The ``a``, ``b`` and ``theta`` fields were added in Phase 1C (EF.2)
+    to expose the full geometric description of each cross-section. They
+    are optional for backwards compatibility with code that constructs
+    :class:`SectionResult` mocks without them.
+
+    When populated, the convention is:
+      - Ellipse path (``compute_stem_sections_ellipse``): ``a`` is the
+        semi-major axis, ``b`` the semi-minor (``a ≥ b``), ``theta`` is
+        the rotation in radians from +x to the semi-major direction.
+      - Circle path (``compute_stem_sections``): ``a = b = R`` and
+        ``theta = 0`` — a circle is the degenerate ellipse with equal
+        axes. This convention lets downstream code compute ovality as
+        ``b / a`` uniformly across both fit paths (1.0 for circles,
+        ``< 1.0`` for ovals; HQP ovalidad criterion is ``a / b > 1.2``).
+      - Invalid sections (``R == 0``): all four are ``0``.
+    """
     X_c: np.ndarray               # (n_trees, n_sections) X centres
     Y_c: np.ndarray               # (n_trees, n_sections) Y centres
-    R: np.ndarray                  # (n_trees, n_sections) radii
+    R: np.ndarray                 # (n_trees, n_sections) equivalent radii
+                                   #   (circle: R; ellipse: √(a·b))
     check: np.ndarray             # (n_trees, n_sections) validity flag
     sector_pct: np.ndarray        # (n_trees, n_sections) sector occupancy %
     sections: np.ndarray          # (n_sections,) section heights
     tree_ids: List[int]           # tree IDs in order
     config: StemCleaningConfig
+    # ---- EF.2 additions (optional for backwards compatibility) ----
+    a: Optional[np.ndarray] = None        # (n_trees, n_sections) semi-major axis
+    b: Optional[np.ndarray] = None        # (n_trees, n_sections) semi-minor axis
+    theta: Optional[np.ndarray] = None    # (n_trees, n_sections) orientation (rad)
 
 
 # ---------------------------------------------------------------------------
@@ -901,6 +923,8 @@ def compute_stem_sections(
             print(f"    Tree {tid:3d}: {n_valid}/{n_sections} valid sections, "
                   f"mean_diam={mean_d:.3f}m")
 
+    # EF.2: expose the circle as the degenerate ellipse a = b = R, theta = 0.
+    # Invalid sections (R == 0) propagate as zeros — no special casing needed.
     return SectionResult(
         X_c=X_c,
         Y_c=Y_c,
@@ -910,6 +934,9 @@ def compute_stem_sections(
         sections=sections,
         tree_ids=unique_trees,
         config=config,
+        a=R.copy(),
+        b=R.copy(),
+        theta=np.zeros_like(R),
     )
 
 
@@ -1012,6 +1039,10 @@ def compute_stem_sections_ellipse(
     R = np.zeros((n_trees, n_sections))
     check = np.zeros((n_trees, n_sections))
     sector_pct = np.zeros((n_trees, n_sections))
+    # EF.2: per-section ellipse parameters (semi-major, semi-minor, orientation).
+    a_arr = np.zeros((n_trees, n_sections))
+    b_arr = np.zeros((n_trees, n_sections))
+    theta_arr = np.zeros((n_trees, n_sections))
 
     for i, tid in enumerate(unique_trees):
         tree_mask = stem_mask & (tree_ids == tid)
@@ -1028,7 +1059,7 @@ def compute_stem_sections_ellipse(
             sec_X = tree_pts[sec_mask, 0]
             sec_Y = tree_pts[sec_mask, 1]
 
-            xc, yc, a, b, _theta, chk, spct = _fit_ellipse_check(
+            xc, yc, a, b, theta, chk, spct = _fit_ellipse_check(
                 sec_X, sec_Y, ellipse_cfg, rng=rng,
             )
 
@@ -1039,8 +1070,12 @@ def compute_stem_sections_ellipse(
             R[i, j] = r_equiv
             check[i, j] = chk
             sector_pct[i, j] = spct
-
+            # EF.2: only store ellipse params on valid sections; invalid ones
+            # (r_equiv == 0) leave a/b/theta at their initialised zero values.
             if r_equiv > 0.0:
+                a_arr[i, j] = a
+                b_arr[i, j] = b
+                theta_arr[i, j] = theta
                 n_valid += 1
                 radii_valid.append(r_equiv)
 
@@ -1059,6 +1094,9 @@ def compute_stem_sections_ellipse(
         sections=sections,
         tree_ids=unique_trees,
         config=config,
+        a=a_arr,
+        b=b_arr,
+        theta=theta_arr,
     )
 
 
