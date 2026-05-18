@@ -18,11 +18,14 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from src.core.ellipse_fitting import EllipseFitConfig
 from src.core.tracking_assignment import (
     Cluster2D,
+    ClusterEllipse,
     HorizontalSlice,
     cluster_slice,
     filter_by_verticality,
+    fit_ellipses_in_slice,
     slice_horizontal_global,
 )
 
@@ -436,3 +439,168 @@ class TestClusterSliceBehaviour:
         c = clusters[0]
         expected = ring[c.indices, :2].mean(axis=0)
         np.testing.assert_allclose(c.centroid_xy, expected, atol=1e-9)
+
+
+# ===========================================================================
+# GS.4 — fit_ellipses_in_slice
+# ===========================================================================
+
+def _stem_ellipse_config(**overrides) -> EllipseFitConfig:
+    """Loose-ish EllipseFitConfig sized for synthetic test rings
+    (radius ~0.15 m, ~150 points per ring). Mirrors the helper used
+    in `test_ellipse_fitting.py`."""
+    base = dict(
+        min_points_section=40,
+        r_min=0.05,
+        r_max=0.40,
+        inner_ratio=0.5,
+        max_inner_points=5,
+        n_sectors=16,
+        min_sectors=9,
+        sector_width=0.02,
+        ransac_n_iters=200,
+        ransac_tau_sampson=0.005,
+        min_inlier_fraction=0.6,
+        min_aspect_ratio=0.5,
+        cluster_eps=0.02,
+    )
+    base.update(overrides)
+    return EllipseFitConfig(**base)
+
+
+class TestFitEllipsesInSliceContract:
+
+    def test_empty_input_returns_empty_list(self):
+        xyz = np.empty((0, 3), dtype=np.float64)
+        cfg = _stem_ellipse_config()
+        assert fit_ellipses_in_slice(xyz, [], cfg) == []
+
+    def test_returns_list_of_cluster_ellipse(self):
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=150, rng_seed=0)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng)
+        assert isinstance(results, list)
+        assert all(isinstance(r, ClusterEllipse) for r in results)
+
+
+class TestFitEllipsesInSliceBehaviour:
+
+    def test_single_ring_fitted_within_tolerance(self):
+        ring = _ring_at_z(0.5, -0.5, 0.15, 1.5, n=200, rng_seed=0)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng)
+        assert len(results) == 1
+        r = results[0]
+        # Indices preserved
+        np.testing.assert_array_equal(r.indices, clusters[0].indices)
+        # Geometry recovered
+        assert abs(r.xc - 0.5) < 5e-3
+        assert abs(r.yc - (-0.5)) < 5e-3
+        assert abs(r.a - 0.15) < 5e-3
+        assert abs(r.b - 0.15) < 5e-3
+        assert r.a >= r.b  # convention
+        assert r.check_status in (0, 1)
+        assert r.n_points == clusters[0].n_points
+
+    def test_two_clusters_both_fitted(self):
+        ring_a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=1)
+        ring_b = _ring_at_z(2.0, 0.0, 0.15, 1.5, n=200, rng_seed=2)
+        xyz = np.vstack([ring_a, ring_b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 2  # sanity from GS.3
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, clusters, cfg, rng=rng)
+        assert len(results) == 2
+        # Centres match the two ring centroids (order may vary).
+        centres = sorted([(r.xc, r.yc) for r in results])
+        np.testing.assert_allclose(centres[0], (0.0, 0.0), atol=5e-3)
+        np.testing.assert_allclose(centres[1], (2.0, 0.0), atol=5e-3)
+
+    def test_undersized_cluster_dropped(self):
+        # 10 points → below min_points_section=40 → _fit_ellipse_check
+        # returns status 2 with zeros → dropped by the filter.
+        rng_geom = np.random.default_rng(seed=0)
+        n = 10
+        a = rng_geom.uniform(0.0, 2.0 * np.pi, size=n)
+        x = 0.15 * np.cos(a)
+        y = 0.15 * np.sin(a)
+        z = np.full(n, 1.5)
+        xyz = np.column_stack([x, y, z])
+        cluster = Cluster2D(
+            indices=np.arange(n, dtype=np.int64),
+            centroid_xy=np.array([0.0, 0.0]),
+            n_points=n,
+        )
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, [cluster], cfg, rng=rng)
+        assert results == []
+
+    def test_pure_noise_cluster_dropped(self):
+        # Random points spread over a 1 m square at fixed z → no ellipse
+        # passes the quality checks → cluster dropped.
+        rng_geom = np.random.default_rng(seed=99)
+        n = 200
+        x = rng_geom.uniform(-0.5, 0.5, size=n)
+        y = rng_geom.uniform(-0.5, 0.5, size=n)
+        z = np.full(n, 1.5)
+        xyz = np.column_stack([x, y, z])
+        cluster = Cluster2D(
+            indices=np.arange(n, dtype=np.int64),
+            centroid_xy=np.array([0.0, 0.0]),
+            n_points=n,
+        )
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, [cluster], cfg, rng=rng)
+        assert results == []
+
+    def test_a_at_least_b_invariant(self):
+        # Even on a slightly elongated ellipse, the wrapper must respect
+        # the a ≥ b convention.
+        rng_geom = np.random.default_rng(seed=3)
+        n = 200
+        t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        x = 0.18 * np.cos(t)
+        y = 0.12 * np.sin(t)
+        z = np.full(n, 1.5)
+        xyz = np.column_stack([x, y, z])
+        cluster = Cluster2D(
+            indices=np.arange(n, dtype=np.int64),
+            centroid_xy=np.array([0.0, 0.0]),
+            n_points=n,
+        )
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, [cluster], cfg, rng=rng)
+        assert len(results) == 1
+        r = results[0]
+        assert r.a >= r.b
+        assert abs(r.a - 0.18) < 5e-3
+        assert abs(r.b - 0.12) < 5e-3
+
+    def test_reproducible_with_seed(self):
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=11)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        cfg = _stem_ellipse_config()
+
+        rng_a = np.random.default_rng(seed=999)
+        rng_b = np.random.default_rng(seed=999)
+        ra = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng_a)
+        rb = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng_b)
+        assert ra == rb

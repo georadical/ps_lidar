@@ -41,10 +41,11 @@ sub-fase.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
+from src.core.ellipse_fitting import EllipseFitConfig, _fit_ellipse_check
 from src.core.features import compute_verticality_mask_early_exit
 
 
@@ -339,3 +340,98 @@ def cluster_slice(
         ))
 
     return clusters
+
+
+# ===========================================================================
+# GS.4 — Fit RANSAC ellipse per cluster
+# ===========================================================================
+
+@dataclass(frozen=True)
+class ClusterEllipse:
+    """A 2D cluster that has been successfully fitted with an ellipse.
+
+    Produced by :func:`fit_ellipses_in_slice` from a :class:`Cluster2D`
+    plus the EL.5 ``_fit_ellipse_check`` output. The ``indices`` field
+    still points into the **original** input cloud — convention shared
+    with :class:`HorizontalSlice` and :class:`Cluster2D` throughout the
+    GS block.
+
+    Convention: ``a ≥ b`` (semi-major ≥ semi-minor); ``theta`` is the
+    rotation in radians from +x to the semi-major axis. All length-like
+    fields are in the same units as the input XYZ (typically metres).
+    """
+    indices: np.ndarray        # (K,) int — full-cloud indices
+    xc: float                  # ellipse centre X
+    yc: float                  # ellipse centre Y
+    a: float                   # semi-major axis
+    b: float                   # semi-minor axis
+    theta: float               # orientation (radians)
+    sector_pct: float          # quality: % of sectors occupied around the curve
+    check_status: int          # EL.5 status: 0 = first-attempt fit, 1 = retried
+    n_points: int              # cluster size fed to RANSAC
+
+
+def fit_ellipses_in_slice(
+    xyz: np.ndarray,
+    clusters: List[Cluster2D],
+    config: EllipseFitConfig,
+    rng: Optional[np.random.Generator] = None,
+) -> List[ClusterEllipse]:
+    """Fit a RANSAC ellipse to each cluster; keep only successful fits.
+
+    Calls :func:`_fit_ellipse_check` (EL.5) on the XY positions of each
+    cluster's points. The wrapper handles RANSAC + geometric refit +
+    quality checks (radius range, inner-empty, sector occupancy, aspect
+    ratio, inlier fraction) and signals success via positive ``(a, b)``.
+
+    A cluster is **kept** in the output when its fit returned strictly
+    positive semi-axes — this captures both ``check_status == 0``
+    (clean first-attempt fit) and ``check_status == 1`` with a
+    successful retry on the largest DBSCAN sub-cluster. Failed retries
+    surface as ``a == b == 0`` and are dropped here, as are slices with
+    too few points (``check_status == 2``).
+
+    Parameters
+    ----------
+    xyz : ndarray of shape (N, 3)
+        The full input point cloud (same one fed to GS.1–GS.3).
+    clusters : list of Cluster2D
+        Output of :func:`cluster_slice` for a single slab.
+    config : EllipseFitConfig
+        Configuration forwarded to ``_fit_ellipse_check``. The
+        equivalent-radius window ``[r_min, r_max]`` filters out
+        cross-sections that are too thin (top of canopy) or too thick
+        (artefacts from merged clusters in dense plots).
+    rng : np.random.Generator, optional
+        Forwarded to the RANSAC loop. Pin a seeded generator for
+        reproducible runs (recommended for the GS gate comparisons).
+
+    Returns
+    -------
+    list of ClusterEllipse
+        One entry per cluster whose fit passed the quality checks,
+        in the same order as the input ``clusters``. Empty if every
+        cluster failed (e.g. all sparse noise) or the input list is
+        empty.
+    """
+    results: List[ClusterEllipse] = []
+    for cluster in clusters:
+        # _fit_ellipse_check already guards its inputs (length checks
+        # etc.), so we don't pre-validate here beyond pulling the XY view.
+        cluster_xy = xyz[cluster.indices, :2]
+        xc, yc, a, b, theta, status, sector_pct = _fit_ellipse_check(
+            cluster_xy[:, 0], cluster_xy[:, 1], config, rng=rng,
+        )
+        if a > 0.0 and b > 0.0:
+            results.append(ClusterEllipse(
+                indices=cluster.indices,
+                xc=float(xc),
+                yc=float(yc),
+                a=float(a),
+                b=float(b),
+                theta=float(theta),
+                sector_pct=float(sector_pct),
+                check_status=int(status),
+                n_points=cluster.n_points,
+            ))
+    return results
