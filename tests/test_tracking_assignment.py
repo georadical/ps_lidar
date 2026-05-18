@@ -25,6 +25,7 @@ from src.core.tracking_assignment import (
     HorizontalSlice,
     Track,
     TrackNode,
+    bootstrap_tracks_from_basal_stripe,
     cluster_slice,
     filter_by_verticality,
     fit_ellipses_in_slice,
@@ -777,3 +778,112 @@ class TestTrackClustersVerticalBehaviour:
         assert t.z_bottom == 1.0
         assert t.z_top == 3.0
         assert t.n_nodes == 3
+
+
+# ===========================================================================
+# GS.6 — bootstrap_tracks_from_basal_stripe
+# ===========================================================================
+
+def _track_from_z_values(zs: list, xc: float = 0.0, yc: float = 0.0) -> Track:
+    """Build a Track at fixed (xc, yc) with one node per z in `zs`."""
+    nodes = [TrackNode(z=z, ellipse=_mock_ellipse(xc, yc)) for z in zs]
+    return Track(nodes=nodes)
+
+
+class TestBootstrapTracksFromBasalStripeContract:
+
+    def test_empty_input_returns_empty(self):
+        assert bootstrap_tracks_from_basal_stripe([], 0.5, 2.0) == []
+
+    def test_rejects_inverted_stripe_bounds(self):
+        with pytest.raises(ValueError):
+            bootstrap_tracks_from_basal_stripe(
+                [_track_from_z_values([1.0])], 2.0, 0.5,
+            )
+
+    def test_rejects_non_positive_min_track_length(self):
+        with pytest.raises(ValueError):
+            bootstrap_tracks_from_basal_stripe(
+                [_track_from_z_values([1.0])], 0.5, 2.0, min_track_length=0,
+            )
+
+
+class TestBootstrapTracksFromBasalStripeBehaviour:
+
+    def test_track_rooted_in_stripe_is_kept(self):
+        # Track starts at z=1.0 (inside stripe 0.5-2.0) → kept.
+        t = _track_from_z_values([1.0, 2.0, 3.0, 4.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == [t]
+
+    def test_track_rooted_above_stripe_is_dropped(self):
+        # Lowest node at z=5 → above stripe top 2.0 → dropped.
+        t = _track_from_z_values([5.0, 6.0, 7.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == []
+
+    def test_track_rooted_below_stripe_is_dropped(self):
+        # Lowest node at z=0.1 → below stripe floor 0.5 → dropped.
+        # (Defensive: usually filter_by_verticality removes ground, but
+        # this guards against bad calibration on z-normalisation.)
+        t = _track_from_z_values([0.1, 1.5, 3.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == []
+
+    def test_boundary_inclusive(self):
+        # z_bottom equal to stripe boundaries → kept (inclusive bounds).
+        t_low = _track_from_z_values([0.5, 1.0])
+        t_high = _track_from_z_values([2.0, 3.0])
+        survivors = bootstrap_tracks_from_basal_stripe(
+            [t_low, t_high], 0.5, 2.0,
+        )
+        assert survivors == [t_low, t_high]
+
+    def test_mixed_tracks_filtered_correctly(self):
+        # 4 tracks: 2 rooted, 2 floating. Only the rooted ones survive.
+        rooted_a = _track_from_z_values([1.0, 2.0, 3.0], xc=0.0)
+        rooted_b = _track_from_z_values([1.2, 2.2], xc=2.0)
+        floating_canopy = _track_from_z_values([8.0, 9.0], xc=0.5)
+        floating_high = _track_from_z_values([15.0], xc=3.0)
+
+        survivors = bootstrap_tracks_from_basal_stripe(
+            [rooted_a, floating_canopy, rooted_b, floating_high],
+            0.5, 2.0,
+        )
+        # Order preserved.
+        assert survivors == [rooted_a, rooted_b]
+
+    def test_min_track_length_filter(self):
+        # Two rooted tracks; one is length 1, the other length 3.
+        # min_track_length=2 keeps only the longer one.
+        short = _track_from_z_values([1.0])
+        long = _track_from_z_values([1.0, 2.0, 3.0])
+        survivors = bootstrap_tracks_from_basal_stripe(
+            [short, long], 0.5, 2.0, min_track_length=2,
+        )
+        assert survivors == [long]
+
+    def test_min_track_length_default_keeps_singletons(self):
+        # Default min_track_length=1 keeps singletons that satisfy the
+        # basal-stripe constraint.
+        t = _track_from_z_values([1.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == [t]
+
+    def test_order_preserved(self):
+        # Filtering must not reshuffle the relative order of survivors.
+        rooted = [
+            _track_from_z_values([1.0, 2.0], xc=float(i))
+            for i in range(5)
+        ]
+        # Sprinkle some floaters
+        floaters = [_track_from_z_values([10.0], xc=float(i)) for i in range(3)]
+        mixed = []
+        for r, f in zip(rooted, floaters + [None] * (len(rooted) - len(floaters))):
+            mixed.append(r)
+            if f is not None:
+                mixed.append(f)
+
+        survivors = bootstrap_tracks_from_basal_stripe(mixed, 0.5, 2.0)
+        # Survivors are exactly the rooted ones, in input order.
+        assert survivors == rooted

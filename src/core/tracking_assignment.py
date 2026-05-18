@@ -598,3 +598,76 @@ def track_clusters_vertical(
             track_last_slab.append(slab_idx)
 
     return [Track(nodes=list(t)) for t in tracks]
+
+
+# ===========================================================================
+# GS.6 — Bootstrap tracks from a basal stripe
+# ===========================================================================
+
+def bootstrap_tracks_from_basal_stripe(
+    tracks: List[Track],
+    stripe_z_low: float,
+    stripe_z_high: float,
+    min_track_length: int = 1,
+) -> List[Track]:
+    """Keep only tracks rooted in the basal stripe; discard floating ones.
+
+    A track is **rooted in the basal stripe** when its lowest node
+    (``track.z_bottom``) lies in ``[stripe_z_low, stripe_z_high]``.
+    Tracks whose lowest node sits above the stripe are presumed to be
+    artefacts — clusters that aligned vertically through several slabs
+    of foliage / canopy but have no actual basal anchor. They are
+    discarded.
+
+    This step is the **bootstrap** that turns the noisy candidate-track
+    set from GS.5 (``track_clusters_vertical``) into a set of trustworthy
+    per-tree polylines. After GS.6 the surviving tracks define the
+    tree IDs that GS.7 will stamp onto the point cloud.
+
+    Parameters
+    ----------
+    tracks : list of Track
+        Candidate tracks from :func:`track_clusters_vertical`.
+    stripe_z_low : float
+        Lower bound of the basal stripe in metres (inclusive).
+    stripe_z_high : float
+        Upper bound of the basal stripe in metres (inclusive).
+    min_track_length : int, default 1
+        Optional length filter: also drop tracks with fewer than
+        ``min_track_length`` nodes. ``1`` keeps singleton tracks
+        (any track with a basal anchor counts, even if only one
+        ellipse passed quality checks). ``2`` requires at least one
+        vertical continuation, useful when working with sparse plots.
+
+    Returns
+    -------
+    list of Track
+        Surviving tracks, in the same order as the input list.
+        Empty if every track was filtered out (e.g. plot with no
+        basal coverage).
+
+    Raises
+    ------
+    ValueError
+        If ``stripe_z_low > stripe_z_high`` or
+        ``min_track_length < 1``.
+    """
+    if stripe_z_low > stripe_z_high:
+        raise ValueError(
+            f"stripe_z_low must be <= stripe_z_high; "
+            f"got {stripe_z_low} and {stripe_z_high}"
+        )
+    if min_track_length < 1:
+        raise ValueError(
+            f"min_track_length must be >= 1; got {min_track_length}"
+        )
+
+    survivors: List[Track] = []
+    for track in tracks:
+        if track.n_nodes < min_track_length:
+            continue
+        z0 = track.z_bottom
+        if stripe_z_low <= z0 <= stripe_z_high:
+            survivors.append(track)
+
+    return survivors
