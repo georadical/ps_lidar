@@ -19,7 +19,9 @@ import numpy as np
 import pytest
 
 from src.core.tracking_assignment import (
+    Cluster2D,
     HorizontalSlice,
+    cluster_slice,
     filter_by_verticality,
     slice_horizontal_global,
 )
@@ -293,3 +295,144 @@ class TestSliceHorizontalGlobalBehaviour:
         # Allow ±25 % variance for the uniform draw.
         assert counts.min() > 700
         assert counts.max() < 1300
+
+
+# ===========================================================================
+# GS.3 — cluster_slice (DBSCAN on slice XY)
+# ===========================================================================
+
+def _ring_at_z(
+    cx: float, cy: float, radius: float, z: float,
+    n: int = 200, rng_seed: int = 0,
+) -> np.ndarray:
+    """Generate `n` points forming an XY ring at a fixed height."""
+    rng = np.random.default_rng(seed=rng_seed)
+    a = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    x = cx + radius * np.cos(a)
+    y = cy + radius * np.sin(a)
+    z_arr = np.full(n, z, dtype=np.float64) + rng.normal(0, 0.01, size=n)
+    return np.column_stack([x, y, z_arr]).astype(np.float64)
+
+
+def _whole_slice(xyz: np.ndarray, z_centre: float) -> HorizontalSlice:
+    """Build a HorizontalSlice that selects all of `xyz`."""
+    return HorizontalSlice(
+        z_centre=z_centre,
+        z_low=z_centre - 100.0,
+        z_high=z_centre + 100.0,
+        indices=np.arange(xyz.shape[0], dtype=np.int64),
+    )
+
+
+class TestClusterSliceContract:
+
+    def test_returns_list_of_cluster2d(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl)
+        assert isinstance(clusters, list)
+        assert all(isinstance(c, Cluster2D) for c in clusters)
+
+    def test_empty_slice_returns_empty_list(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        empty = HorizontalSlice(
+            z_centre=10.0, z_low=9.5, z_high=10.5,
+            indices=np.empty(0, dtype=np.int64),
+        )
+        assert cluster_slice(xyz, empty) == []
+
+    def test_indices_refer_to_input_xyz_not_slice_subset(self):
+        # Build a cloud where the slice selects a non-contiguous subset
+        # and verify the returned cluster indices are in the input-cloud
+        # coordinate system.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=120)
+        noise_before = np.random.default_rng(7).normal(size=(50, 3))
+        noise_before[:, 2] = -10.0  # well below slab
+        noise_after = np.random.default_rng(8).normal(size=(50, 3))
+        noise_after[:, 2] = 100.0   # well above slab
+        xyz = np.vstack([noise_before, ring, noise_after])
+
+        # Slice spans only the ring region.
+        slice_obj = HorizontalSlice(
+            z_centre=1.5, z_low=1.0, z_high=2.0,
+            indices=np.arange(50, 50 + 120, dtype=np.int64),
+        )
+        clusters = cluster_slice(xyz, slice_obj, eps=0.05, min_samples=5)
+        assert len(clusters) >= 1
+        # All cluster indices must be inside [50, 170)
+        for c in clusters:
+            assert c.indices.min() >= 50
+            assert c.indices.max() < 50 + 120
+
+    def test_rejects_invalid_shape(self):
+        with pytest.raises(ValueError):
+            cluster_slice(np.zeros((10, 2)), _whole_slice(np.zeros((10, 3)), 0.0))
+
+    def test_rejects_non_positive_eps_or_min_samples(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=50)
+        sl = _whole_slice(xyz, z_centre=1.5)
+        with pytest.raises(ValueError):
+            cluster_slice(xyz, sl, eps=0.0)
+        with pytest.raises(ValueError):
+            cluster_slice(xyz, sl, eps=-0.05)
+        with pytest.raises(ValueError):
+            cluster_slice(xyz, sl, min_samples=0)
+
+
+class TestClusterSliceBehaviour:
+
+    def test_single_well_formed_ring_makes_one_cluster(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 1
+        c = clusters[0]
+        assert c.n_points == 200
+        # Centroid near (0, 0)
+        np.testing.assert_allclose(c.centroid_xy, [0.0, 0.0], atol=0.02)
+
+    def test_two_well_separated_rings_make_two_clusters(self):
+        # Two rings centred 2 m apart — way more than eps=0.10
+        ring_a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=1)
+        ring_b = _ring_at_z(2.0, 0.0, 0.15, 1.5, n=200, rng_seed=2)
+        xyz = np.vstack([ring_a, ring_b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 2
+        # Each cluster has ~200 points (no cross-contamination).
+        sizes = sorted(c.n_points for c in clusters)
+        assert sizes == [200, 200]
+
+    def test_pure_noise_returns_no_clusters(self):
+        rng = np.random.default_rng(seed=42)
+        # Scatter sparse random points so DBSCAN labels everything as noise
+        # at the default min_samples=10.
+        xyz = rng.uniform(-5.0, 5.0, size=(80, 3))
+        xyz[:, 2] = 1.5
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.05, min_samples=10)
+        assert clusters == []
+
+    def test_eps_monotonicity(self):
+        # Two rings 0.4 m apart. Small eps separates them; large eps
+        # merges them.
+        ring_a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=1)
+        ring_b = _ring_at_z(0.4, 0.0, 0.15, 1.5, n=200, rng_seed=2)
+        xyz = np.vstack([ring_a, ring_b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+
+        small_eps = cluster_slice(xyz, sl, eps=0.05, min_samples=5)
+        big_eps = cluster_slice(xyz, sl, eps=0.30, min_samples=5)
+        assert len(small_eps) >= len(big_eps), (
+            f"raising eps did not reduce cluster count: "
+            f"{len(small_eps)} → {len(big_eps)}"
+        )
+
+    def test_centroid_matches_mean_of_cluster_points(self):
+        ring = _ring_at_z(1.0, 2.5, 0.15, 1.5, n=200, rng_seed=9)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 1
+        c = clusters[0]
+        expected = ring[c.indices, :2].mean(axis=0)
+        np.testing.assert_allclose(c.centroid_xy, expected, atol=1e-9)

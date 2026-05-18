@@ -243,3 +243,99 @@ def slice_horizontal_global(
         ))
 
     return slices
+
+
+# ===========================================================================
+# GS.3 — DBSCAN per slice
+# ===========================================================================
+
+@dataclass(frozen=True)
+class Cluster2D:
+    """A 2D cluster within a single horizontal slice.
+
+    The ``indices`` array points back into the **original** input cloud
+    passed all the way down from :func:`filter_by_verticality` /
+    :func:`slice_horizontal_global` — not into a slice-local subset.
+    This is the same convention as :class:`HorizontalSlice` and lets
+    the GS.7 assignment scatter results to the full cloud in one pass.
+    """
+    indices: np.ndarray        # (K,) int — positions in the input cloud
+    centroid_xy: np.ndarray    # (2,) float — XY centroid of the cluster
+    n_points: int              # convenience (== indices.size)
+
+
+def cluster_slice(
+    xyz: np.ndarray,
+    slice_obj: HorizontalSlice,
+    eps: float = 0.10,
+    min_samples: int = 10,
+) -> List[Cluster2D]:
+    """Run DBSCAN on the XY positions of points belonging to a slice.
+
+    The horizontal slice from :func:`slice_horizontal_global` carries
+    indices into the full cloud; this function reads the XY positions
+    of those points (ignoring z, since the slice already constrains it)
+    and groups them into 2D clusters with DBSCAN.
+
+    Noise points (label ``-1``) are dropped. Each returned cluster
+    carries an index array pointing back into the original cloud, so
+    no slice-local renumbering ever leaks downstream.
+
+    Parameters
+    ----------
+    xyz : ndarray of shape (N, 3)
+        The full input point cloud (typically the verticality-filtered
+        output of :func:`filter_by_verticality`).
+    slice_obj : HorizontalSlice
+        One slice from :func:`slice_horizontal_global`.
+    eps : float, default 0.10
+        DBSCAN ``eps`` in metres. 10 cm separates stems in a typical
+        plantation; tighten on dense plots, loosen on sparse ones.
+        HDBSCAN as an alternative is parked for the future per the
+        Phase 1B plan.
+    min_samples : int, default 10
+        DBSCAN ``min_samples``. Below this the point becomes noise.
+
+    Returns
+    -------
+    list of Cluster2D
+        One entry per non-noise cluster, in DBSCAN label order
+        (no implicit sort by size). Empty if the slice is empty or
+        the data contains only noise.
+
+    Raises
+    ------
+    ValueError
+        If ``xyz`` is not 2D with three columns, or ``eps`` /
+        ``min_samples`` are not positive.
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must have shape (N, 3); got {xyz.shape}")
+    if eps <= 0.0:
+        raise ValueError(f"eps must be positive; got {eps}")
+    if min_samples < 1:
+        raise ValueError(f"min_samples must be >= 1; got {min_samples}")
+
+    if slice_obj.indices.size == 0:
+        return []
+
+    pts_xy = xyz[slice_obj.indices, :2]
+
+    from sklearn.cluster import DBSCAN
+    labels = DBSCAN(eps=eps, min_samples=min_samples).fit_predict(pts_xy)
+
+    clusters: List[Cluster2D] = []
+    for label in np.unique(labels):
+        if label == -1:
+            continue
+        mask = labels == label
+        cluster_indices = slice_obj.indices[mask]
+        centroid = pts_xy[mask].mean(axis=0)
+        clusters.append(Cluster2D(
+            indices=cluster_indices,
+            centroid_xy=centroid.astype(np.float64),
+            n_points=int(mask.sum()),
+        ))
+
+    return clusters
