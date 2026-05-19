@@ -40,6 +40,7 @@ sub-fase.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Sequence, Tuple
 
@@ -1087,7 +1088,10 @@ def assign_trees_by_tracking(
         print("\n=== GS.8: tracking-based tree_id assignment ===")
         print(f"  Input: {n_orig:,} points")
 
+    t_pipeline_start = time.perf_counter()
+
     # GS.1 — verticality filter on the FULL cloud.
+    t0 = time.perf_counter()
     filtered_xyz, keep_mask = filter_by_verticality(
         xyz,
         threshold=config.verticality_threshold,
@@ -1098,13 +1102,16 @@ def assign_trees_by_tracking(
         margin=config.coarse_margin,
     )
     original_indices = np.where(keep_mask)[0]  # filtered → original mapping
+    t_gs1 = time.perf_counter() - t0
     if verbose:
         print(
             f"  GS.1 verticality filter: {filtered_xyz.shape[0]:,} / "
-            f"{n_orig:,} kept ({100.0 * keep_mask.mean():.1f}%)"
+            f"{n_orig:,} kept ({100.0 * keep_mask.mean():.1f}%)  "
+            f"[{t_gs1:.1f}s]"
         )
 
     # GS.2 — slice the filtered cloud horizontally.
+    t0 = time.perf_counter()
     slices_filtered = slice_horizontal_global(
         filtered_xyz,
         z_min=config.z_min,
@@ -1127,11 +1134,12 @@ def assign_trees_by_tracking(
         )
         for s in slices_filtered
     ]
+    t_gs2 = time.perf_counter() - t0
     if verbose:
         n_non_empty = sum(1 for s in slices if s.indices.size > 0)
         print(
             f"  GS.2 slicing: {len(slices)} slabs total, "
-            f"{n_non_empty} non-empty"
+            f"{n_non_empty} non-empty  [{t_gs2:.1f}s]"
         )
 
     # GS.3 + GS.4 per slab — passing the ORIGINAL `xyz` since the
@@ -1139,48 +1147,87 @@ def assign_trees_by_tracking(
     slab_ellipses: List[List[ClusterEllipse]] = []
     n_clusters_total = 0
     n_ellipses_total = 0
-    for s in slices:
+    t_gs3 = 0.0
+    t_gs4 = 0.0
+    # Per-slab profiling buckets for hot-slab diagnosis.
+    per_slab_times: List[tuple] = []  # (slab_idx, z_centre, n_pts, t_gs3_slab, t_gs4_slab, n_clusters, n_ellipses)
+    for slab_idx, s in enumerate(slices):
+        t_slab3_start = time.perf_counter()
         clusters = cluster_slice(
             xyz, s,
             eps=config.dbscan_eps,
             min_samples=config.dbscan_min_samples,
         )
+        t_slab3 = time.perf_counter() - t_slab3_start
+        t_gs3 += t_slab3
         n_clusters_total += len(clusters)
+
+        t_slab4_start = time.perf_counter()
         ellipses = fit_ellipses_in_slice(
             xyz, clusters, config.ellipse, rng=rng,
         )
+        t_slab4 = time.perf_counter() - t_slab4_start
+        t_gs4 += t_slab4
         n_ellipses_total += len(ellipses)
         slab_ellipses.append(ellipses)
+        per_slab_times.append((
+            slab_idx, float(s.z_centre), int(s.indices.size),
+            t_slab3, t_slab4, len(clusters), len(ellipses),
+        ))
     if verbose:
         print(
-            f"  GS.3 + GS.4: {n_clusters_total} DBSCAN clusters → "
-            f"{n_ellipses_total} valid ellipse fits"
+            f"  GS.3 DBSCAN total: {n_clusters_total} clusters  [{t_gs3:.1f}s]"
         )
+        print(
+            f"  GS.4 ellipse fit:  {n_ellipses_total} valid ellipses  "
+            f"[{t_gs4:.1f}s]"
+        )
+        # Top-5 hot slabs by total time, so Jorge can see where the
+        # cost is concentrated (typically a couple of dense slabs).
+        hot = sorted(
+            per_slab_times,
+            key=lambda r: r[3] + r[4],
+            reverse=True,
+        )[:5]
+        print("    top-5 hot slabs (GS.3 + GS.4):")
+        print("      idx   z(m)    pts   GS.3 s  GS.4 s  clusters  ellipses")
+        for idx, z, npts, t3, t4, nc, ne in hot:
+            print(
+                f"      {idx:3d}  {z:5.2f}  {npts:7,}  "
+                f"{t3:6.2f}  {t4:6.2f}    {nc:5d}    {ne:5d}"
+            )
 
     # GS.5 — vertical tracking.
+    t0 = time.perf_counter()
     slab_centres = [s.z_centre for s in slices]
     tracks = track_clusters_vertical(
         slab_centres, slab_ellipses,
         max_xy_jump=config.max_xy_jump,
         max_gap_slabs=config.max_gap_slabs,
     )
+    t_gs5 = time.perf_counter() - t0
     if verbose:
-        print(f"  GS.5 tracking: {len(tracks)} candidate tracks")
+        print(
+            f"  GS.5 tracking: {len(tracks)} candidate tracks  [{t_gs5:.2f}s]"
+        )
 
     # GS.6 — basal-stripe bootstrap.
+    t0 = time.perf_counter()
     survivors = bootstrap_tracks_from_basal_stripe(
         tracks,
         config.basal_stripe_z_low,
         config.basal_stripe_z_high,
         min_track_length=config.min_track_length,
     )
+    t_gs6 = time.perf_counter() - t0
     if verbose:
         print(
             f"  GS.6 basal bootstrap: {len(survivors)} surviving tracks "
-            f"(= n_trees)"
+            f"(= n_trees)  [{t_gs6:.2f}s]"
         )
 
     # GS.7 / GS.7b — assignment to the full-size cloud.
+    t0 = time.perf_counter()
     if config.assignment_method == "curved_cylinder":
         result = assign_trees_by_curved_cylinder(
             xyz, survivors,
@@ -1197,14 +1244,27 @@ def assign_trees_by_tracking(
         raise ValueError(
             f"unknown assignment_method: {config.assignment_method!r}"
         )
+    t_gs7 = time.perf_counter() - t0
 
+    t_total = time.perf_counter() - t_pipeline_start
     if verbose:
         n_assigned = int((result.tree_ids >= 0).sum())
         print(
             f"  {method_label}: {n_assigned:,} / {n_orig:,} points "
-            f"labelled ({100.0 * n_assigned / max(n_orig, 1):.1f}%)"
+            f"labelled ({100.0 * n_assigned / max(n_orig, 1):.1f}%)  "
+            f"[{t_gs7:.1f}s]"
         )
-        print(f"=== Done. n_trees = {result.n_trees} ===\n")
+        print(
+            f"=== Done. n_trees = {result.n_trees}  "
+            f"(total {t_total:.1f}s) ==="
+        )
+        # Compact roll-up so Jorge can paste it back if needed.
+        print(
+            "  breakdown: "
+            f"GS.1={t_gs1:.1f}s  GS.2={t_gs2:.2f}s  "
+            f"GS.3={t_gs3:.1f}s  GS.4={t_gs4:.1f}s  "
+            f"GS.5={t_gs5:.2f}s  GS.6={t_gs6:.2f}s  GS.7={t_gs7:.1f}s"
+        )
 
     return result
 
