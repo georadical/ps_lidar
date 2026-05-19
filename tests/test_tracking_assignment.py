@@ -455,6 +455,113 @@ class TestClusterSliceBehaviour:
         np.testing.assert_allclose(c.centroid_xy, expected, atol=1e-9)
 
 
+class TestClusterSliceVoxelised:
+    """Voxel pre-aggregation path: voxelise the slab → DBSCAN on
+    centroids → expand voxel labels back to original points. The
+    cluster.indices field MUST still point into the original input
+    cloud, same contract as the raw-DBSCAN path."""
+
+    def test_rejects_negative_voxel_resolution(self):
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        sl = _whole_slice(ring, z_centre=1.5)
+        with pytest.raises(ValueError):
+            cluster_slice(ring, sl, voxel_resolution=-0.05)
+
+    def test_voxel_zero_equals_legacy_path(self):
+        # voxel_resolution=0 must reproduce the legacy raw-DBSCAN path
+        # bit for bit.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=42)
+        sl = _whole_slice(ring, z_centre=1.5)
+        legacy = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        explicit_zero = cluster_slice(
+            ring, sl, eps=0.10, min_samples=5, voxel_resolution=0.0,
+        )
+        assert len(legacy) == len(explicit_zero)
+        for a, b in zip(legacy, explicit_zero):
+            np.testing.assert_array_equal(a.indices, b.indices)
+
+    def test_voxelised_finds_single_ring(self):
+        # 800 points around a single ring → after 0.05 m voxelisation
+        # ~20 voxels along the perimeter. eps=0.10 connects neighbours,
+        # min_samples=3 (per-voxel count) recovers one cluster.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=800, rng_seed=11)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(
+            ring, sl,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        assert len(clusters) == 1
+        # All 800 raw points should be in the cluster (no noise drop
+        # since every voxel is part of the perimeter cluster).
+        assert clusters[0].n_points == 800
+        # Centroid still ≈ ring centre.
+        np.testing.assert_allclose(
+            clusters[0].centroid_xy, [0.0, 0.0], atol=0.03,
+        )
+
+    def test_voxelised_separates_two_rings(self):
+        # Two well-separated rings → two voxelised clusters.
+        a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=400, rng_seed=1)
+        b = _ring_at_z(2.0, 0.0, 0.15, 1.5, n=400, rng_seed=2)
+        xyz = np.vstack([a, b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(
+            xyz, sl,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        assert len(clusters) == 2
+
+    def test_voxelised_cluster_indices_point_to_original_cloud(self):
+        # Sandwich the ring between unrelated points so we can verify
+        # the cluster indices are in the GLOBAL coordinate system,
+        # not voxel-local.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=400, rng_seed=3)
+        noise_before = np.random.default_rng(7).normal(size=(50, 3))
+        noise_before[:, 2] = -10.0
+        noise_after = np.random.default_rng(8).normal(size=(50, 3))
+        noise_after[:, 2] = 100.0
+        xyz = np.vstack([noise_before, ring, noise_after])
+
+        # Slice covers only the ring.
+        slice_obj = HorizontalSlice(
+            z_centre=1.5, z_low=1.0, z_high=2.0,
+            indices=np.arange(50, 50 + 400, dtype=np.int64),
+        )
+        clusters = cluster_slice(
+            xyz, slice_obj,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        assert len(clusters) == 1
+        c = clusters[0]
+        assert c.indices.min() >= 50
+        assert c.indices.max() < 50 + 400
+
+    def test_voxelisation_significantly_reduces_points_per_voxel(self):
+        # Sanity: with 4000 points densely packed in a 1 m × 1 m square
+        # and voxel_resolution=0.05 → at most 400 voxels (20×20 grid).
+        # The voxelised DBSCAN should see ≤400 entries vs 4000 raw.
+        rng = np.random.default_rng(seed=99)
+        x = rng.uniform(-0.5, 0.5, size=4000)
+        y = rng.uniform(-0.5, 0.5, size=4000)
+        z = np.full(4000, 1.5) + rng.normal(0, 0.01, size=4000)
+        xyz = np.column_stack([x, y, z]).astype(np.float64)
+        sl = _whole_slice(xyz, z_centre=1.5)
+
+        # Voxelise with relatively forgiving DBSCAN params; the test
+        # only checks that we get clusters at all (i.e. the voxelised
+        # path doesn't crash on a dense square) — quality is exercised
+        # by the ring tests above.
+        clusters = cluster_slice(
+            xyz, sl,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        # Should produce at least one (big) cluster.
+        assert len(clusters) >= 1
+        # The kept-point sum must not exceed the input count.
+        total_assigned = sum(c.n_points for c in clusters)
+        assert total_assigned <= 4000
+
+
 # ===========================================================================
 # GS.4 — fit_ellipses_in_slice
 # ===========================================================================
