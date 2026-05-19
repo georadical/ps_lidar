@@ -41,7 +41,7 @@ sub-fase.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Literal, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -791,6 +791,188 @@ def assign_tree_ids_from_tracks(
 
 
 # ===========================================================================
+# GS.7b — Curved-cylinder assignment with adaptive radius
+# ===========================================================================
+#
+# Replaces the GS.7 DBSCAN-membership approach for assignment. Where GS.7
+# stamps ``tree_id`` only on the points that survived RANSAC fits inside
+# the slabs the track touched, this approach builds a 3D **tube** around
+# each track's polyline and assigns every point that falls inside the
+# tube — recovering points DBSCAN fragmented, slabs where the ellipse
+# fit failed, and the regions between successful slabs.
+#
+# This is the operational retirement of the straight cylinder: the
+# legacy `extract_trunks` cylinder is straight per-tree; this one is a
+# chained sequence of small cylindrical segments along the curved track,
+# with the radius interpolating between adjacent nodes' fitted semi-major
+# axes.
+
+def assign_trees_by_curved_cylinder(
+    xyz: np.ndarray,
+    tracks: List[Track],
+    radius_factor: float = 1.5,
+    radius_min: float = 0.05,
+    radius_max: float = 0.50,
+    z_margin: float = 0.5,
+) -> TrackingAssignmentResult:
+    """Assign tree_id by a curved-cylinder buffer around each track.
+
+    For each track, the polyline is the sequence of node centres
+    ``(xc, yc, z)`` sorted ascending in z. Per node the radius is
+    ``ellipse.a * radius_factor`` clipped to
+    ``[radius_min, radius_max]``. Each polyline segment (pair of
+    consecutive nodes) defines a frustum-like tube whose radius
+    interpolates linearly between the two endpoints. The polyline is
+    virtually extended above and below by ``z_margin`` so points
+    slightly beyond the topmost / bottommost node are still captured.
+
+    For every cloud point inside any tube, the assignment goes to the
+    track with the smallest **normalised perpendicular distance**
+    (``perp_distance / local_radius``). This handles dense plots where
+    adjacent stems' tubes overlap — the point lands on the actually
+    closer stem in stem-radius units, not the arbitrarily nearer one
+    in absolute metres.
+
+    Parameters
+    ----------
+    xyz : ndarray of shape (N, 3)
+        Original input cloud (same as fed to `assign_trees_by_tracking`).
+    tracks : list of Track
+        Surviving tracks from GS.6.
+    radius_factor : float, default 1.5
+        Multiplier applied to ``node.ellipse.a`` to size each segment.
+        1.5× the semi-major axis is a forgiving default — the tube
+        captures the outer perimeter of the stem plus a small margin
+        for sensor noise.
+    radius_min, radius_max : float, defaults 0.05 / 0.50 (m)
+        Hard bounds on the per-node radius. Stops degenerate fits
+        (a → 0 from a bad RANSAC outcome) from producing a zero-radius
+        tube, and prevents merged-cluster artefacts from creating an
+        oversized tube that would steal points from neighbouring stems.
+    z_margin : float, default 0.5 (m)
+        Half-slab extension of the polyline above the topmost node and
+        below the bottommost node. With the default 1 m slab spacing,
+        this captures the half-slab worth of points just outside the
+        track's z-range.
+
+    Returns
+    -------
+    TrackingAssignmentResult
+        ``tree_ids`` array of length ``N`` with assigned IDs in
+        ``range(n_trees)`` and ``-1`` outside every tube;
+        ``stem_ids`` is all zeros (bifurcations not handled yet).
+    """
+    if xyz.ndim != 2 or xyz.shape[1] != 3:
+        raise ValueError(f"xyz must have shape (N, 3); got {xyz.shape}")
+    if radius_factor <= 0.0:
+        raise ValueError(f"radius_factor must be positive; got {radius_factor}")
+    if not (0.0 < radius_min <= radius_max):
+        raise ValueError(
+            f"radius bounds invalid; need 0 < min <= max, "
+            f"got [{radius_min}, {radius_max}]"
+        )
+    if z_margin < 0.0:
+        raise ValueError(f"z_margin must be >= 0; got {z_margin}")
+
+    n_points = xyz.shape[0]
+    tree_ids = np.full(n_points, -1, dtype=np.int32)
+    stem_ids = np.zeros(n_points, dtype=np.int32)
+    # Per-point tie-breaker: normalised distance to the closest tube
+    # so far. Lower wins.
+    best_norm_dist = np.full(n_points, np.inf, dtype=np.float64)
+
+    z_all = xyz[:, 2]
+
+    for track_idx, track in enumerate(tracks):
+        # Polyline + per-node radius
+        nodes_xyz = np.array(
+            [(node.ellipse.xc, node.ellipse.yc, node.z) for node in track.nodes],
+            dtype=np.float64,
+        )
+        radii = np.clip(
+            np.array(
+                [node.ellipse.a * radius_factor for node in track.nodes],
+                dtype=np.float64,
+            ),
+            radius_min,
+            radius_max,
+        )
+
+        # Extend the polyline by phantom nodes at z_bottom − z_margin
+        # and z_top + z_margin, with the same XY and radius as the
+        # adjacent real nodes. This turns the z_margin parameter into
+        # an actual tube extension (not just a candidate-filter widening),
+        # so points slightly past the polyline endpoints get assigned
+        # cleanly via segment projection. Singletons are handled below
+        # with a spherical buffer instead, so we skip the extension for
+        # them.
+        if z_margin > 0.0 and len(nodes_xyz) >= 2:
+            bottom_ghost = nodes_xyz[0].copy()
+            bottom_ghost[2] -= z_margin
+            top_ghost = nodes_xyz[-1].copy()
+            top_ghost[2] += z_margin
+            nodes_xyz = np.vstack([bottom_ghost[np.newaxis, :], nodes_xyz,
+                                   top_ghost[np.newaxis, :]])
+            radii = np.concatenate([[radii[0]], radii, [radii[-1]]])
+
+        z_lo = float(track.z_bottom - z_margin)
+        z_hi = float(track.z_top + z_margin)
+
+        # Candidate point indices in z-range (cheap pre-filter).
+        in_z = np.where((z_all >= z_lo) & (z_all <= z_hi))[0]
+        if in_z.size == 0:
+            continue
+
+        cand_xyz = xyz[in_z]
+
+        if len(nodes_xyz) == 1:
+            # Singleton track: spherical assignment centred at the node.
+            p = nodes_xyz[0]
+            r = radii[0]
+            diff = cand_xyz - p
+            norm_dist = np.linalg.norm(diff, axis=1) / r
+        else:
+            # Track minimum normalised distance across all segments.
+            norm_dist = np.full(in_z.size, np.inf, dtype=np.float64)
+            for i in range(len(nodes_xyz) - 1):
+                p0 = nodes_xyz[i]
+                p1 = nodes_xyz[i + 1]
+                r0 = radii[i]
+                r1 = radii[i + 1]
+                seg = p1 - p0
+                seg_len_sq = float(np.dot(seg, seg))
+                if seg_len_sq < 1e-12:
+                    # Coincident nodes (shouldn't happen post-GS.5); skip.
+                    continue
+                # Projection parameter onto the segment.
+                t = ((cand_xyz - p0) @ seg) / seg_len_sq
+                t_clipped = np.clip(t, 0.0, 1.0)
+                # Closest point on the segment for each candidate.
+                closest = p0 + t_clipped[:, None] * seg
+                diff = cand_xyz - closest
+                dist = np.linalg.norm(diff, axis=1)
+                # Linearly interpolated radius along the segment.
+                r_interp = r0 + t_clipped * (r1 - r0)
+                seg_norm_dist = dist / r_interp
+                np.minimum(norm_dist, seg_norm_dist, out=norm_dist)
+
+        # A point is "inside" this track's tube iff norm_dist < 1.
+        inside = norm_dist < 1.0
+        # Competitive update against tracks processed earlier.
+        better = inside & (norm_dist < best_norm_dist[in_z])
+        global_idx = in_z[better]
+        tree_ids[global_idx] = track_idx
+        best_norm_dist[global_idx] = norm_dist[better]
+
+    return TrackingAssignmentResult(
+        tree_ids=tree_ids,
+        stem_ids=stem_ids,
+        n_trees=len(tracks),
+        tracks=list(tracks),
+    )
+
+
+# ===========================================================================
 # GS.8 — Orchestrator + compatibility shim
 # ===========================================================================
 
@@ -838,6 +1020,26 @@ class TrackingAssignmentConfig:
     basal_stripe_z_low: float = 0.5
     basal_stripe_z_high: float = 2.0
     min_track_length: int = 1
+
+    # --- GS.7 / GS.7b assignment mode ---
+    # "curved_cylinder" is the default and what jubilates the straight
+    # cylinder: an adaptive-radius buffer around the track's polyline
+    # (cilindro curvo). "dbscan_membership" is the GS.7 legacy mode
+    # that assigns only the points that survived the DBSCAN clusters
+    # of the track's nodes — kept for diagnostic A/B comparisons.
+    assignment_method: Literal["curved_cylinder", "dbscan_membership"] = (
+        "curved_cylinder"
+    )
+    # Cylinder radius is `node.ellipse.a * cylinder_radius_factor`, clipped
+    # to ``[cylinder_min_radius, cylinder_max_radius]`` to absorb
+    # degenerate fits at the extremes.
+    cylinder_radius_factor: float = 1.5
+    cylinder_min_radius: float = 0.05
+    cylinder_max_radius: float = 0.50
+    # Polyline ends are extended by this margin above/below to capture
+    # points that fall slightly beyond the topmost / bottommost node
+    # (e.g. roots flare, sub-canopy points whose slab had no ellipse).
+    cylinder_z_margin: float = 0.5
 
 
 def assign_trees_by_tracking(
@@ -978,12 +1180,28 @@ def assign_trees_by_tracking(
             f"(= n_trees)"
         )
 
-    # GS.7 — assign on the full-size cloud.
-    result = assign_tree_ids_from_tracks(survivors, n_points=n_orig)
+    # GS.7 / GS.7b — assignment to the full-size cloud.
+    if config.assignment_method == "curved_cylinder":
+        result = assign_trees_by_curved_cylinder(
+            xyz, survivors,
+            radius_factor=config.cylinder_radius_factor,
+            radius_min=config.cylinder_min_radius,
+            radius_max=config.cylinder_max_radius,
+            z_margin=config.cylinder_z_margin,
+        )
+        method_label = "curved cylinder (GS.7b)"
+    elif config.assignment_method == "dbscan_membership":
+        result = assign_tree_ids_from_tracks(survivors, n_points=n_orig)
+        method_label = "DBSCAN membership (GS.7 legacy)"
+    else:
+        raise ValueError(
+            f"unknown assignment_method: {config.assignment_method!r}"
+        )
+
     if verbose:
         n_assigned = int((result.tree_ids >= 0).sum())
         print(
-            f"  GS.7 assignment: {n_assigned:,} / {n_orig:,} points "
+            f"  {method_label}: {n_assigned:,} / {n_orig:,} points "
             f"labelled ({100.0 * n_assigned / max(n_orig, 1):.1f}%)"
         )
         print(f"=== Done. n_trees = {result.n_trees} ===\n")

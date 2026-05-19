@@ -28,6 +28,7 @@ from src.core.tracking_assignment import (
     TrackingAssignmentConfig,
     TrackingAssignmentResult,
     assign_tree_ids_from_tracks,
+    assign_trees_by_curved_cylinder,
     assign_trees_by_tracking,
     bootstrap_tracks_from_basal_stripe,
     build_tracking_audit_table,
@@ -1345,3 +1346,293 @@ class TestExportTrackingAuditTable:
             lines = f.read().splitlines()
         assert len(lines) == 2  # header + 1 row
         assert "tree_id" in lines[0]
+
+
+# ===========================================================================
+# GS.7b — assign_trees_by_curved_cylinder
+# ===========================================================================
+
+def _cloud_in_box(
+    n: int,
+    xy_centre=(0.0, 0.0), xy_radius: float = 0.30,
+    z_low: float = 0.0, z_high: float = 5.0,
+    rng_seed: int = 0,
+) -> np.ndarray:
+    """A small XYZ box of random points used to probe curved-cylinder
+    assignment without depending on the upstream GS chain."""
+    rng = np.random.default_rng(seed=rng_seed)
+    x = rng.uniform(xy_centre[0] - xy_radius, xy_centre[0] + xy_radius, size=n)
+    y = rng.uniform(xy_centre[1] - xy_radius, xy_centre[1] + xy_radius, size=n)
+    z = rng.uniform(z_low, z_high, size=n)
+    return np.column_stack([x, y, z]).astype(np.float64)
+
+
+class TestAssignTreesByCurvedCylinderContract:
+
+    def test_rejects_invalid_xyz(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(np.zeros((10, 2)), [])
+
+    def test_rejects_non_positive_radius_factor(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(
+                np.zeros((10, 3)), [], radius_factor=0.0,
+            )
+
+    def test_rejects_inverted_radius_bounds(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(
+                np.zeros((10, 3)), [], radius_min=0.5, radius_max=0.1,
+            )
+
+    def test_rejects_negative_z_margin(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(
+                np.zeros((10, 3)), [], z_margin=-0.1,
+            )
+
+    def test_empty_tracks_returns_all_unassigned(self):
+        xyz = _cloud_in_box(n=20)
+        result = assign_trees_by_curved_cylinder(xyz, [])
+        assert isinstance(result, TrackingAssignmentResult)
+        assert result.n_trees == 0
+        assert result.tree_ids.shape == (20,)
+        assert np.all(result.tree_ids == -1)
+
+
+class TestAssignTreesByCurvedCylinderBehaviour:
+
+    def test_single_vertical_track_captures_tube(self):
+        # Vertical track at (0, 0): nodes at z=1,2,3,4,5, all radius
+        # a=0.15. Points within 1.5 × 0.15 = 0.225 m of the axis at
+        # z in [0.5, 5.5] (with z_margin=0.5) must be assigned.
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0, 4.0, 5.0],
+            xc=0.0, yc=0.0, a=0.15, b=0.15,
+        )
+
+        # Build a cloud: 200 points well inside the tube, 200 well outside.
+        rng = np.random.default_rng(seed=7)
+        z_inside = rng.uniform(1.0, 5.0, size=200)
+        r_inside = rng.uniform(0.0, 0.10, size=200)  # < 0.225 → inside
+        a_inside = rng.uniform(0.0, 2.0 * np.pi, size=200)
+        inside_xyz = np.column_stack([
+            r_inside * np.cos(a_inside),
+            r_inside * np.sin(a_inside),
+            z_inside,
+        ])
+
+        z_outside = rng.uniform(1.0, 5.0, size=200)
+        r_outside = rng.uniform(1.0, 2.0, size=200)  # far outside
+        a_outside = rng.uniform(0.0, 2.0 * np.pi, size=200)
+        outside_xyz = np.column_stack([
+            r_outside * np.cos(a_outside),
+            r_outside * np.sin(a_outside),
+            z_outside,
+        ])
+
+        xyz = np.vstack([inside_xyz, outside_xyz])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5,
+        )
+
+        # First 200 (inside) → assigned. Last 200 (outside) → unassigned.
+        assert np.all(result.tree_ids[:200] == 0)
+        assert np.all(result.tree_ids[200:] == -1)
+
+    def test_two_parallel_tracks_disjoint_assignment(self):
+        # Two vertical tracks 2 m apart in XY, tubes of radius 0.225 →
+        # no overlap. Each track captures its own cluster.
+        track_a = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=0.0, yc=0.0, a=0.15, b=0.15,
+        )
+        track_b = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=2.0, yc=0.0, a=0.15, b=0.15,
+        )
+        # 100 points near each axis.
+        rng = np.random.default_rng(seed=8)
+        cloud_a = np.column_stack([
+            rng.normal(0.0, 0.05, size=100),
+            rng.normal(0.0, 0.05, size=100),
+            rng.uniform(1.0, 3.0, size=100),
+        ])
+        cloud_b = np.column_stack([
+            rng.normal(2.0, 0.05, size=100),
+            rng.normal(0.0, 0.05, size=100),
+            rng.uniform(1.0, 3.0, size=100),
+        ])
+        xyz = np.vstack([cloud_a, cloud_b])
+
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track_a, track_b], radius_factor=1.5,
+        )
+
+        # cloud_a points get tree_id 0; cloud_b get tree_id 1.
+        assert np.all(result.tree_ids[:100] == 0)
+        assert np.all(result.tree_ids[100:] == 1)
+
+    def test_overlapping_tubes_tie_broken_by_normalised_distance(self):
+        # Two tracks at (0,0) and (0.20, 0). Tubes overlap. A point at
+        # (0.05, 0) is closer to track 0 in normalised units → tree_id 0.
+        # A point at (0.18, 0) is closer to track 1 → tree_id 1.
+        track_a = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=0.0, yc=0.0, a=0.15, b=0.15,
+        )
+        track_b = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=0.20, yc=0.0, a=0.15, b=0.15,
+        )
+        xyz = np.array([
+            [0.05, 0.0, 2.0],  # closer to a (norm_dist = 0.05/0.225 ≈ 0.22)
+            [0.18, 0.0, 2.0],  # closer to b (norm_dist = 0.02/0.225 ≈ 0.09)
+        ])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track_a, track_b], radius_factor=1.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+        assert int(result.tree_ids[1]) == 1
+
+    def test_curved_track_captures_inclined_points(self):
+        # Track inclined: XY drifts +0.5 m per slab. Points along that
+        # drift should be assigned even though they're 1+ m from the
+        # bottom node's XY.
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0, 4.0, 5.0], a=0.15, b=0.15,
+        )
+        # Manually patch XY of the nodes via a fresh track build —
+        # _track_full uses a constant (xc, yc), so I rebuild here.
+        nodes = []
+        for i, z in enumerate([1.0, 2.0, 3.0, 4.0, 5.0]):
+            ell = ClusterEllipse(
+                indices=np.empty(0, dtype=np.int64),
+                xc=0.5 * i, yc=0.0,
+                a=0.15, b=0.15, theta=0.0,
+                sector_pct=80.0, check_status=0, n_points=0,
+            )
+            nodes.append(TrackNode(z=z, ellipse=ell))
+        inclined_track = Track(nodes=nodes)
+
+        # A point along the inclined axis: (1.0, 0, 3.0) (at z=3, the
+        # axis sits at x = 0.5 · 2 = 1.0).
+        xyz = np.array([[1.0, 0.0, 3.0]])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [inclined_track], radius_factor=1.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+
+    def test_singleton_track_spherical_assignment(self):
+        # Track with one node → spherical buffer around it.
+        track = _track_full(z_values=[2.0], xc=0.0, yc=0.0, a=0.15, b=0.15)
+        # Point within 0.225 m of (0, 0, 2.0) → assigned.
+        # Point beyond → unassigned.
+        xyz = np.array([
+            [0.0, 0.0, 2.0],       # at the node
+            [0.10, 0.10, 2.0],     # ~0.14 m from node, inside
+            [1.0, 0.0, 2.0],       # 1 m away, outside
+        ])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+        assert int(result.tree_ids[1]) == 0
+        assert int(result.tree_ids[2]) == -1
+
+    def test_z_margin_extends_polyline_endpoints(self):
+        # Track spans z=[1, 3]. With z_margin=0.5, points at z=0.6 or
+        # z=3.4 still get assigned (clamped to the nearest endpoint).
+        # Without the margin (z_margin=0), they would fall outside.
+        track = _track_full(z_values=[1.0, 3.0], xc=0.0, yc=0.0, a=0.15, b=0.15)
+        xyz = np.array([
+            [0.0, 0.0, 0.6],
+            [0.0, 0.0, 3.4],
+            [0.0, 0.0, 0.4],   # well outside the margin (z=0.4 < 1−0.5 = 0.5)
+            [0.0, 0.0, 3.6],   # well outside the margin (z=3.6 > 3+0.5 = 3.5)
+        ])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5, z_margin=0.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+        assert int(result.tree_ids[1]) == 0
+        assert int(result.tree_ids[2]) == -1
+        assert int(result.tree_ids[3]) == -1
+
+    def test_radius_clipping_bounds(self):
+        # A track with absurdly small `a` (degenerate fit). Without
+        # radius_min, the tube collapses; with radius_min=0.05 the
+        # tube has a 0.05 m floor that captures nearby points.
+        track = _track_full(
+            z_values=[1.0, 2.0], xc=0.0, yc=0.0, a=0.001, b=0.001,
+        )
+        xyz = np.array([[0.03, 0.0, 1.5]])  # 3 cm from axis
+        # With radius_factor=1.5 and a=0.001 → effective radius
+        # 0.0015 < 0.05 → clipped up to 0.05. Inside.
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5,
+            radius_min=0.05, radius_max=0.50,
+        )
+        assert int(result.tree_ids[0]) == 0
+
+        # With a huge a but capped radius_max=0.10, a point at 0.2 m
+        # falls outside the cap → unassigned.
+        track_big = _track_full(
+            z_values=[1.0, 2.0], xc=0.0, yc=0.0, a=10.0, b=10.0,
+        )
+        xyz2 = np.array([[0.2, 0.0, 1.5]])
+        result2 = assign_trees_by_curved_cylinder(
+            xyz2, [track_big], radius_factor=1.5,
+            radius_min=0.01, radius_max=0.10,
+        )
+        assert int(result2.tree_ids[0]) == -1
+
+
+class TestOrchestratorAssignmentMethodSwitch:
+
+    def test_default_is_curved_cylinder(self):
+        cfg = TrackingAssignmentConfig()
+        assert cfg.assignment_method == "curved_cylinder"
+
+    def test_dbscan_membership_path_still_works(self):
+        # Tiny end-to-end to confirm the legacy assignment branch is
+        # still callable via config.
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+            assignment_method="dbscan_membership",
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        assert isinstance(result, TrackingAssignmentResult)
+
+    def test_curved_cylinder_assigns_more_than_dbscan_membership(self):
+        # Same data, two methods: the curved cylinder must label
+        # at least as many points as DBSCAN membership (it's a strict
+        # superset on a well-formed track).
+        xyz = _tall_cylinder(radius=0.15, height=8.0, n_per_m=200)
+        common_kwargs = dict(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        r_dbscan = assign_trees_by_tracking(
+            xyz, TrackingAssignmentConfig(
+                assignment_method="dbscan_membership", **common_kwargs,
+            ),
+        )
+        r_curved = assign_trees_by_tracking(
+            xyz, TrackingAssignmentConfig(
+                assignment_method="curved_cylinder", **common_kwargs,
+            ),
+        )
+        n_dbscan = int((r_dbscan.tree_ids >= 0).sum())
+        n_curved = int((r_curved.tree_ids >= 0).sum())
+        # Curved cylinder must label at least as many; on a real pillar
+        # it usually labels MORE because it recovers points that DBSCAN
+        # fragmented or dropped at slab boundaries.
+        assert n_curved >= n_dbscan
+
+    def test_unknown_method_raises(self):
+        xyz = np.zeros((10, 3))
+        cfg = TrackingAssignmentConfig()
+        # Hack: bypass the Literal type via __setattr__-like trick.
+        # dataclasses are frozen=False on TrackingAssignmentConfig.
+        object.__setattr__(cfg, "assignment_method", "bogus")
+        with pytest.raises(ValueError):
+            assign_trees_by_tracking(xyz, cfg)
