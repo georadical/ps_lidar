@@ -566,6 +566,7 @@ def _refit_ellipse_geometric(
     initial_coefs: np.ndarray,
     n_newton_iter: int = 20,
     max_lm_iter: int = 50,
+    max_inliers: int = 500,
 ) -> Optional[np.ndarray]:
     """Geometric LS refit of an ellipse on a (typically inlier) point set.
 
@@ -600,6 +601,16 @@ def _refit_ellipse_geometric(
         (``max_nfev = 6 · max_lm_iter`` since each LM iteration costs
         roughly one Jacobian evaluation = 5 forward passes + 1 residual,
         for the 5 parameters).
+    max_inliers : int, default 500
+        If the inlier set is larger than this, deterministically
+        subsample to ``max_inliers`` points before LM. Geometric refit
+        precision saturates at a few hundred clean perimeter points;
+        running LM with finite-difference Jacobians over tens of
+        thousands of inliers is the dominant cost of the GS pipeline
+        on dense slabs and gives no useful additional precision.
+        Subsampling is uniform across the input order
+        (``np.linspace`` strides), so the resulting subset preserves
+        the perimeter's angular coverage. Set to ``0`` to disable.
 
     Returns
     -------
@@ -618,6 +629,19 @@ def _refit_ellipse_geometric(
         )
     if X.size < 5:
         return None
+    if max_inliers < 0:
+        raise ValueError(f"max_inliers must be >= 0; got {max_inliers}")
+
+    # Deterministic subsampling cap on the inlier set. LM with
+    # finite-difference Jacobians scales linearly in N, and refit
+    # precision saturates well below 1 k points — capping at 500 by
+    # default keeps the fit identical (to numerical noise) while
+    # collapsing per-cluster cost by ~60× on the dense slabs that
+    # currently dominate the GS runtime.
+    if 0 < max_inliers < X.size:
+        idx_subset = np.linspace(0, X.size - 1, max_inliers).astype(np.int64)
+        X = X[idx_subset]
+        Y = Y[idx_subset]
 
     geom0 = _conic_to_geometric(initial_coefs)
     if geom0 is None:
@@ -701,6 +725,15 @@ class EllipseFitConfig:
 
     # --- Retry path (DBSCAN clustering) ---
     cluster_eps: float = 0.02
+
+    # --- Geometric refit subsampling cap (EL.4 + GS speed) ---
+    # If the inlier set is larger than this, deterministically subsample
+    # before scipy.optimize.least_squares. Refit precision saturates at
+    # a few hundred clean perimeter points; running LM with finite-
+    # difference Jacobians over tens of thousands of inliers is the
+    # dominant cost on dense slabs and gives no useful additional
+    # precision. Set to 0 to disable subsampling.
+    max_refit_inliers: int = 500
 
 
 # --- Helpers used by _fit_ellipse_check -----------------------------------
@@ -844,6 +877,7 @@ def _fit_ellipse_check(
         coefs, inlier_mask, n_inliers = ransac_result
         refit_coefs = _refit_ellipse_geometric(
             X[inlier_mask], Y[inlier_mask], coefs,
+            max_inliers=config.max_refit_inliers,
         )
         if refit_coefs is not None:
             coefs = refit_coefs

@@ -600,6 +600,51 @@ class TestRefitEllipseGeometric:
         with pytest.raises(ValueError):
             _refit_ellipse_geometric(np.array([1.0, 2.0]), np.array([1.0]), coefs)
 
+    def test_refit_max_inliers_subsamples_large_input(self):
+        # Refit on 5000 clean inliers with max_inliers=200 must produce
+        # essentially the same fit as refit on all 5000 — within tens
+        # of microns. This validates that the subsampling cap is safe
+        # at the precision relevant to forestry LiDAR.
+        xc_t, yc_t, a_t, b_t, theta_t = 0.0, 0.0, 0.18, 0.12, np.pi / 6.0
+        X, Y = _make_ellipse_points(xc_t, yc_t, a_t, b_t, theta_t, n=5000)
+        coefs_alg = _fit_ellipse_algebraic(X, Y)
+        assert coefs_alg is not None
+
+        # Disable cap → fit on all 5000
+        coefs_full = _refit_ellipse_geometric(X, Y, coefs_alg, max_inliers=0)
+        # Cap at 200
+        coefs_capped = _refit_ellipse_geometric(X, Y, coefs_alg, max_inliers=200)
+
+        assert coefs_full is not None and coefs_capped is not None
+        g_full = _conic_to_geometric(coefs_full)
+        g_capped = _conic_to_geometric(coefs_capped)
+        assert g_full is not None and g_capped is not None
+
+        # Same xc, yc, a, b within 1e-5 m
+        for i in range(4):
+            assert abs(g_full[i] - g_capped[i]) < 1e-5, (
+                f"param {i}: full={g_full[i]} capped={g_capped[i]}"
+            )
+        # Theta within 1e-5 rad
+        assert _theta_diff_mod_pi(g_full[4], g_capped[4]) < 1e-5
+
+    def test_refit_negative_max_inliers_raises(self):
+        X = np.linspace(0, 1, 10)
+        Y = np.linspace(0, 1, 10)
+        coefs = np.array([1.0, 0.0, 1.0, 0.0, 0.0, -1.0])
+        with pytest.raises(ValueError):
+            _refit_ellipse_geometric(X, Y, coefs, max_inliers=-5)
+
+    def test_refit_no_subsampling_when_below_cap(self):
+        # 100 points and cap=500 → no subsampling happens. Result must
+        # equal a refit with no cap.
+        X, Y = _make_ellipse_points(0.0, 0.0, 0.15, 0.10, 0.0, n=100)
+        coefs_alg = _fit_ellipse_algebraic(X, Y)
+        coefs_a = _refit_ellipse_geometric(X, Y, coefs_alg, max_inliers=0)
+        coefs_b = _refit_ellipse_geometric(X, Y, coefs_alg, max_inliers=500)
+        assert coefs_a is not None and coefs_b is not None
+        np.testing.assert_allclose(coefs_a, coefs_b, atol=0)
+
     def test_ransac_then_refit_pipeline(self):
         # Full pipeline integration: noisy ellipse + 20% outliers.
         # RANSAC selects inliers, geometric refit polishes. Final centre
