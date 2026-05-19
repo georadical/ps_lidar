@@ -824,6 +824,7 @@ def _fit_ellipse_check(
     config: EllipseFitConfig,
     is_retry: bool = False,
     rng: Optional[np.random.Generator] = None,
+    return_reason: bool = False,
 ) -> Tuple[float, float, float, float, float, int, float]:
     """Fit an ellipse with quality checks; production wrapper around the
     EL.1–EL.4 primitives. Analogue of ``_fit_circle_check`` in
@@ -854,10 +855,20 @@ def _fit_ellipse_check(
 
         ``sector_pct`` is the percentage of sectors occupied around the
         fitted ellipse (used as a quality indicator downstream).
+
+    When ``return_reason=True`` the tuple is extended with an 8th element,
+    ``reject_reason``: a short string identifying the first failing stage
+    (``"ok"``, ``"too_few_pts"``, ``"ransac_none"``, ``"conic_degenerate"``,
+    ``"inner_full"``, ``"r_min"``, ``"r_max"``, ``"sectors_low"``,
+    ``"aspect_low"``, ``"inlier_low"``, ``"retry_too_small(<prev>)"``, or
+    ``"retry_failed(<prev>)"``). Used by ``diagnose_slab_clusters`` to
+    show *which* stage rejected each cluster rather than guessing from
+    bbox/aspect. Production callers leave this off (default).
     """
     n = len(X)
     if n < config.min_points_section:
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 2, 0.0
+        result = (0.0, 0.0, 0.0, 0.0, 0.0, 2, 0.0)
+        return (*result, "too_few_pts") if return_reason else result
 
     # --- RANSAC + geometric refit + quality checks ---
     min_inliers = max(5, int(config.min_inlier_fraction * n))
@@ -872,6 +883,7 @@ def _fit_ellipse_check(
     fit_bad = ransac_result is None
     xc = yc = a = b = theta = 0.0
     sector_pct = 0.0
+    reason = "ransac_none" if fit_bad else "ok"
 
     if not fit_bad:
         coefs, inlier_mask, n_inliers = ransac_result
@@ -885,6 +897,7 @@ def _fit_ellipse_check(
         geom = _conic_to_geometric(coefs)
         if geom is None:
             fit_bad = True
+            reason = "conic_degenerate"
         else:
             xc, yc, a, b, theta = geom
             r_equiv = float(np.sqrt(a * b))
@@ -899,24 +912,43 @@ def _fit_ellipse_check(
             )
             aspect_ratio = b / a
 
-            fit_bad = (
-                n_inner > config.max_inner_points
-                or r_equiv < config.r_min
-                or r_equiv > config.r_max
-                or not sectors_ok
-                or aspect_ratio < config.min_aspect_ratio
-                or inlier_fraction < config.min_inlier_fraction
-            )
+            # First failing condition wins. The elif chain preserves the
+            # original short-circuit-OR semantics for fit_bad while
+            # capturing which stage actually rejected the fit.
+            if n_inner > config.max_inner_points:
+                fit_bad = True
+                reason = "inner_full"
+            elif r_equiv < config.r_min:
+                fit_bad = True
+                reason = "r_min"
+            elif r_equiv > config.r_max:
+                fit_bad = True
+                reason = "r_max"
+            elif not sectors_ok:
+                fit_bad = True
+                reason = "sectors_low"
+            elif aspect_ratio < config.min_aspect_ratio:
+                fit_bad = True
+                reason = "aspect_low"
+            elif inlier_fraction < config.min_inlier_fraction:
+                fit_bad = True
+                reason = "inlier_low"
 
     # --- Retry path (mirrors _fit_circle_check) ---
     if fit_bad and not is_retry:
         Xg, Yg = _point_clustering_largest(X, Y, config.cluster_eps)
         if len(Xg) >= config.min_points_section:
-            return _fit_ellipse_check(Xg, Yg, config, is_retry=True, rng=rng)
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 1, 0.0
+            return _fit_ellipse_check(
+                Xg, Yg, config, is_retry=True, rng=rng,
+                return_reason=return_reason,
+            )
+        result = (0.0, 0.0, 0.0, 0.0, 0.0, 1, 0.0)
+        return (*result, f"retry_too_small({reason})") if return_reason else result
 
     if fit_bad:
         # is_retry and still bad: surface zeros + status 1
-        return 0.0, 0.0, 0.0, 0.0, 0.0, 1, 0.0
+        result = (0.0, 0.0, 0.0, 0.0, 0.0, 1, 0.0)
+        return (*result, f"retry_failed({reason})") if return_reason else result
 
-    return xc, yc, a, b, theta, (1 if is_retry else 0), sector_pct
+    result = (xc, yc, a, b, theta, (1 if is_retry else 0), sector_pct)
+    return (*result, reason) if return_reason else result

@@ -1119,11 +1119,14 @@ def diagnose_slab_clusters(
 
     Re-runs :func:`cluster_slice` + :func:`_fit_ellipse_check` for the
     given slab and prints one row per cluster: point count, XY
-    bounding box, PCA aspect ratio, and the fit status + sector_pct
-    returned by the EL.5 wrapper. Used to diagnose the **why** behind
-    a near-zero GS.4 ellipse-acceptance rate — does the rejection come
-    from fragmentation, elongated foliage clusters, or quality-check
-    misses?
+    bounding box, PCA aspect ratio, fit status, sector_pct, and the
+    rejection ``reason`` returned by the EL.5 wrapper
+    (``return_reason=True``). Used to diagnose the **why** behind a
+    near-zero GS.4 ellipse-acceptance rate — the ``outcome`` column
+    names the first failing stage (``ransac_none``, ``sectors_low``,
+    ``inlier_low``, ``r_min``/``r_max``, ``aspect_low``,
+    ``inner_full``, ``conic_degenerate``, ``too_few_pts``, or
+    ``retry_failed(<prev>)``).
 
     Intended for debug-only invocation. Costs ~10 s per slab via the
     re-fitting. The orchestrator calls this for every basal slab when
@@ -1168,27 +1171,19 @@ def diagnose_slab_clusters(
         else:
             aspect = float("inf")
 
-        xc, yc, a, b, _theta, status, sector_pct = _fit_ellipse_check(
+        xc, yc, a, b, _theta, status, sector_pct, reason = _fit_ellipse_check(
             cluster_xy[:, 0], cluster_xy[:, 1], config.ellipse, rng=rng,
+            return_reason=True,
         )
         r_eq = float(np.sqrt(a * b)) if (a > 0 and b > 0) else 0.0
 
-        # Outcome classification
+        # Outcome = the actual rejection stage reported by _fit_ellipse_check.
+        # bbox / aspect / r_eq are already columns of the dump above, so the
+        # outcome just names *why* the fit failed (or "VALID" on success).
         if a > 0 and b > 0:
             outcome = "VALID" if status == 0 else "VALID (retry)"
-        elif status == 2:
-            outcome = f"too few pts (<{config.ellipse.min_points_section})"
         else:
-            # Status 1 with a == 0 → quality check failed. Classify hint
-            # by inspecting the cheap geometry we already have.
-            if bbox_x > 2.2 * config.ellipse.r_max or bbox_y > 2.2 * config.ellipse.r_max:
-                outcome = "too big (bbox > 2.2·r_max)"
-            elif bbox_x < 2.0 * config.ellipse.r_min and bbox_y < 2.0 * config.ellipse.r_min:
-                outcome = "too small (bbox < 2·r_min)"
-            elif aspect > 3.0:
-                outcome = f"elongated (aspect={aspect:.1f})"
-            else:
-                outcome = f"shape/sectors (pct={sector_pct:.0f})"
+            outcome = reason
 
         print(
             f"    {i:3d}  {n_pts:6d}  {bbox_x:5.3f}   {bbox_y:5.3f}   "
