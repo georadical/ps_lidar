@@ -1076,6 +1076,17 @@ class TrackingAssignmentConfig:
     basal_stripe_z_high: float = 2.0
     min_track_length: int = 1
 
+    # --- Diagnostic dump (GS.8c, debug-only) ---
+    # When True, the orchestrator prints per-cluster geometry + fit
+    # outcome for basal slabs (z_centre <= basal_stripe_z_high).
+    # Useful when GS.4 reports near-zero valid ellipses despite many
+    # clusters — exposes whether the rejection is due to fragmentation
+    # (n_pts < min_points_section), elongation (aspect > 3, not a stem
+    # cross-section), or quality-check failure (sectors / inlier).
+    # Costs ~10 s per basal slab via re-running the fit; only enable
+    # for debug runs.
+    diagnostic_basal_slabs: bool = False
+
     # --- GS.7 / GS.7b assignment mode ---
     # "curved_cylinder" is the default and what jubilates the straight
     # cylinder: an adaptive-radius buffer around the track's polyline
@@ -1095,6 +1106,95 @@ class TrackingAssignmentConfig:
     # points that fall slightly beyond the topmost / bottommost node
     # (e.g. roots flare, sub-canopy points whose slab had no ellipse).
     cylinder_z_margin: float = 0.5
+
+
+def diagnose_slab_clusters(
+    xyz: np.ndarray,
+    slab: "HorizontalSlice",
+    config: "TrackingAssignmentConfig",
+    rng: Optional[np.random.Generator] = None,
+    max_clusters: int = 25,
+) -> None:
+    """Print per-cluster geometry and fit-rejection diagnostics.
+
+    Re-runs :func:`cluster_slice` + :func:`_fit_ellipse_check` for the
+    given slab and prints one row per cluster: point count, XY
+    bounding box, PCA aspect ratio, and the fit status + sector_pct
+    returned by the EL.5 wrapper. Used to diagnose the **why** behind
+    a near-zero GS.4 ellipse-acceptance rate — does the rejection come
+    from fragmentation, elongated foliage clusters, or quality-check
+    misses?
+
+    Intended for debug-only invocation. Costs ~10 s per slab via the
+    re-fitting. The orchestrator calls this for every basal slab when
+    ``config.diagnostic_basal_slabs`` is True.
+    """
+    clusters = cluster_slice(
+        xyz, slab,
+        eps=config.dbscan_eps,
+        min_samples=config.dbscan_min_samples,
+        voxel_resolution=config.dbscan_voxel_resolution,
+    )
+    if not clusters:
+        print(f"\n[diagnose] slab z={slab.z_centre:.2f}m: 0 clusters — skipped")
+        return
+
+    # Header
+    print(
+        f"\n[diagnose] slab z={slab.z_centre:.2f}m: {len(clusters)} clusters "
+        f"(showing first {min(max_clusters, len(clusters))})"
+    )
+    print(
+        "    idx  n_pts   bbox_x  bbox_y  aspect   r_eq   status  "
+        "sector_pct  outcome"
+    )
+
+    # Sort by descending size so the most interesting (largest) clusters
+    # come first. Helps spot whether the biggest cluster is actually a
+    # stem or something else.
+    clusters_sorted = sorted(clusters, key=lambda c: c.n_points, reverse=True)
+    for i, cluster in enumerate(clusters_sorted[:max_clusters]):
+        cluster_xy = xyz[cluster.indices, :2]
+        n_pts = cluster.n_points
+        bbox_x = float(cluster_xy[:, 0].ptp())
+        bbox_y = float(cluster_xy[:, 1].ptp())
+        # PCA aspect ratio: stems are ~1.0, elongated foliage > 3.0.
+        if n_pts > 1:
+            centred = cluster_xy - cluster_xy.mean(axis=0)
+            cov = np.cov(centred.T)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = np.sort(np.abs(eigvals))
+            aspect = float(eigvals[-1] / max(eigvals[0], 1e-12))
+        else:
+            aspect = float("inf")
+
+        xc, yc, a, b, _theta, status, sector_pct = _fit_ellipse_check(
+            cluster_xy[:, 0], cluster_xy[:, 1], config.ellipse, rng=rng,
+        )
+        r_eq = float(np.sqrt(a * b)) if (a > 0 and b > 0) else 0.0
+
+        # Outcome classification
+        if a > 0 and b > 0:
+            outcome = "VALID" if status == 0 else "VALID (retry)"
+        elif status == 2:
+            outcome = f"too few pts (<{config.ellipse.min_points_section})"
+        else:
+            # Status 1 with a == 0 → quality check failed. Classify hint
+            # by inspecting the cheap geometry we already have.
+            if bbox_x > 2.2 * config.ellipse.r_max or bbox_y > 2.2 * config.ellipse.r_max:
+                outcome = "too big (bbox > 2.2·r_max)"
+            elif bbox_x < 2.0 * config.ellipse.r_min and bbox_y < 2.0 * config.ellipse.r_min:
+                outcome = "too small (bbox < 2·r_min)"
+            elif aspect > 3.0:
+                outcome = f"elongated (aspect={aspect:.1f})"
+            else:
+                outcome = f"shape/sectors (pct={sector_pct:.0f})"
+
+        print(
+            f"    {i:3d}  {n_pts:6d}  {bbox_x:5.3f}   {bbox_y:5.3f}   "
+            f"{aspect:5.2f}  {r_eq:5.3f}    {int(status)}     {sector_pct:6.1f}    "
+            f"{outcome}"
+        )
 
 
 def assign_trees_by_tracking(
@@ -1280,6 +1380,17 @@ def assign_trees_by_tracking(
             f"  GS.6 basal bootstrap: {len(survivors)} surviving tracks "
             f"(= n_trees)  [{t_gs6:.2f}s]"
         )
+
+    # Diagnostic dump on basal slabs (GS.8c, debug-only).
+    if config.diagnostic_basal_slabs:
+        print("\n  === Basal-slab cluster diagnostics ===")
+        for slab in slices:
+            if (
+                slab.z_centre <= config.basal_stripe_z_high
+                and slab.indices.size > 0
+            ):
+                diagnose_slab_clusters(xyz, slab, config, rng=rng)
+        print("  === End diagnostics ===\n")
 
     # GS.7 / GS.7b — assignment to the full-size cloud.
     t0 = time.perf_counter()
