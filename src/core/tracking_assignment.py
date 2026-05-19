@@ -1100,3 +1100,143 @@ def tracking_result_to_trunk_extraction_result(
         cluster_points=np.empty((0, 3), dtype=np.float64),
         config=TrunkExtractionConfig(),
     )
+
+
+# ===========================================================================
+# GS.8b — Tracking audit table (false-positive diagnostic)
+# ===========================================================================
+
+def build_tracking_audit_table(
+    xyz: np.ndarray,
+    tracking_result: TrackingAssignmentResult,
+    slab_step: float,
+):
+    """Build a per-track diagnostic CSV analogous to ``trunk_audit.csv``.
+
+    Surfaces the metrics needed to spot false-positive tracks (small
+    isolated clusters that happened to fit an ellipse but don't look
+    like real trees):
+
+      * ``n_nodes``: how many slabs the track spans. Real trees usually
+        cover ≥ 5 nodes; FPs often have 1–2.
+      * ``z_extent``: total vertical extent in metres. FPs are typically
+        < 3 m.
+      * ``gap_fraction``: ``1 − n_nodes / expected_nodes`` where
+        ``expected_nodes`` is the count of slab positions that fit
+        inside the track's z-range. Continuous real trees → ~ 0.0;
+        FPs with gaps → ≥ 0.3.
+      * ``n_points``: total points labelled with the tree_id (membership
+        of every ellipse cluster across all the track's nodes).
+      * ``mean_radius``, ``radius_cv``: consistency of √(a·b) across
+        nodes. Real trees taper smoothly; FPs jump around.
+      * ``mean_aspect_ratio``: average ``a / b``. Real stems ≈ 1.0;
+        elongated FPs (rows of leaves, ground texture) > 1.5.
+      * ``mean_sector_pct``: average sector-occupancy quality. Real
+        stems often > 60 %; FPs hover at the rejection floor.
+      * ``density_pts_per_m3``: ``n_points / (π·r²·h)`` — order-of-
+        magnitude FP separator on the right sensor.
+
+    The function does NOT filter anything: it only reports. Use the CSV
+    to pick thresholds, then either re-run with a stricter config or
+    write a downstream filter (GS.8c, optional).
+
+    Parameters
+    ----------
+    xyz : ndarray of shape (N, 3)
+        The original cloud passed to ``assign_trees_by_tracking``. Only
+        used for ``n_points`` lookup (we count by ``tree_ids == k``).
+    tracking_result : TrackingAssignmentResult
+        Output of the GS pipeline.
+    slab_step : float
+        Vertical spacing of the slabs (from
+        ``TrackingAssignmentConfig.slab_step``). Needed to compute
+        ``gap_fraction``.
+
+    Returns
+    -------
+    pandas.DataFrame
+        One row per track (= per tree_id). Empty if
+        ``tracking_result.tracks`` is empty.
+    """
+    import pandas as pd
+
+    if slab_step <= 0.0:
+        raise ValueError(f"slab_step must be positive; got {slab_step}")
+
+    rows = []
+    for i, track in enumerate(tracking_result.tracks):
+        n_nodes = track.n_nodes
+        z_bottom = float(track.z_bottom)
+        z_top = float(track.z_top)
+        z_extent = z_top - z_bottom
+
+        # Expected number of nodes if the track had no gaps:
+        # one node per slab centre in the track's z range, inclusive.
+        if z_extent > 0:
+            expected_nodes = int(round(z_extent / slab_step)) + 1
+        else:
+            expected_nodes = 1
+        gap_fraction = max(0.0, 1.0 - n_nodes / max(expected_nodes, 1))
+
+        # Per-node geometric stats.
+        ellipses = [node.ellipse for node in track.nodes]
+        radii = np.array(
+            [float(np.sqrt(e.a * e.b)) for e in ellipses if e.a > 0 and e.b > 0],
+            dtype=np.float64,
+        )
+        aspects = np.array(
+            [e.a / e.b for e in ellipses if e.b > 0],
+            dtype=np.float64,
+        )
+        sector_pcts = np.array(
+            [e.sector_pct for e in ellipses],
+            dtype=np.float64,
+        )
+
+        mean_radius = float(radii.mean()) if radii.size else 0.0
+        radius_cv = (
+            float(radii.std() / mean_radius) if mean_radius > 0 else 0.0
+        )
+        mean_aspect_ratio = float(aspects.mean()) if aspects.size else 0.0
+        mean_sector_pct = (
+            float(sector_pcts.mean()) if sector_pcts.size else 0.0
+        )
+
+        n_points = int((tracking_result.tree_ids == i).sum())
+
+        if mean_radius > 0.0 and z_extent > 0.0:
+            volume = np.pi * mean_radius * mean_radius * z_extent
+            density = float(n_points / volume)
+        else:
+            density = 0.0
+
+        rows.append({
+            "tree_id": i,
+            "n_nodes": n_nodes,
+            "z_bottom": round(z_bottom, 3),
+            "z_top": round(z_top, 3),
+            "z_extent": round(z_extent, 3),
+            "gap_fraction": round(gap_fraction, 3),
+            "n_points": n_points,
+            "mean_radius": round(mean_radius, 4),
+            "radius_cv": round(radius_cv, 3),
+            "mean_aspect_ratio": round(mean_aspect_ratio, 3),
+            "mean_sector_pct": round(mean_sector_pct, 1),
+            "density_pts_per_m3": round(density, 1),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def export_tracking_audit_table(df, path):
+    """Write the tracking-audit DataFrame to a CSV.
+
+    Wrapper kept for symmetry with ``export_trunk_audit_table`` in
+    ``src.core.trunk_audit`` so the notebook cells can use the same
+    idiom for both audits.
+    """
+    from pathlib import Path
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(p, index=False)
+    return p

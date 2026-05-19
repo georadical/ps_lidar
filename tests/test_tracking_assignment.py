@@ -30,8 +30,10 @@ from src.core.tracking_assignment import (
     assign_tree_ids_from_tracks,
     assign_trees_by_tracking,
     bootstrap_tracks_from_basal_stripe,
+    build_tracking_audit_table,
     build_tree_axes_from_tracks,
     cluster_slice,
+    export_tracking_audit_table,
     filter_by_verticality,
     fit_ellipses_in_slice,
     slice_horizontal_global,
@@ -1177,3 +1179,169 @@ class TestTrackingResultToTrunkExtractionResult:
         np.testing.assert_array_equal(shim.trunk_mask, result.tree_ids >= 0)
         assert shim.n_trees == result.n_trees
         assert len(shim.tree_axes) == result.n_trees
+
+
+# ===========================================================================
+# GS.8b — build_tracking_audit_table
+# ===========================================================================
+
+def _track_full(
+    z_values: list, xc: float = 0.0, yc: float = 0.0,
+    a: float = 0.15, b: float = 0.15, sector_pct: float = 80.0,
+    indices_per_node: list = None,
+) -> Track:
+    """Build a Track where every node carries a populated ellipse +
+    optional per-node index arrays. Lets the audit tests exercise the
+    real arithmetic over `track.nodes`."""
+    if indices_per_node is None:
+        indices_per_node = [np.empty(0, dtype=np.int64)] * len(z_values)
+    nodes = []
+    for z, idx in zip(z_values, indices_per_node):
+        ellipse = ClusterEllipse(
+            indices=np.asarray(idx, dtype=np.int64),
+            xc=xc, yc=yc, a=a, b=b, theta=0.0,
+            sector_pct=sector_pct, check_status=0,
+            n_points=int(len(idx)),
+        )
+        nodes.append(TrackNode(z=z, ellipse=ellipse))
+    return Track(nodes=nodes)
+
+
+def _make_tracking_result(tracks: list, n_points: int = 100) -> TrackingAssignmentResult:
+    """Helper: build a TrackingAssignmentResult by running the GS.7
+    assignment over a constructed track list."""
+    return assign_tree_ids_from_tracks(tracks, n_points=n_points)
+
+
+class TestBuildTrackingAuditTable:
+
+    def test_empty_tracks_returns_empty_dataframe(self):
+        import pandas as pd
+        result = _make_tracking_result([], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        assert isinstance(df, pd.DataFrame)
+        assert df.empty
+
+    def test_rejects_non_positive_slab_step(self):
+        result = _make_tracking_result([], n_points=0)
+        with pytest.raises(ValueError):
+            build_tracking_audit_table(
+                np.empty((0, 3)), result, slab_step=0.0,
+            )
+
+    def test_single_clean_track_metrics(self):
+        # Track with 5 nodes spanning 4 m of z (slabs 1m apart),
+        # each node carries 20 points → 100 points total.
+        indices_per_node = [
+            np.arange(0, 20),
+            np.arange(20, 40),
+            np.arange(40, 60),
+            np.arange(60, 80),
+            np.arange(80, 100),
+        ]
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0, 4.0, 5.0],
+            a=0.15, b=0.15,
+            sector_pct=80.0,
+            indices_per_node=indices_per_node,
+        )
+        result = _make_tracking_result([track], n_points=100)
+        df = build_tracking_audit_table(
+            np.zeros((100, 3)), result, slab_step=1.0,
+        )
+        assert len(df) == 1
+        row = df.iloc[0]
+        assert int(row["tree_id"]) == 0
+        assert int(row["n_nodes"]) == 5
+        assert float(row["z_bottom"]) == 1.0
+        assert float(row["z_top"]) == 5.0
+        assert float(row["z_extent"]) == 4.0
+        assert float(row["gap_fraction"]) == pytest.approx(0.0, abs=1e-9)
+        assert int(row["n_points"]) == 100
+        assert float(row["mean_radius"]) == pytest.approx(0.15, abs=1e-4)
+        assert float(row["radius_cv"]) == pytest.approx(0.0, abs=1e-9)
+        assert float(row["mean_aspect_ratio"]) == pytest.approx(1.0, abs=1e-9)
+        assert float(row["mean_sector_pct"]) == pytest.approx(80.0, abs=1e-9)
+
+    def test_gap_fraction_detects_holes(self):
+        # 3 nodes at z=1, 5, 9 → spans 8 m, but should have ~9 nodes
+        # at 1 m spacing → gap_fraction ≈ 1 − 3/9 = 0.667.
+        track = _track_full(z_values=[1.0, 5.0, 9.0])
+        result = _make_tracking_result([track], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        row = df.iloc[0]
+        assert float(row["gap_fraction"]) == pytest.approx(2.0 / 3.0, abs=1e-2)
+
+    def test_singleton_track_no_extent(self):
+        # Singleton (1 node) → z_extent=0, gap_fraction=0 (expected=1),
+        # density=0 (no volume).
+        track = _track_full(z_values=[1.0])
+        result = _make_tracking_result([track], n_points=5)
+        df = build_tracking_audit_table(
+            np.zeros((5, 3)), result, slab_step=1.0,
+        )
+        row = df.iloc[0]
+        assert int(row["n_nodes"]) == 1
+        assert float(row["z_extent"]) == 0.0
+        assert float(row["gap_fraction"]) == 0.0
+        assert float(row["density_pts_per_m3"]) == 0.0
+
+    def test_oval_track_higher_aspect_ratio(self):
+        # Strong oval cluster (a=0.30, b=0.10) → aspect 3.0 (FP-like).
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0],
+            a=0.30, b=0.10,
+            sector_pct=60.0,
+        )
+        result = _make_tracking_result([track], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        assert float(df.iloc[0]["mean_aspect_ratio"]) == pytest.approx(3.0, abs=1e-3)
+
+    def test_density_separates_real_vs_fp_proxy(self):
+        # Real-ish: 5000 pts in a 10 m × r=0.15 stem → density ≈ 7074
+        idx_real = np.arange(0, 5000)
+        real = _track_full(
+            z_values=[i + 1.0 for i in range(11)],
+            a=0.15, b=0.15,
+            indices_per_node=[idx_real[i*500:(i+1)*500] for i in range(10)] + [np.empty(0, dtype=np.int64)],
+        )
+        # FP-ish: 50 pts in a 2 m × r=0.10 ellipsoid → density ≈ 795
+        idx_fp = np.arange(5000, 5050)
+        fp = _track_full(
+            z_values=[10.0, 11.0, 12.0],
+            a=0.10, b=0.10,
+            indices_per_node=[idx_fp[:17], idx_fp[17:34], idx_fp[34:]],
+        )
+        result = _make_tracking_result([real, fp], n_points=5050)
+        df = build_tracking_audit_table(
+            np.zeros((5050, 3)), result, slab_step=1.0,
+        )
+        d_real = float(df.iloc[0]["density_pts_per_m3"])
+        d_fp = float(df.iloc[1]["density_pts_per_m3"])
+        # Real density should be an order of magnitude larger than FP density.
+        assert d_real > 5 * d_fp
+
+
+class TestExportTrackingAuditTable:
+
+    def test_writes_csv_to_path(self, tmp_path):
+        track = _track_full(z_values=[1.0, 2.0, 3.0])
+        result = _make_tracking_result([track], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        path = tmp_path / "tracking_audit.csv"
+        out_path = export_tracking_audit_table(df, path)
+        assert out_path == path
+        assert path.exists()
+        # Roundtrip: header + 1 data row.
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        assert len(lines) == 2  # header + 1 row
+        assert "tree_id" in lines[0]
