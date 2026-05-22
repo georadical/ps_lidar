@@ -1087,6 +1087,15 @@ class TrackingAssignmentConfig:
     # for debug runs.
     diagnostic_basal_slabs: bool = False
 
+    # Per-track diagnostic dump after GS.6 (debug-only). Shows
+    # (n_nodes, z_bottom, z_top, Δz, xc_bot, yc_bot) and the basal-
+    # stripe verdict per candidate track, with a category histogram
+    # of why each was accepted/rejected. Useful when GS.6 keeps only
+    # a handful of tracks out of many — exposes whether the bottleneck
+    # is the stripe lower bound, the upper bound, the minimum length
+    # filter, or fragmentation. Costs ~0 s.
+    diagnostic_candidate_tracks: bool = False
+
     # --- GS.7 / GS.7b assignment mode ---
     # "curved_cylinder" is the default and what jubilates the straight
     # cylinder: an adaptive-radius buffer around the track's polyline
@@ -1190,6 +1199,110 @@ def diagnose_slab_clusters(
             f"{aspect:5.2f}  {r_eq:5.3f}    {int(status)}     {sector_pct:6.1f}    "
             f"{outcome}"
         )
+
+
+def diagnose_candidate_tracks(
+    tracks: List["Track"],
+    config: "TrackingAssignmentConfig",
+) -> None:
+    """Print per-track diagnostics for GS.5 candidates + GS.6 verdicts.
+
+    Mirrors the spirit of :func:`diagnose_slab_clusters` one stage
+    upstream: when GS.6 keeps only a handful of tracks out of many,
+    this dump shows *why* — for each candidate, prints
+    ``(n_nodes, z_bottom, z_top, Δz, xc_bot, yc_bot)`` plus the basal-
+    stripe verdict (``ACCEPT`` / ``below_stripe`` / ``above_stripe`` /
+    ``too_short``) and a category histogram so a single run reveals
+    whether the bottleneck is the stripe lower bound, the upper bound,
+    or the minimum length filter.
+
+    Intended for debug-only invocation. Costs ~0 s (tracks are already
+    computed; just printed). The orchestrator calls this after GS.6
+    when ``config.diagnostic_candidate_tracks`` is True.
+    """
+    z_low = config.basal_stripe_z_low
+    z_high = config.basal_stripe_z_high
+    min_len = config.min_track_length
+
+    # Classify each track
+    verdicts: List[str] = []
+    cat_counts = {
+        "ACCEPT": 0,
+        "below_stripe": 0,
+        "above_stripe": 0,
+        "too_short": 0,
+    }
+    nnodes_buckets = {"1": 0, "2": 0, "3-5": 0, "6-10": 0, ">10": 0}
+    for track in tracks:
+        n = track.n_nodes
+        z0 = track.z_bottom
+        if n < min_len:
+            v = "too_short"
+        elif z0 < z_low:
+            v = "below_stripe"
+        elif z0 > z_high:
+            v = "above_stripe"
+        else:
+            v = "ACCEPT"
+        verdicts.append(v)
+        cat_counts[v] += 1
+
+        if n == 1:
+            nnodes_buckets["1"] += 1
+        elif n == 2:
+            nnodes_buckets["2"] += 1
+        elif n <= 5:
+            nnodes_buckets["3-5"] += 1
+        elif n <= 10:
+            nnodes_buckets["6-10"] += 1
+        else:
+            nnodes_buckets[">10"] += 1
+
+    # Header + summary
+    n_total = len(tracks)
+    print(f"\n  === Candidate-track diagnostics (GS.5 → GS.6) ===")
+    print(
+        f"  basal_stripe = [{z_low:.2f}, {z_high:.2f}]m, "
+        f"min_track_length = {min_len}"
+    )
+    print(
+        f"  {n_total} candidate tracks → "
+        f"{cat_counts['ACCEPT']} accepted, "
+        f"{n_total - cat_counts['ACCEPT']} rejected"
+    )
+    print(f"    rejected by category:")
+    print(f"      z_bottom < {z_low:.2f} (below stripe): {cat_counts['below_stripe']}")
+    print(f"      z_bottom > {z_high:.2f} (above stripe): {cat_counts['above_stripe']}")
+    print(f"      n_nodes < {min_len} (too short):       {cat_counts['too_short']}")
+    print(f"    n_nodes histogram (all {n_total} tracks):")
+    for k, v in nnodes_buckets.items():
+        print(f"      {k:>5}: {v}")
+
+    # Per-track table — sort by verdict (ACCEPT first), then by Δz desc
+    # so the most "tree-like" candidates appear at the top.
+    order = sorted(
+        range(n_total),
+        key=lambda i: (
+            0 if verdicts[i] == "ACCEPT" else 1,
+            -(tracks[i].z_top - tracks[i].z_bottom),
+        ),
+    )
+    print(
+        f"\n    idx  n_nodes  z_bot   z_top    Δz    xc_bot   yc_bot   verdict"
+    )
+    for i in order:
+        t = tracks[i]
+        z0 = t.z_bottom
+        z1 = t.z_top
+        dz = z1 - z0
+        node0 = t.nodes[0]
+        xc = float(node0.ellipse.xc)
+        yc = float(node0.ellipse.yc)
+        print(
+            f"    {i:3d}   {t.n_nodes:5d}   {z0:5.2f}  {z1:6.2f}  {dz:5.2f}  "
+            f"{xc:7.3f}  {yc:7.3f}   {verdicts[i]}"
+        )
+    print("  === End candidate-track diagnostics ===\n")
 
 
 def assign_trees_by_tracking(
@@ -1375,6 +1488,10 @@ def assign_trees_by_tracking(
             f"  GS.6 basal bootstrap: {len(survivors)} surviving tracks "
             f"(= n_trees)  [{t_gs6:.2f}s]"
         )
+
+    # Per-track diagnostic dump (palanca 0b, debug-only).
+    if config.diagnostic_candidate_tracks:
+        diagnose_candidate_tracks(tracks, config)
 
     # Diagnostic dump on basal slabs (GS.8c, debug-only).
     if config.diagnostic_basal_slabs:
