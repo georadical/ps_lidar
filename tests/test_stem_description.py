@@ -23,6 +23,7 @@ from src.core.stem_description import (
     build_stem_description_rows,
     build_taper_rows,
     classify_sweep,
+    classify_sweep_zones,
     compute_coverage_metrics,
     coverage_metrics_to_dataframe,
     stem_description_to_dataframe,
@@ -310,6 +311,82 @@ class TestComputeCoverageMetrics:
 # ===========================================================================
 # Integration tests — build_stem_description_rows
 # ===========================================================================
+
+class TestClassifySweepZones:
+    """Zone-aware sliding-window classifier (F1.1)."""
+
+    @staticmethod
+    def _straight_polyline(z_top: float = 10.0, n: int = 21) -> np.ndarray:
+        z = np.linspace(0.0, z_top, n)
+        return np.column_stack([np.zeros(n), np.zeros(n), z])
+
+    def test_empty_inputs_return_empty(self):
+        assert classify_sweep_zones(None, 0.2) == []
+        assert classify_sweep_zones(self._straight_polyline(), 0.0) == []
+        assert classify_sweep_zones(np.zeros((2, 3)), 0.2) == []
+
+    def test_straight_polyline_single_8_zone(self):
+        cl = self._straight_polyline(z_top=10.0, n=21)
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        assert len(zones) == 1
+        assert zones[0][2] == "8"
+        # Spans the whole polyline
+        assert zones[0][0] == pytest.approx(0.0)
+        assert zones[0][1] == pytest.approx(10.0)
+
+    def test_localised_bow_creates_worse_central_zone(self):
+        # Polyline ~21 m long, endpoints on the stem axis (x=0), with a
+        # localised bow at z ∈ [10, 14] where x drifts to 0.2 m.
+        # Distance to base-top chord: 0 outside the bow, 0.2 inside.
+        # ratio = 0.2 / SED 0.2 = 1.0 → "1" inside, "8" outside.
+        z = np.linspace(0.0, 21.0, 106)  # 0.2 m spacing
+        x = np.zeros_like(z)
+        bow_mask = (z >= 10.0) & (z <= 14.0)
+        x[bow_mask] = 0.20
+        cl = np.column_stack([x, np.zeros_like(z), z])
+
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "1" in codes
+        assert "8" in codes
+        # First zone covers the lower clean section
+        assert zones[0][0] == pytest.approx(0.0, abs=0.5)
+        assert zones[0][2] == "8"
+        # Last zone covers the upper clean section
+        assert zones[-1][1] == pytest.approx(21.0, abs=0.5)
+        assert zones[-1][2] == "8"
+
+    def test_upgrade_rule_absorbs_short_better_zone(self):
+        # Two "1" bows bracketing a 1 m gap that would look like "8"
+        # locally. With upgrade_min=3.0 m, the short central "8" must
+        # be absorbed into the surrounding "1" code. Polyline endpoints
+        # are on the stem axis (x=0) so the base-top chord aligns with
+        # the trunk axis.
+        z = np.linspace(0.0, 10.0, 101)  # 0.1 m spacing
+        x = np.zeros_like(z)
+        x[(z >= 2.0) & (z < 4.5)] = 0.20   # first bow
+        x[(z > 5.5) & (z <= 8.0)] = 0.20   # second bow
+        cl = np.column_stack([x, np.zeros_like(z), z])
+
+        zones = classify_sweep_zones(
+            cl, sed_obs_m=0.20, upgrade_min_section_m=3.0,
+        )
+        # After absorption the central 1 m "8" gap is gone; the surviving
+        # zones should be: bottom "8" (clean basal), central merged "1",
+        # top "8" (clean apex).
+        codes = [c for (_, _, c) in zones]
+        assert codes == ["8", "1", "8"]
+        # Central "1" zone now spans the union of both bows (≈ 2.0 to 8.0)
+        assert zones[1][0] == pytest.approx(2.0, abs=0.2)
+        assert zones[1][1] == pytest.approx(8.0, abs=0.2)
+
+    def test_zones_cover_polyline_contiguously(self):
+        cl = self._straight_polyline(z_top=15.0, n=76)
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        # No gaps between zones
+        for k in range(len(zones) - 1):
+            assert zones[k][1] == pytest.approx(zones[k + 1][0], abs=0.3)
+
 
 class TestBuildStemDescriptionRows:
     """Sparse-row schema: base + DBH + end-of-zone Sw + optional F.

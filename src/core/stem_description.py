@@ -272,6 +272,200 @@ def _polyline_length_z(centerline: np.ndarray) -> float:
     return float(z.max() - z.min())
 
 
+def classify_sweep_zones(
+    centerline: Optional[np.ndarray],
+    sed_obs_m: float,
+    upgrade_min_section_m: float = 3.0,
+    log_length_threshold_m: float = 6.1,
+) -> List[tuple]:
+    """Decompose a centerline polyline into Interpine sweep zones via a
+    sliding-window local-amplitude classifier (F1.1 algorithm).
+
+    This is the zone-aware sibling of :func:`classify_sweep`: where the
+    single-code helper reduces the whole stem to one Interpine code by
+    the polyline's global max amplitude, this function walks the
+    polyline with a 4 m window (default) and assigns a code per node,
+    then coalesces consecutive same-code nodes into zones — recovering
+    cases where a 21 m stem labelled ``"1"`` globally actually breaks
+    into something like ``[8 (0-5 m), L (5-12 m), 1 (12-18 m), S (18-21 m)]``.
+
+    Algorithm (see ``memory/reference_interpine_hqp_codes.md`` for the
+    code-to-amplitude mapping it consumes):
+
+    1. **Sort nodes by z** to be robust against polylines not stored in
+       ascending order.
+    2. **Per-node amplitude vs the global base-top chord**: build the
+       chord from the bottom-most polyline node to the top-most. For
+       every node, compute the perpendicular distance to that chord.
+       This signal is naturally localised — nodes outside any bow
+       region sit on the chord (amplitude ≈ 0), nodes inside a bow have
+       amplitude proportional to the bow height. A windowed local-chord
+       variant was tried first but tilted the chord whenever the window
+       included a bow as an endpoint, leaking the bow's amplitude into
+       nominally-straight neighbouring nodes. The global-chord approach
+       is simpler and correctly attributes amplitude to the actual
+       deviation node.
+    3. **Per-node code mapping**: ``ratio = amplitude / sed_obs_m``,
+       then map to ``"8" / "LS" / "3" / "1" / "X"`` by the same severity
+       thresholds as :func:`classify_sweep`. ``"LS"`` is a placeholder
+       resolved to ``"L"`` or ``"S"`` after coalescing, based on zone
+       length (≥ 6.1 m → L, else S).
+    4. **Coalesce** consecutive same-code nodes into zones
+       ``(z_start, z_end, code)``.
+    5. **Upgrade-rule enforcement** (Interpine HQP quickcard): a zone
+       with a *better* code that is shorter than ``upgrade_min_section_m``
+       and is sandwiched between two *worse* zones is **absorbed into
+       the worse neighbour**. The reverse — a short worse zone between
+       two better zones — keeps its worse code (kinks, local defects
+       don't average out). The rule iterates until stable, then
+       same-code zones are merged again.
+
+    Limitations
+    -----------
+    - Pure amplitude-based: cannot distinguish ``W`` (wobble — multiple
+      XY direction reversals) or ``K`` (kink — sharp angle change at a
+      single segment). Those require shape-pattern detection on the
+      polyline, deferred to a future module.
+    - ``L`` vs ``S`` is resolved by zone length only, not by the
+      "consistent direction" vs "back and forth" criterion of the
+      Interpine quickcard (which also needs shape detection). Length is
+      the dominant operative cue for log-merchantability, so the
+      length-based split is a useful approximation.
+
+    Parameters
+    ----------
+    centerline : ndarray of shape (N, 3) or None
+        Per-tree polyline of section centres. ``None`` or fewer than
+        3 nodes returns an empty list.
+    sed_obs_m : float
+        Topmost-extracted-section diameter in metres. Zero or negative
+        returns an empty list.    upgrade_min_section_m : float, default 3.0
+        Minimum length a better-coded zone must have to survive the
+        upgrade rule. Interpine HQP quickcard: "Only Upgrade Branch
+        or Sweep Class … if > 3 m Section Between Zones of Lower
+        Quality".
+    log_length_threshold_m : float, default 6.1
+        Threshold for splitting the SED/5 amplitude class into ``L``
+        (length ≥ 6.1 m → "OK for logs > 6.1 m") vs ``S`` (length <
+        6.1 m → short-log only).
+
+    Returns
+    -------
+    list of (z_start, z_end, code) tuples
+        Sorted by ``z_start`` ascending. Each tuple defines a contiguous
+        zone of the polyline with its Interpine sweep code.
+    """
+    if centerline is None or sed_obs_m <= 0.0:
+        return []
+    cl = np.asarray(centerline, dtype=np.float64)
+    if cl.ndim != 2 or cl.shape[1] != 3 or cl.shape[0] < 3:
+        return []
+
+    # 1. Sort by z
+    order = np.argsort(cl[:, 2])
+    cl = cl[order]
+    z = cl[:, 2]
+    n = cl.shape[0]
+
+    # 2. Per-node perpendicular distance to the global base-top chord.
+    # Vectorised: build the chord from cl[0] to cl[-1], project every
+    # node onto it, and take the residual distance.
+    p0 = cl[0]
+    p1 = cl[-1]
+    axis = p1 - p0
+    axis_len_sq = float(np.dot(axis, axis))
+    if axis_len_sq < 1e-18:
+        return []
+    rel = cl - p0
+    t = (rel @ axis) / axis_len_sq
+    closest = p0 + t[:, None] * axis
+    local_amp = np.linalg.norm(cl - closest, axis=1)
+
+    # 3. Per-node code mapping
+    inv_sed = 1.0 / sed_obs_m
+    codes_per_node: List[str] = []
+    for amp in local_amp:
+        ratio = amp * inv_sed
+        if ratio <= 1.0 / 8.0:
+            codes_per_node.append("8")
+        elif ratio <= 1.0 / 5.0:
+            codes_per_node.append("LS")
+        elif ratio <= 1.0 / 3.0:
+            codes_per_node.append("3")
+        elif ratio <= 1.0:
+            codes_per_node.append("1")
+        else:
+            codes_per_node.append("X")
+
+    # 4. Coalesce consecutive same-code nodes into zones
+    zones: List[tuple] = []
+    run_start = 0
+    for i in range(1, n):
+        if codes_per_node[i] != codes_per_node[run_start]:
+            zones.append((
+                float(z[run_start]),
+                float(z[i - 1]),
+                codes_per_node[run_start],
+            ))
+            run_start = i
+    zones.append((
+        float(z[run_start]),
+        float(z[n - 1]),
+        codes_per_node[run_start],
+    ))
+
+    # Resolve LS → L or S by zone length
+    zones = [
+        (
+            s, e,
+            ("L" if (e - s) >= log_length_threshold_m else "S")
+            if c == "LS" else c
+        )
+        for (s, e, c) in zones
+    ]
+
+    # 5. Upgrade-rule enforcement (iterate to fixed point)
+    severity = {"8": 0, "L": 1, "S": 1, "3": 2, "1": 3, "X": 4}
+    safety = 0
+    while safety < 20:
+        safety += 1
+        new_zones: List[tuple] = []
+        any_change = False
+
+        for k, (s, e, c) in enumerate(zones):
+            length = e - s
+            sev = severity.get(c, 0)
+
+            absorb = False
+            if k > 0 and k < len(zones) - 1 and length < upgrade_min_section_m:
+                prev_c = zones[k - 1][2]
+                next_c = zones[k + 1][2]
+                prev_sev = severity.get(prev_c, 0)
+                next_sev = severity.get(next_c, 0)
+                if sev < prev_sev and sev < next_sev:
+                    worse_code = prev_c if prev_sev >= next_sev else next_c
+                    if new_zones and new_zones[-1][2] == worse_code:
+                        s0, _, _ = new_zones[-1]
+                        new_zones[-1] = (s0, e, worse_code)
+                    else:
+                        new_zones.append((s, e, worse_code))
+                    absorb = True
+                    any_change = True
+
+            if not absorb:
+                if new_zones and new_zones[-1][2] == c:
+                    s0, _, _ = new_zones[-1]
+                    new_zones[-1] = (s0, e, c)
+                else:
+                    new_zones.append((s, e, c))
+
+        zones = new_zones
+        if not any_change:
+            break
+
+    return zones
+
+
 def classify_sweep(
     centerline: Optional[np.ndarray],
     sed_obs_m: float,
@@ -466,15 +660,18 @@ def build_stem_description_rows(
             dbh_row["Diameter"] = round(float(tm.dbh) * 1000.0, 1)
             rows.append(dbh_row)
 
-        # 3. End-of-zone Sw row at the topmost extracted section.
-        sweep_code = classify_sweep(
+        # 3. Sweep zones via the sliding-window classifier (F1.1). Emits
+        # one row per detected zone, with Position at the zone's z_end.
+        # When the classifier returns a single zone covering the whole
+        # stem, this collapses to the previous single-row behaviour.
+        zones = classify_sweep_zones(
             tree_centerlines[i],
             sed_obs_m=(cov.sed_obs_cm / 100.0) if cov.valid_sed else 0.0,
         )
-        if sweep_code is not None and cov.valid_sed:
+        for (_z_start, z_end, code) in zones:
             sw_row = empty_row(tree_number)
-            sw_row["Position"] = round(float(cov.sed_obs_height_m), 3)
-            sw_row["Sw"] = sweep_code
+            sw_row["Position"] = round(float(z_end), 3)
+            sw_row["Sw"] = code
             rows.append(sw_row)
 
         # 4. Feature row: F = O1.2+ if oval at DBH (HQP excessive ovality)
