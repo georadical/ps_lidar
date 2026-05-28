@@ -859,6 +859,8 @@ def assign_trees_by_curved_cylinder(
     radius_min: float = 0.05,
     radius_max: float = 0.50,
     z_margin: float = 0.5,
+    extend_below: Optional[float] = None,
+    extend_above: Optional[float] = None,
 ) -> TrackingAssignmentResult:
     """Assign tree_id by a curved-cylinder buffer around each track.
 
@@ -895,10 +897,22 @@ def assign_trees_by_curved_cylinder(
         tube, and prevents merged-cluster artefacts from creating an
         oversized tube that would steal points from neighbouring stems.
     z_margin : float, default 0.5 (m)
-        Half-slab extension of the polyline above the topmost node and
-        below the bottommost node. With the default 1 m slab spacing,
-        this captures the half-slab worth of points just outside the
-        track's z-range.
+        Backward-compat default for ``extend_below`` and ``extend_above``
+        when those are left as ``None``. Has no other effect.
+    extend_below : float, optional
+        Arc-length distance to extrapolate the polyline below its bottom
+        node, along the **tangent of the first segment** (``-(n[1]-n[0])``
+        direction). Set to ~3 m to reach ground from a track that starts
+        at z=3 m. If ``None``, defaults to ``z_margin``. Set to 0 to
+        disable the bottom extension entirely.
+    extend_above : float, optional
+        Arc-length distance to extrapolate the polyline above its top
+        node, along the **tangent of the last segment** (``n[-1]-n[-2]``
+        direction). Useful when point density / occlusion above the
+        canopy break prevents new ellipse fits but the trunk visibly
+        continues upward — the tube follows the lean the centerline was
+        already taking. If ``None``, defaults to ``z_margin``. Set to 0
+        to disable.
 
     Returns
     -------
@@ -918,6 +932,14 @@ def assign_trees_by_curved_cylinder(
         )
     if z_margin < 0.0:
         raise ValueError(f"z_margin must be >= 0; got {z_margin}")
+    if extend_below is None:
+        extend_below = z_margin
+    if extend_above is None:
+        extend_above = z_margin
+    if extend_below < 0.0:
+        raise ValueError(f"extend_below must be >= 0; got {extend_below}")
+    if extend_above < 0.0:
+        raise ValueError(f"extend_above must be >= 0; got {extend_above}")
 
     n_points = xyz.shape[0]
     tree_ids = np.full(n_points, -1, dtype=np.int32)
@@ -945,25 +967,55 @@ def assign_trees_by_curved_cylinder(
             radius_max,
         )
 
-        # Extend the polyline by phantom nodes at z_bottom − z_margin
-        # and z_top + z_margin, with the same XY and radius as the
-        # adjacent real nodes. This turns the z_margin parameter into
-        # an actual tube extension (not just a candidate-filter widening),
-        # so points slightly past the polyline endpoints get assigned
-        # cleanly via segment projection. Singletons are handled below
-        # with a spherical buffer instead, so we skip the extension for
-        # them.
-        if z_margin > 0.0 and len(nodes_xyz) >= 2:
-            bottom_ghost = nodes_xyz[0].copy()
-            bottom_ghost[2] -= z_margin
-            top_ghost = nodes_xyz[-1].copy()
-            top_ghost[2] += z_margin
-            nodes_xyz = np.vstack([bottom_ghost[np.newaxis, :], nodes_xyz,
-                                   top_ghost[np.newaxis, :]])
-            radii = np.concatenate([[radii[0]], radii, [radii[-1]]])
+        # Extend the polyline by phantom nodes at both endpoints along
+        # the **local tangent** of the first / last segment. This lets
+        # the tube follow the lean the centerline was already taking
+        # (rather than snapping to pure-vertical), and the extension
+        # arc-length is configurable independently for each end.
+        # Singletons are handled below with a spherical buffer instead,
+        # so we skip the extension for them.
+        if len(nodes_xyz) >= 2:
+            bottom_ghost = None
+            top_ghost = None
 
-        z_lo = float(track.z_bottom - z_margin)
-        z_hi = float(track.z_top + z_margin)
+            if extend_below > 0.0:
+                first_seg = nodes_xyz[1] - nodes_xyz[0]
+                seg_len = float(np.linalg.norm(first_seg))
+                if seg_len > 1e-9:
+                    # Direction pointing OUT of the polyline at the bottom
+                    # (i.e., from n[1] toward n[0] and beyond).
+                    outward = -first_seg / seg_len
+                    bottom_ghost = nodes_xyz[0] + outward * extend_below
+
+            if extend_above > 0.0:
+                last_seg = nodes_xyz[-1] - nodes_xyz[-2]
+                seg_len = float(np.linalg.norm(last_seg))
+                if seg_len > 1e-9:
+                    # Direction pointing OUT of the polyline at the top.
+                    outward = last_seg / seg_len
+                    top_ghost = nodes_xyz[-1] + outward * extend_above
+
+            # Apply both ghosts at once to keep index arithmetic simple.
+            prepend = (
+                [bottom_ghost[np.newaxis, :]] if bottom_ghost is not None
+                else []
+            )
+            append = (
+                [top_ghost[np.newaxis, :]] if top_ghost is not None
+                else []
+            )
+            if prepend or append:
+                nodes_xyz = np.vstack(prepend + [nodes_xyz] + append)
+                pre_r = [radii[:1]] if bottom_ghost is not None else []
+                post_r = [radii[-1:]] if top_ghost is not None else []
+                radii = np.concatenate(pre_r + [radii] + post_r)
+
+        # Derive the z-AABB from the (possibly extended) polyline. With
+        # tangent-based extensions, the bottom/top ghost z's are not
+        # simply ``z_bottom - extend_below`` — they depend on the local
+        # tangent's vertical component.
+        z_lo = float(nodes_xyz[:, 2].min())
+        z_hi = float(nodes_xyz[:, 2].max())
 
         # Candidate point indices in 3D AABB (cheap pre-filter).
         # Per-track XY bounding box: spans the polyline's xc/yc range with
@@ -1133,7 +1185,19 @@ class TrackingAssignmentConfig:
     # Polyline ends are extended by this margin above/below to capture
     # points that fall slightly beyond the topmost / bottommost node
     # (e.g. roots flare, sub-canopy points whose slab had no ellipse).
+    # ``cylinder_extend_below`` and ``cylinder_extend_above`` default to
+    # this when left None; set them explicitly for asymmetric extensions
+    # (e.g. reach ground from a track that starts at z=3 m).
     cylinder_z_margin: float = 0.5
+    # Arc-length distance to extrapolate the polyline below/above its
+    # bottom/top node along the **local tangent** of the first/last
+    # segment. When None, both default to ``cylinder_z_margin``. Set
+    # explicitly when the GS pipeline's z_min cuts off the basal section
+    # (extend_below ≈ z_min - ground) or when point density drops at the
+    # top of the canopy (extend_above follows the lean of the last
+    # segment, recovering the upper trunk that has no ellipse fits).
+    cylinder_extend_below: Optional[float] = None
+    cylinder_extend_above: Optional[float] = None
 
 
 def diagnose_slab_clusters(
@@ -1532,6 +1596,8 @@ def assign_trees_by_tracking(
             radius_min=config.cylinder_min_radius,
             radius_max=config.cylinder_max_radius,
             z_margin=config.cylinder_z_margin,
+            extend_below=config.cylinder_extend_below,
+            extend_above=config.cylinder_extend_above,
         )
         method_label = "curved cylinder (GS.7b)"
     elif config.assignment_method == "dbscan_membership":
