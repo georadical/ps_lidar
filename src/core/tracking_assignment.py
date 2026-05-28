@@ -900,19 +900,27 @@ def assign_trees_by_curved_cylinder(
         Backward-compat default for ``extend_below`` and ``extend_above``
         when those are left as ``None``. Has no other effect.
     extend_below : float, optional
-        Arc-length distance to extrapolate the polyline below its bottom
-        node, along the **tangent of the first segment** (``-(n[1]-n[0])``
-        direction). Set to ~3 m to reach ground from a track that starts
-        at z=3 m. If ``None``, defaults to ``z_margin``. Set to 0 to
-        disable the bottom extension entirely.
+        Vertical distance to extend the polyline below its bottom node
+        (xy unchanged, z shifted by ``-extend_below``). Set to ~3 m to
+        reach ground from a track that starts at z=3 m. Pure vertical
+        extension is intentional: a tangent-direction extrapolation
+        amplifies per-slab centroid noise — a 10° tilt × 3 m extension
+        gives ~50 cm of XY drift, pushing the tube off the real trunk
+        axis and contaminating the labelling with surrounding material.
+        Trunks are close to vertical near ground in mature forest, so
+        vertical extension is forest-realistic on top of being safe.
+        If ``None``, defaults to ``z_margin``. Set to 0 to disable.
     extend_above : float, optional
-        Arc-length distance to extrapolate the polyline above its top
-        node, along the **tangent of the last segment** (``n[-1]-n[-2]``
-        direction). Useful when point density / occlusion above the
-        canopy break prevents new ellipse fits but the trunk visibly
-        continues upward — the tube follows the lean the centerline was
-        already taking. If ``None``, defaults to ``z_margin``. Set to 0
-        to disable.
+        Vertical distance to extend the polyline above its top node
+        (xy unchanged, z shifted by ``+extend_above``). Same vertical-
+        only rationale as ``extend_below``. Note: for trunks that lean
+        significantly at the canopy break, a vertical extension will
+        miss the real upper trunk and instead enter the canopy column
+        above the lower trunk. A future opt-in mode with smoothed-
+        tangent extension (averaged over the last K segments, with a
+        safety clamp on the off-vertical angle) can recover lean-
+        following without re-introducing single-segment noise.
+        If ``None``, defaults to ``z_margin``. Set to 0 to disable.
 
     Returns
     -------
@@ -967,33 +975,28 @@ def assign_trees_by_curved_cylinder(
             radius_max,
         )
 
-        # Extend the polyline by phantom nodes at both endpoints along
-        # the **local tangent** of the first / last segment. This lets
-        # the tube follow the lean the centerline was already taking
-        # (rather than snapping to pure-vertical), and the extension
-        # arc-length is configurable independently for each end.
-        # Singletons are handled below with a spherical buffer instead,
-        # so we skip the extension for them.
+        # Extend the polyline by phantom nodes at both endpoints with
+        # **pure vertical** offsets (zero XY drift), keeping the same xy
+        # as the adjacent real endpoint. This is the safest extension:
+        # any XY component in the tangent direction would, multiplied by
+        # an extension of several metres, push the tube significantly
+        # off the real trunk axis when the per-slab centroid carries any
+        # noise — exactly what an earlier tangent-extrapolated draft did
+        # ("palanca 8 v1"), and visibly contaminated the labelling. The
+        # asymmetric ``extend_below`` / ``extend_above`` distances are
+        # respected separately. Singletons are handled below with a
+        # spherical buffer instead, so we skip the extension for them.
         if len(nodes_xyz) >= 2:
             bottom_ghost = None
             top_ghost = None
 
             if extend_below > 0.0:
-                first_seg = nodes_xyz[1] - nodes_xyz[0]
-                seg_len = float(np.linalg.norm(first_seg))
-                if seg_len > 1e-9:
-                    # Direction pointing OUT of the polyline at the bottom
-                    # (i.e., from n[1] toward n[0] and beyond).
-                    outward = -first_seg / seg_len
-                    bottom_ghost = nodes_xyz[0] + outward * extend_below
+                bottom_ghost = nodes_xyz[0].copy()
+                bottom_ghost[2] -= extend_below
 
             if extend_above > 0.0:
-                last_seg = nodes_xyz[-1] - nodes_xyz[-2]
-                seg_len = float(np.linalg.norm(last_seg))
-                if seg_len > 1e-9:
-                    # Direction pointing OUT of the polyline at the top.
-                    outward = last_seg / seg_len
-                    top_ghost = nodes_xyz[-1] + outward * extend_above
+                top_ghost = nodes_xyz[-1].copy()
+                top_ghost[2] += extend_above
 
             # Apply both ghosts at once to keep index arithmetic simple.
             prepend = (
@@ -1010,10 +1013,7 @@ def assign_trees_by_curved_cylinder(
                 post_r = [radii[-1:]] if top_ghost is not None else []
                 radii = np.concatenate(pre_r + [radii] + post_r)
 
-        # Derive the z-AABB from the (possibly extended) polyline. With
-        # tangent-based extensions, the bottom/top ghost z's are not
-        # simply ``z_bottom - extend_below`` — they depend on the local
-        # tangent's vertical component.
+        # Derive the z-AABB from the (possibly extended) polyline.
         z_lo = float(nodes_xyz[:, 2].min())
         z_hi = float(nodes_xyz[:, 2].max())
 
