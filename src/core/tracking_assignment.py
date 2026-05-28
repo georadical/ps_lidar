@@ -926,6 +926,8 @@ def assign_trees_by_curved_cylinder(
     # so far. Lower wins.
     best_norm_dist = np.full(n_points, np.inf, dtype=np.float64)
 
+    x_all = xyz[:, 0]
+    y_all = xyz[:, 1]
     z_all = xyz[:, 2]
 
     for track_idx, track in enumerate(tracks):
@@ -963,8 +965,25 @@ def assign_trees_by_curved_cylinder(
         z_lo = float(track.z_bottom - z_margin)
         z_hi = float(track.z_top + z_margin)
 
-        # Candidate point indices in z-range (cheap pre-filter).
-        in_z = np.where((z_all >= z_lo) & (z_all <= z_hi))[0]
+        # Candidate point indices in 3D AABB (cheap pre-filter).
+        # Per-track XY bounding box: spans the polyline's xc/yc range with
+        # an extra radius_max margin on each side, which is the largest
+        # cross-segment distance any inlier point could ever have. Any
+        # point outside this AABB cannot fall inside the tube for ANY
+        # segment, so we can safely prune it before the per-segment loop.
+        # On a 20m-radius plot with ~57 tracks, this drops cand_xyz from
+        # ~21M points (z-only filter) to ~10s-100s of k per track
+        # (~2m × 2m × Δz footprint) — typically 100-1000× speedup on the
+        # per-segment work that dominates GS.7b runtime.
+        x_lo = float(nodes_xyz[:, 0].min() - radius_max)
+        x_hi = float(nodes_xyz[:, 0].max() + radius_max)
+        y_lo = float(nodes_xyz[:, 1].min() - radius_max)
+        y_hi = float(nodes_xyz[:, 1].max() + radius_max)
+        in_z = np.where(
+            (z_all >= z_lo) & (z_all <= z_hi)
+            & (x_all >= x_lo) & (x_all <= x_hi)
+            & (y_all >= y_lo) & (y_all <= y_hi)
+        )[0]
         if in_z.size == 0:
             continue
 
