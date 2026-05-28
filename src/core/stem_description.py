@@ -371,23 +371,30 @@ def build_stem_description_rows(
 
     ``PlotId, TreeNumber, StemNo, Level, Position, Diameter, Br, Sw, F``
 
-    For each tree in ``tree_metrics`` (assumed aligned with
-    ``coverage_metrics`` and ``tree_centerlines``), emits:
+    **Sparse schema** — emits boundary rows only, NOT one per section.
+    Per Interpine PlotSafe convention, a stem entry encodes its quality
+    zones by their **endpoints**, not by dense diameter sampling. For
+    each tree:
 
-    - **Base marker row**: ``Position = 0.0``, ``Diameter = NaN``
-      (Interpine convention — flags the start of a stem entry).
-    - **One position row per valid section**: ``Position = z_section``
-      (m), ``Diameter`` = 2·√(a·b)·1000 mm (ellipse fit) or 2·R·1000 mm
-      (circle fit), ``Br/Sw/F`` left NaN.
-    - **One feature row per tree** with the sweep code from
-      :func:`classify_sweep` if a code can be computed (``Position`` =
-      NaN, ``Sw`` populated, ``Br/F`` NaN).
-    - **One feature row per tree** with ``F = "O1.2+"`` if
-      ``is_oval_at_dbh`` is True (Interpine HQP excessive ovality code).
+    - **Base marker row**: ``Position = 0.0``, ``Diameter = NaN``.
+    - **DBH row**: ``Position = 1.30``, ``Diameter`` = the equivalent
+      diameter at the DBH section in mm (= ``tm.dbh * 1000``). Skipped
+      when ``tm.valid_at_dbh`` is False.
+    - **End-of-zone Sw row**: ``Position = z_top`` (topmost extracted
+      section), ``Sw`` = sweep code from :func:`classify_sweep`. This
+      single row currently encodes the whole stem as one zone. When a
+      future shape-pattern classifier detects multiple zones (e.g. L
+      from 0-4 m, S from 4-7 m), this function will emit one Sw row per
+      zone boundary.
+    - **Optional F row** with ``F = "O1.2+"`` if ``is_oval_at_dbh`` is
+      True (Interpine HQP excessive ovality code).
+
+    Dense per-section diameter sampling lives on the separate ``Taper``
+    sheet (see :func:`build_taper_rows`).
 
     Branch (``Br``) and most ``F`` codes (``B10+``, ``N10+``, ``S*+``,
-    ``D``, ``R``, ``F*+``, ``C``) are reserved for future modules — left
-    NaN here.
+    ``D``, ``R``, ``F*+``, ``C``) are reserved for future modules — not
+    emitted here.
 
     Parameters
     ----------
@@ -396,12 +403,17 @@ def build_stem_description_rows(
         notebook; typically a plot identifier like ``"T460298B"``).
     tree_metrics : sequence of TreeMetrics
         From :func:`src.core.dendrometry.compute_tree_metrics`.
+        Provides ``dbh`` (equivalent diameter in m), ``valid_at_dbh``,
+        and ``is_oval_at_dbh``.
     coverage_metrics : sequence of CoverageMetrics
         From :func:`compute_coverage_metrics`; provides per-tree
-        ``sed_obs_cm`` for the sweep classification denominator.
+        ``sed_obs_cm`` (sweep denominator) and ``sed_obs_height_m``
+        (position of the end-of-zone Sw row).
     section_result : SectionResult
-        Per-section fits. Read for ``a, b`` (ellipse mode) or ``R``
-        (circle mode) at every valid section per tree.
+        Per-section fits. Kept on the API for forward compatibility
+        with a multi-zone sweep classifier; not currently consulted by
+        the sparse-row path (it uses the topmost-section height from
+        ``coverage_metrics`` instead).
     tree_centerlines : sequence of ndarray or None
         Per-tree polylines from
         :func:`src.core.trunk_validation.build_centerline_from_sections`,
@@ -424,12 +436,6 @@ def build_stem_description_rows(
             f"got {len(tree_metrics)} and {len(tree_centerlines)}"
         )
 
-    has_ellipse = (
-        section_result.a is not None
-        and section_result.b is not None
-    )
-    sections = np.asarray(section_result.sections, dtype=np.float64)
-
     rows: List[dict] = []
 
     def empty_row(tree_number: int) -> dict:
@@ -448,37 +454,26 @@ def build_stem_description_rows(
     for i, (tm, cov) in enumerate(zip(tree_metrics, coverage_metrics)):
         tree_number = int(tm.tree_id)
 
-        # 1. Base marker row (Interpine convention): Position=0.0, Diameter=NaN
+        # 1. Base marker row (Interpine convention): Position=0, Diameter=NaN
         base_row = empty_row(tree_number)
         base_row["Position"] = 0.0
         rows.append(base_row)
 
-        # 2. Position rows: one per valid section
-        r_row = section_result.R[i]
-        for j in range(sections.size):
-            if r_row[j] <= 0.0:
-                continue
-            if has_ellipse:
-                a_val = float(section_result.a[i, j])  # type: ignore[index]
-                b_val = float(section_result.b[i, j])  # type: ignore[index]
-                diameter_mm = (
-                    2.0 * float(np.sqrt(max(a_val * b_val, 0.0))) * 1000.0
-                )
-            else:
-                diameter_mm = 2.0 * float(r_row[j]) * 1000.0
+        # 2. DBH row: Position=1.30, Diameter from tm.dbh (m → mm)
+        if tm.valid_at_dbh and tm.dbh > 0.0:
+            dbh_row = empty_row(tree_number)
+            dbh_row["Position"] = round(float(tm.dbh_section_height), 3)
+            dbh_row["Diameter"] = round(float(tm.dbh) * 1000.0, 1)
+            rows.append(dbh_row)
 
-            pos_row = empty_row(tree_number)
-            pos_row["Position"] = round(float(sections[j]), 3)
-            pos_row["Diameter"] = round(diameter_mm, 1)
-            rows.append(pos_row)
-
-        # 3. Feature row: Sw (sweep classification from centerline + SED)
+        # 3. End-of-zone Sw row at the topmost extracted section.
         sweep_code = classify_sweep(
             tree_centerlines[i],
             sed_obs_m=(cov.sed_obs_cm / 100.0) if cov.valid_sed else 0.0,
         )
-        if sweep_code is not None:
+        if sweep_code is not None and cov.valid_sed:
             sw_row = empty_row(tree_number)
+            sw_row["Position"] = round(float(cov.sed_obs_height_m), 3)
             sw_row["Sw"] = sweep_code
             rows.append(sw_row)
 
@@ -489,6 +484,106 @@ def build_stem_description_rows(
             rows.append(f_row)
 
     return rows
+
+
+def build_taper_rows(
+    tree_metrics: Sequence[TreeMetrics],
+    section_result: SectionResult,
+    z_start: float = 1.30,
+    z_step: float = 1.0,
+    z_tolerance: float = 0.15,
+) -> List[dict]:
+    """Build per-meter taper rows for the ``Taper`` xlsx sheet.
+
+    Emits one row per tree per target height ``z``, where ``z`` walks
+    from the DBH height (1.30 m default) upward in ``z_step`` (1 m
+    default) increments, aligned to integer-metre values above DBH:
+
+        targets = [1.30, 2.00, 3.00, 4.00, ...] up to the topmost
+        valid section's z.
+
+    For each target, finds the closest section within ``z_tolerance``
+    and records its diameter (mm). The 1 m default matches the
+    operational standard for forestry stem taper sampling — dense
+    enough for Smalian / Huber / Newton volume integration and Kozak /
+    Max-Burkhart taper-function fitting, without inflating the export
+    with per-20 cm noise.
+
+    Output columns: ``Tree_ID, Position_m, Diameter_mm``.
+
+    Parameters
+    ----------
+    tree_metrics : sequence of TreeMetrics
+        Same per-tree order as the rest of the pipeline.
+    section_result : SectionResult
+        Per-section fits in either circle (``R``) or ellipse
+        (``a, b``) mode.
+    z_start : float, default 1.30
+        First target height in metres (DBH convention).
+    z_step : float, default 1.0
+        Spacing between subsequent targets in metres. Set to 0.5 to
+        densify, 2.0 for log-interval spacing.
+    z_tolerance : float, default 0.15
+        Half-window for snapping each target to the closest
+        ``section_result.sections`` entry. With the default 0.2 m
+        sectioning, 0.15 m covers the natural ±0.10 m offset.
+
+    Returns
+    -------
+    list of dict
+        One row per (tree, target) pair where a valid section was
+        found. Trees with no valid sections emit no rows.
+    """
+    import math
+
+    has_ellipse = (
+        section_result.a is not None
+        and section_result.b is not None
+    )
+    sections = np.asarray(section_result.sections, dtype=np.float64)
+
+    rows: List[dict] = []
+    for i, tm in enumerate(tree_metrics):
+        tid = int(tm.tree_id)
+        r_row = section_result.R[i]
+        valid = np.where(r_row > 0.0)[0]
+        if valid.size == 0:
+            continue
+        z_top = float(sections[valid.max()])
+
+        # Build target list: z_start, then integer-metre values above z_start.
+        targets: List[float] = [z_start]
+        zt = float(math.ceil(z_start + 1e-9))
+        while zt <= z_top + 1e-9:
+            targets.append(zt)
+            zt += z_step
+
+        for tgt in targets:
+            diffs = np.abs(sections - tgt)
+            j = int(np.argmin(diffs))
+            if diffs[j] > z_tolerance or r_row[j] <= 0.0:
+                continue
+            if has_ellipse:
+                a_val = float(section_result.a[i, j])  # type: ignore[index]
+                b_val = float(section_result.b[i, j])  # type: ignore[index]
+                d_mm = 2.0 * float(np.sqrt(max(a_val * b_val, 0.0))) * 1000.0
+            else:
+                d_mm = 2.0 * float(r_row[j]) * 1000.0
+            rows.append({
+                "Tree_ID": tid,
+                "Position_m": round(float(tgt), 2),
+                "Diameter_mm": round(d_mm, 1),
+            })
+
+    return rows
+
+
+def taper_to_dataframe(rows: Sequence[dict]):
+    """Convert taper rows to a pandas DataFrame in the canonical
+    column order ``[Tree_ID, Position_m, Diameter_mm]``.
+    """
+    import pandas as pd
+    return pd.DataFrame(rows, columns=["Tree_ID", "Position_m", "Diameter_mm"])
 
 
 def stem_description_to_dataframe(rows: Sequence[dict]):

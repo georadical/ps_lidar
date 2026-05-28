@@ -21,10 +21,12 @@ from src.core.stem_description import (
     _polyline_length_z,
     _topmost_valid_section_index,
     build_stem_description_rows,
+    build_taper_rows,
     classify_sweep,
     compute_coverage_metrics,
     coverage_metrics_to_dataframe,
     stem_description_to_dataframe,
+    taper_to_dataframe,
 )
 from src.core.trunk_validation import SectionResult, StemCleaningConfig
 
@@ -310,23 +312,23 @@ class TestComputeCoverageMetrics:
 # ===========================================================================
 
 class TestBuildStemDescriptionRows:
+    """Sparse-row schema: base + DBH + end-of-zone Sw + optional F.
+    Dense diameter samples live on the separate Taper sheet."""
 
-    def test_per_section_position_rows_and_base_marker(self):
-        # Single tree with 3 valid sections at z = 0.3, 1.3, 2.3
-        # plus 1 invalid section at z = 3.3.
+    def test_sparse_rows_base_dbh_and_endofzone_sweep(self):
+        # Single tree with valid sections at z = 0.3, 1.3, 2.3 (Δz_top=2.3).
         sections = np.array([0.3, 1.3, 2.3, 3.3])
-        a = np.array([[0.15, 0.14, 0.13, 0.0]])  # 0.0 marks the invalid one
+        a = np.array([[0.15, 0.14, 0.13, 0.0]])  # 0.0 marks invalid
         b = np.array([[0.15, 0.14, 0.13, 0.0]])
         sr = _make_section_result([42], sections, a, b)
 
-        tm = _make_tree_metrics(tree_id=42, height_total=2.5)
+        tm = _make_tree_metrics(tree_id=42, height_total=2.5, dbh=0.28)
         cov = CoverageMetrics(
             tree_id=42,
             ht_cloud_m=3.0, ht_stem_m=2.5, rh_obs=0.83,
             dbh_cm=28.0, sed_obs_cm=26.0,
             sed_obs_height_m=2.3, valid_sed=True,
         )
-        # Centerline: 3 nodes, perfectly straight → sweep "8".
         cl = np.array([
             [0.0, 0.0, 0.3],
             [0.0, 0.0, 1.3],
@@ -341,35 +343,32 @@ class TestBuildStemDescriptionRows:
             tree_centerlines=[cl],
         )
 
-        # Expected rows: 1 base marker + 3 position rows + 1 sweep row.
-        assert len(rows) == 5
+        # Expected: base + DBH + Sw end-of-zone = 3 rows (no F since not oval).
+        assert len(rows) == 3
+        assert all(r["PlotId"] == "T_TEST" for r in rows)
+        assert all(r["TreeNumber"] == 42 for r in rows)
 
         # Base marker
-        assert rows[0]["Position"] == 0.0
-        assert np.isnan(rows[0]["Diameter"])
-        assert rows[0]["PlotId"] == "T_TEST"
-        assert rows[0]["TreeNumber"] == 42
-        assert rows[0]["StemNo"] == 0
-        assert rows[0]["Level"] == 0
+        base = rows[0]
+        assert base["Position"] == 0.0
+        assert np.isnan(base["Diameter"])
 
-        # Position rows: 3 valid sections, diameters in mm
-        position_rows = [r for r in rows if not np.isnan(r["Position"])][1:]
-        diameters = sorted(r["Diameter"] for r in position_rows)
-        # Sections 0.3, 1.3, 2.3 with a=b=0.15, 0.14, 0.13 → diameters 300, 280, 260 mm
-        assert diameters == pytest.approx([260.0, 280.0, 300.0], abs=0.1)
+        # DBH row
+        dbh_row = rows[1]
+        assert dbh_row["Position"] == pytest.approx(1.30)
+        assert dbh_row["Diameter"] == pytest.approx(280.0, abs=0.1)
+        assert np.isnan(dbh_row["Sw"]) and np.isnan(dbh_row["F"])
 
-        # Sweep row
-        sw_rows = [r for r in rows if not isinstance(r["Sw"], float)
-                   or not np.isnan(r["Sw"])]
-        assert len(sw_rows) == 1
-        assert sw_rows[0]["Sw"] == "8"
-        assert np.isnan(sw_rows[0]["Position"])
-        assert np.isnan(sw_rows[0]["Diameter"])
+        # End-of-zone Sw row
+        sw_row = rows[2]
+        assert sw_row["Position"] == pytest.approx(2.3)
+        assert sw_row["Sw"] == "8"
+        assert np.isnan(sw_row["Diameter"])
 
     def test_oval_tree_emits_ovality_feature_row(self):
         sections = np.array([1.3])
         a = np.array([[0.20]])
-        b = np.array([[0.20]])  # circle-style; oval flag comes from tree_metrics
+        b = np.array([[0.20]])
         sr = _make_section_result([1], sections, a, b)
 
         tm = _make_tree_metrics(
@@ -391,6 +390,99 @@ class TestBuildStemDescriptionRows:
                   if not (isinstance(r["F"], float) and np.isnan(r["F"]))]
         assert len(f_rows) == 1
         assert f_rows[0]["F"] == "O1.2+"
+
+    def test_invalid_dbh_skips_dbh_row(self):
+        sections = np.array([2.3, 3.3])
+        a = np.array([[0.18, 0.17]])
+        b = np.array([[0.18, 0.17]])
+        sr = _make_section_result([2], sections, a, b)
+
+        tm = _make_tree_metrics(tree_id=2, height_total=3.0)
+        tm.valid_at_dbh = False
+        tm.dbh = 0.0
+        cov = CoverageMetrics(
+            tree_id=2, ht_cloud_m=5.0, ht_stem_m=3.0, rh_obs=0.60,
+            dbh_cm=0.0, sed_obs_cm=34.0, sed_obs_height_m=3.3, valid_sed=True,
+        )
+        cl = np.array([
+            [0.0, 0.0, 2.3],
+            [0.0, 0.0, 2.8],
+            [0.0, 0.0, 3.3],
+        ])
+        rows = build_stem_description_rows(
+            plot_id="P", tree_metrics=[tm], coverage_metrics=[cov],
+            section_result=sr, tree_centerlines=[cl],
+        )
+        # base + Sw end-of-zone (no DBH row, no F)
+        assert len(rows) == 2
+        positions = [r["Position"] for r in rows]
+        assert positions[0] == 0.0
+        assert positions[1] == pytest.approx(3.3)
+
+
+class TestBuildTaperRows:
+
+    def test_targets_dbh_then_integer_meters(self):
+        # Sections every 0.2 m from 0.3 to 5.3 m. Topmost valid at z=5.3.
+        sections = np.round(np.arange(0.3, 5.31, 0.2), 1)
+        n = len(sections)
+        a = np.full((1, n), 0.20)
+        b = np.full((1, n), 0.20)
+        sr = _make_section_result([7], sections, a, b)
+
+        tm = _make_tree_metrics(tree_id=7, height_total=5.0, z_top=5.3)
+        rows = build_taper_rows([tm], sr, z_start=1.30, z_step=1.0)
+
+        positions = [r["Position_m"] for r in rows]
+        # Expected: 1.3, 2.0, 3.0, 4.0, 5.0
+        assert positions == pytest.approx([1.3, 2.0, 3.0, 4.0, 5.0])
+        # All diameters from a=b=0.20 → 400 mm
+        assert all(r["Diameter_mm"] == pytest.approx(400.0, abs=0.1) for r in rows)
+        assert all(r["Tree_ID"] == 7 for r in rows)
+
+    def test_skips_when_no_valid_section_near_target(self):
+        # Only one valid section at 1.3; all others invalid.
+        sections = np.array([0.3, 1.3, 2.3, 3.3])
+        a = np.array([[0.0, 0.20, 0.0, 0.0]])
+        b = np.array([[0.0, 0.20, 0.0, 0.0]])
+        sr = _make_section_result([3], sections, a, b)
+        tm = _make_tree_metrics(tree_id=3, height_total=3.0, z_top=3.3)
+        rows = build_taper_rows([tm], sr, z_start=1.30, z_step=1.0)
+        # Only the DBH target (1.3) finds a valid section.
+        assert len(rows) == 1
+        assert rows[0]["Position_m"] == pytest.approx(1.3)
+
+    def test_no_valid_section_emits_no_rows(self):
+        sections = np.array([0.3, 1.3, 2.3])
+        a = np.zeros((1, 3))
+        b = np.zeros((1, 3))
+        sr = _make_section_result([4], sections, a, b)
+        tm = _make_tree_metrics(tree_id=4, height_total=2.0, z_top=2.3)
+        assert build_taper_rows([tm], sr) == []
+
+    def test_z_step_2m(self):
+        # z_step=2 → targets 1.3, 2.0, 4.0, 6.0 ...
+        sections = np.round(np.arange(0.3, 7.51, 0.2), 1)
+        n = len(sections)
+        a = np.full((1, n), 0.18)
+        b = np.full((1, n), 0.18)
+        sr = _make_section_result([8], sections, a, b)
+        tm = _make_tree_metrics(tree_id=8, height_total=7.0, z_top=7.3)
+        rows = build_taper_rows([tm], sr, z_start=1.30, z_step=2.0)
+        positions = [r["Position_m"] for r in rows]
+        assert positions == pytest.approx([1.3, 2.0, 4.0, 6.0])
+
+
+class TestTaperDataframe:
+
+    def test_columns_in_canonical_order(self):
+        rows = [
+            {"Tree_ID": 1, "Position_m": 1.3, "Diameter_mm": 300.0},
+            {"Tree_ID": 1, "Position_m": 2.0, "Diameter_mm": 290.0},
+        ]
+        df = taper_to_dataframe(rows)
+        assert list(df.columns) == ["Tree_ID", "Position_m", "Diameter_mm"]
+        assert len(df) == 2
 
 
 class TestDataframeConverters:
