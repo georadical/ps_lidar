@@ -291,30 +291,41 @@ in **absolute centimetres (> 5 cm)**, unlike the SED-fraction geometry
 codes — confirmed from the quickcard W panel ("Wobble / Movement Back
 and Forth / > 5 cm", 4 m window).
 
-### Current implementation status (honest)
+### Implementation status
 
-`src/core/stem_description.py::classify_sweep_zones` distinguishes
-`L` from `S` by **length only** (`l_min_length_m`: a SED/5 zone ≥ 5 m
-→ `L`, else `S`). It does **not** inspect direction at all. Consequences:
+**F1.5a (DONE)** — direction-aware L/S split. A new primitive
+`_polyline_direction_metrics` in `src/core/stem_description.py`
+returns `n_bows` (direction reversals on the lateral-offset profile
+with a 1 cm prominence deadband), `max_abs_offset_m`, and
+`max_turn_deg`. `classify_sweep_zones` step 5 now decides L vs S by
+`n_bows` (`≤ 1` → L consistent; `≥ 2` → S back-and-forth) — length is
+no longer the L/S criterion. The metric is computed **once globally
+per centerline** because a back-and-forth pattern manifests as
+multiple SED/5 zones with axis crossings between bows; slicing
+per-zone would always read each zone as monotonic. **S has no maximum
+length** under the Interpine convention — a 10 m back-and-forth stays
+`S`. F1.4 noise-floor minimums still apply in step 6.
 
-- A 7 m **back-and-forth** sweep is mislabelled `L` (should be `S`/`W`).
-- A 4 m **consistent** sweep is mislabelled `S` (should be `L` if ≥ 6 m).
-- `W` and `K` are **not detected**.
+**F1.5b (future)** — `W` and `K` defect-flag detection using the same
+primitive's other outputs:
+- `W` triggers when `n_bows ≥ 2` AND `max_abs_offset_m > 5 cm`
+  (absolute cm, not SED-fraction) over a 4 m window — pulp quality.
+- `K` triggers when `max_turn_deg` exceeds a threshold (e.g. 15-20°).
 
-### The shared primitive (future work — step F1.5)
+`W`, `K`, `X` are **defect flags**, not geometry codes, so they carry
+short / exempt length minimums — a 2 m wobble is a legitimate `W`
+unlike a 2 m `S` which is sub-operational. The sub-operational
+alternating `S/3/S/3/S` cluster F1.4 currently folds into the
+surrounding `8` (tree 11 of T460298B) is the canonical `W` case once
+F1.5b lands.
 
-All four cases need the same missing primitive: **count direction
-reversals (and detect sharp angle changes) along the polyline within a
-window**. Build it once and it (a) corrects the L/S split, (b) detects
-`W` (back-and-forth above 5 cm absolute), and (c) detects `K` (sharp
-change). 
+### Known limitation (F1.5a)
 
-`W`, `K` (like `X`) are **defect flags**, not geometry codes, so they
-carry short / exempt length minimums — a 2 m wobble is a legitimate
-`W`, unlike a 2 m `S` which is sub-operational for a geometry code. The
-sub-operational alternating `S/3/S/3/S` cluster that F1.4 currently
-folds into the surrounding `8` (observed on tree 11 of T460298B) is the
-canonical `W` once this primitive exists.
+The global `n_bows` per centerline assumes one direction character
+per tree. A real tree with a consistent lower-trunk lean AND an
+upper-trunk wobble would be labelled `S` everywhere. In plantation
+radiata pine this single-character assumption holds in practice;
+revisit if real-data shows mixed patterns.
 
 ---
 

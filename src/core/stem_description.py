@@ -272,11 +272,188 @@ def _polyline_length_z(centerline: np.ndarray) -> float:
     return float(z.max() - z.min())
 
 
+# ===========================================================================
+# F1.5 — Direction-pattern primitives (L/S split + future W/K detection)
+# ===========================================================================
+
+def _count_swings(s: np.ndarray, deadband: float) -> int:
+    """Count direction reversals in a 1D profile (zigzag swing count)
+    with a prominence deadband.
+
+    The intuition: walk the profile tracking the running extreme of the
+    current direction. A reversal is registered only when the value
+    has retraced from the running extreme by at least ``deadband``.
+    Tiny jitter (< ``deadband``) is absorbed without spurious swings.
+
+    Used by :func:`_polyline_direction_metrics` to produce ``n_bows`` —
+    the number of bows / direction reversals in a polyline's lateral
+    offset profile. Consistent (single bow) sweeps yield ``n_bows ≤ 1``;
+    back-and-forth (S-curve, camel-back, wave) yields ``n_bows ≥ 2``.
+
+    Parameters
+    ----------
+    s : array_like
+        1D profile of signed values (lateral offset along the dominant
+        sweep direction in our use).
+    deadband : float
+        Minimum retracement required to register a direction reversal,
+        in the same units as ``s`` (typically metres). Set to the
+        polyline noise floor (~1 cm for our centroid jitter).
+
+    Returns
+    -------
+    int
+        Number of direction reversals (swings) detected.
+    """
+    s = np.asarray(s, dtype=np.float64).ravel()
+    if s.size < 3:
+        return 0
+    swings = 0
+    direction = 0  # +1 rising, -1 falling, 0 undetermined
+    pivot = float(s[0])
+    for v_arr in s[1:]:
+        v = float(v_arr)
+        if direction == 0:
+            if v - pivot >= deadband:
+                direction = 1
+                pivot = v
+            elif pivot - v >= deadband:
+                direction = -1
+                pivot = v
+            # else: within deadband; pivot stays where it is so the next
+            # eventual move is measured from the same anchor.
+        elif direction == 1:  # rising
+            if v > pivot:
+                pivot = v  # new high
+            elif pivot - v >= deadband:
+                swings += 1
+                direction = -1
+                pivot = v
+        else:  # direction == -1, falling
+            if v < pivot:
+                pivot = v  # new low
+            elif v - pivot >= deadband:
+                swings += 1
+                direction = 1
+                pivot = v
+    return swings
+
+
+def _max_turn_angle_deg(centerline: np.ndarray) -> float:
+    """Largest turn angle (degrees) between consecutive XY-projected
+    polyline segments.
+
+    Used by :func:`_polyline_direction_metrics` to expose ``max_turn_deg``
+    for future ``K`` (kink) detection in F1.5b.
+    """
+    if centerline.ndim != 2 or centerline.shape[0] < 3:
+        return 0.0
+    xy = centerline[:, :2]
+    segs = np.diff(xy, axis=0)
+    seg_len = np.linalg.norm(segs, axis=1)
+    max_ang = 0.0
+    for i in range(len(segs) - 1):
+        la, lb = float(seg_len[i]), float(seg_len[i + 1])
+        if la < 1e-9 or lb < 1e-9:
+            continue
+        cos_ang = float(np.clip(np.dot(segs[i], segs[i + 1]) / (la * lb), -1.0, 1.0))
+        ang = float(np.degrees(np.arccos(cos_ang)))
+        if ang > max_ang:
+            max_ang = ang
+    return max_ang
+
+
+def _polyline_direction_metrics(
+    centerline: np.ndarray,
+    deadband_m: float = 0.01,
+) -> dict:
+    """Direction-pattern metrics for a centerline polyline (F1.5).
+
+    Used by :func:`classify_sweep_zones` to separate `L` (consistent)
+    from `S` (back-and-forth) within SED/5-amplitude zones, and (in
+    F1.5b) to detect `W` and `K` defect flags.
+
+    Algorithm:
+
+    1. Sort by z (defensive).
+    2. Compute each node's perpendicular offset vector from the
+       base-top chord (3D, lies in the plane ⊥ to axis).
+    3. Reduce to a signed scalar profile by projecting offsets onto
+       the **dominant sweep direction** (first right-singular vector
+       of the offsets matrix — i.e. the PCA principal axis of the
+       2-D-ish offset cloud).
+    4. ``n_bows`` = number of swings in that signed profile via
+       :func:`_count_swings` with a prominence ``deadband_m``.
+    5. ``max_abs_offset_m`` = max |perpendicular offset| (m), the
+       absolute amplitude — used by F1.5b W detection (`> 5 cm`).
+    6. ``max_turn_deg`` = max turn angle between consecutive XY
+       segments — used by F1.5b K detection.
+
+    Returns a dict; safe to call on degenerate polylines (returns
+    zero metrics for fewer than 3 nodes or a degenerate base-top axis).
+
+    Parameters
+    ----------
+    centerline : ndarray of shape (M, 3)
+        Polyline nodes ``(x, y, z)``. Sorted internally by z.
+    deadband_m : float, default 0.01 (1 cm)
+        Prominence floor for the swing count, in metres. Filters out
+        per-section centroid jitter (typically a few mm at section
+        scale) so only real direction changes count as bows.
+
+    Returns
+    -------
+    dict
+        ``{"n_bows": int, "max_abs_offset_m": float, "max_turn_deg": float}``.
+    """
+    zero = {"n_bows": 0, "max_abs_offset_m": 0.0, "max_turn_deg": 0.0}
+    cl = np.asarray(centerline, dtype=np.float64)
+    if cl.ndim != 2 or cl.shape[1] != 3 or cl.shape[0] < 3:
+        return zero
+
+    order = np.argsort(cl[:, 2])
+    cl = cl[order]
+
+    p0 = cl[0]
+    p1 = cl[-1]
+    axis = p1 - p0
+    axis_len_sq = float(np.dot(axis, axis))
+    if axis_len_sq < 1e-18:
+        return zero
+
+    rel = cl - p0
+    t = (rel @ axis) / axis_len_sq
+    closest = p0 + t[:, None] * axis
+    offsets = cl - closest  # (M, 3); each row ⊥ to axis
+
+    offset_norms = np.linalg.norm(offsets, axis=1)
+    max_abs_offset_m = float(offset_norms.max())
+
+    # Signed scalar via PCA dominant direction. For a near-straight
+    # polyline (all offsets ≈ 0) the SVD direction is meaningless but
+    # the projected values are tiny → swing counter returns 0.
+    if max_abs_offset_m < 1e-12:
+        signed = np.zeros(cl.shape[0])
+    else:
+        _, _, vt = np.linalg.svd(offsets, full_matrices=False)
+        u_dir = vt[0]
+        signed = offsets @ u_dir
+
+    n_bows = _count_swings(signed, deadband_m)
+    max_turn_deg = _max_turn_angle_deg(cl)
+
+    return {
+        "n_bows": n_bows,
+        "max_abs_offset_m": max_abs_offset_m,
+        "max_turn_deg": max_turn_deg,
+    }
+
+
 def classify_sweep_zones(
     centerline: Optional[np.ndarray],
     sed_obs_m: float,
-    l_min_length_m: float = 5.0,
     min_zone_length_by_code: Optional[dict] = None,
+    direction_deadband_m: float = 0.01,
 ) -> List[tuple]:
     """Decompose a centerline polyline into Interpine sweep zones via a
     per-node global-chord amplitude classifier (F1.1) with per-code
@@ -312,13 +489,19 @@ def classify_sweep_zones(
        resolved to ``"L"`` or ``"S"`` after coalescing (step 5).
     4. **Coalesce** consecutive same-code nodes into zones
        ``(z_start, z_end, code)``.
-    5. **Resolve LS** by zone length: a SED/5 zone of length
-       ≥ ``l_min_length_m`` (default 5 m) is ``"L"`` (a genuine long-log
-       gentle sweep); a shorter SED/5 zone is **reclassified to** ``"S"``
-       — same amplitude class, but a length that, per the Interpine
-       definition, only supports short logs. This keeps the semantics
-       clean: an ``L`` is never reported below its operative length;
-       sub-5 m SED/5 sweep is what it physically is — an ``S``.
+    5. **Resolve LS by direction pattern** (F1.5a): the Interpine
+       quickcard separates ``L`` from ``S`` by direction, not just
+       length — ``L`` is a gentle sweep in a *consistent single
+       direction*; ``S`` is a gentle sweep *back and forth*. For each
+       SED/5 zone, slice the centerline to that zone's z-range and
+       compute :func:`_polyline_direction_metrics`. The zone is
+       ``"L"`` when ``n_bows ≤ 1`` (straight or single consistent
+       bow) and ``"S"`` when ``n_bows ≥ 2`` (back-and-forth, e.g.
+       S-curve, camel-back, wave). Length is no longer the L/S split
+       criterion — it was a proxy in F1.2-F1.4. ``S`` has no maximum
+       length under the Interpine convention: a long back-and-forth
+       sweep stays ``S``. The F1.4 noise-floor minimum still applies
+       to absorb sub-operational zones in step 6.
     6. **Minimum-zone-length enforcement** (F1.4, cluster-aware noise
        floor): a zone is *short* if its length is below its code's
        operative minimum (``min_zone_length_by_code``); ``X`` is exempt
@@ -359,11 +542,9 @@ def classify_sweep_zones(
       XY direction reversals) or ``K`` (kink — sharp angle change at a
       single segment). Those require shape-pattern detection on the
       polyline, deferred to a future module.
-    - ``L`` vs ``S`` is resolved by zone length only, not by the
-      "consistent direction" vs "back and forth" criterion of the
-      Interpine quickcard (which also needs shape detection). Length is
-      the dominant operative cue for log-merchantability, so the
-      length-based split is a useful approximation.
+    - ``L`` vs ``S`` is direction-aware in F1.5a (``n_bows`` from
+      :func:`_polyline_direction_metrics`), matching the Interpine
+      quickcard's "consistent direction" vs "back and forth" criterion.
 
     Parameters
     ----------
@@ -373,11 +554,13 @@ def classify_sweep_zones(
     sed_obs_m : float
         Topmost-extracted-section diameter in metres. Zero or negative
         returns an empty list.
-    l_min_length_m : float, default 5.0
-        Minimum length for a SED/5 zone to qualify as ``"L"``. Below
-        this it is reclassified to ``"S"``. The Interpine quickcard
-        quotes 6 m for L; 5 m is used as the operative floor (the
-        quickcard lengths are soft per Interpine 2013).
+    direction_deadband_m : float, default 0.01 (1 cm)
+        Prominence floor for :func:`_count_swings` when counting
+        ``n_bows`` in step 5. Filters out per-section centroid jitter
+        (typical at section scale) so only real direction reversals
+        count as bows. 1 cm is well above the centroid noise floor
+        and well below the cm-scale of a genuine sweep, giving a
+        clean L vs S split.
     min_zone_length_by_code : dict, optional
         Per-code operative minimum zone length (m) for the absorption
         pass. Defaults to ``{"8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0,
@@ -454,13 +637,26 @@ def classify_sweep_zones(
         codes_per_node[run_start],
     ))
 
-    # 5. Resolve LS → L (≥ l_min_length_m) or S (reclassified, shorter).
+    # 5. Resolve LS → L (consistent) or S (back-and-forth) by direction.
+    # F1.5a — direction dominates over length. Crucially, a back-and-forth
+    # sweep manifests in the polyline as SEPARATE SED/5 amplitude zones
+    # (one for each bow side) separated by intermediate axis-crossings
+    # (the "8" gaps where the centerline is near the chord). Each
+    # individual SED/5 zone is monotonic by construction (it's a
+    # contiguous run of SED/5 amplitude), so per-zone slicing would
+    # always classify it as L. We therefore compute the direction
+    # metric **once over the whole centerline** and apply the verdict
+    # to all LS zones: a tree's overall sweep character (one consistent
+    # bow vs back-and-forth) is the right unit for the Interpine L/S
+    # distinction. Length is no longer the L/S criterion (it was a
+    # proxy in F1.2-F1.4); the F1.4 noise-floor min still applies in
+    # step 6. S has no maximum length under the Interpine convention.
+    global_dir = _polyline_direction_metrics(
+        cl, deadband_m=direction_deadband_m,
+    )
+    is_back_and_forth = global_dir["n_bows"] >= 2
     zones = [
-        (
-            s, e,
-            ("L" if (e - s) >= l_min_length_m else "S")
-            if c == "LS" else c
-        )
+        (s, e, ("S" if is_back_and_forth else "L") if c == "LS" else c)
         for (s, e, c) in zones
     ]
 

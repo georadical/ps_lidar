@@ -17,7 +17,10 @@ import pytest
 from src.core.dendrometry import TreeMetrics
 from src.core.stem_description import (
     CoverageMetrics,
+    _count_swings,
     _max_deviation_from_baseline,
+    _max_turn_angle_deg,
+    _polyline_direction_metrics,
     _polyline_length_z,
     _topmost_valid_section_index,
     build_stem_description_rows,
@@ -312,6 +315,96 @@ class TestComputeCoverageMetrics:
 # Integration tests — build_stem_description_rows
 # ===========================================================================
 
+class TestCountSwings:
+    """Zigzag swing counter with prominence deadband (F1.5 primitive)."""
+
+    def test_straight_profile_zero_swings(self):
+        assert _count_swings(np.zeros(20), deadband=0.01) == 0
+
+    def test_single_bow_one_swing(self):
+        # Rise to peak, fall back: one direction reversal at the peak.
+        s = np.array([0.0, 3.0, 6.0, 9.0, 6.0, 3.0, 0.0])
+        assert _count_swings(s, deadband=0.01) == 1
+
+    def test_s_curve_two_swings(self):
+        # Bow +, bow −: two reversals (peak and trough).
+        s = np.array([0.0, 5.0, 0.0, -5.0, 0.0])
+        assert _count_swings(s, deadband=0.01) == 2
+
+    def test_deadband_ignores_jitter(self):
+        # Single bow with a 0.5-unit dip on the plateau (the bow itself
+        # peaks at 9 units). The dip is well below the deadband, the
+        # bow excursion is well above → 1 swing, not 3 spurious ones.
+        s = np.array([0.0, 5.0, 9.0, 8.5, 9.0, 5.0, 0.0])
+        assert _count_swings(s, deadband=1.0) == 1
+
+    def test_camel_back_counted(self):
+        # Two peaks on the same side: 0 → 5 → 2 → 8 → 0. Three swings.
+        s = np.array([0.0, 5.0, 2.0, 8.0, 0.0])
+        assert _count_swings(s, deadband=0.01) == 3
+
+    def test_short_input_returns_zero(self):
+        assert _count_swings(np.array([1.0, 2.0]), deadband=0.01) == 0
+
+
+class TestPolylineDirectionMetrics:
+
+    def test_straight_polyline_zero_metrics(self):
+        z = np.linspace(0.0, 10.0, 21)
+        cl = np.column_stack([np.zeros(21), np.zeros(21), z])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] == 0
+        assert m["max_abs_offset_m"] == pytest.approx(0.0, abs=1e-9)
+        assert m["max_turn_deg"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_single_bow_one(self):
+        # Endpoints on axis, a bow in the middle.
+        z = np.linspace(0.0, 10.0, 101)
+        x = np.where((z >= 3.0) & (z <= 7.0), 0.10, 0.0)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] == 1
+        assert m["max_abs_offset_m"] == pytest.approx(0.10, abs=0.005)
+
+    def test_s_curve_two_bows(self):
+        # +x bow then −x bow.
+        z = np.linspace(0.0, 12.0, 121)
+        x = np.zeros_like(z)
+        x[(z >= 2.0) & (z <= 5.0)] = 0.10
+        x[(z >= 7.0) & (z <= 10.0)] = -0.10
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] >= 2
+
+    def test_degenerate_inputs(self):
+        # Fewer than 3 nodes → zero metrics.
+        m = _polyline_direction_metrics(np.zeros((2, 3)))
+        assert m["n_bows"] == 0
+        # Coincident endpoints (axis_len_sq ≈ 0) → zero metrics.
+        cl = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] == 0
+
+
+class TestMaxTurnAngleDeg:
+
+    def test_straight_line_zero(self):
+        cl = np.column_stack([
+            np.zeros(5), np.zeros(5), np.arange(5, dtype=float),
+        ])
+        assert _max_turn_angle_deg(cl) == pytest.approx(0.0, abs=1e-9)
+
+    def test_right_angle_kink(self):
+        # XY path doubles back at a right angle.
+        cl = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 2.0],
+        ])
+        # XY segments: (1,0) then (0,1) → 90° turn.
+        assert _max_turn_angle_deg(cl) == pytest.approx(90.0, abs=1e-6)
+
+
 class TestClassifySweepZones:
     """Zone-aware sliding-window classifier (F1.1)."""
 
@@ -377,11 +470,40 @@ class TestClassifySweepZones:
         assert zones[1][0] == pytest.approx(5.0, abs=0.2)
         assert zones[1][1] == pytest.approx(13.0, abs=0.2)
 
-    def test_short_sed5_zone_reclassified_to_S(self):
-        # SED/5 amplitude (ratio 0.175) over a 4 m plateau → "S"
-        # (4 m < l_min_length_m=5 m, so not "L").
+    def test_consistent_single_bow_is_L_regardless_of_length(self):
+        # F1.5a: a SED/5 plateau (single consistent bow) is L even at
+        # the shortest operative length, because direction (not length)
+        # decides L vs S. Previously this same 4 m plateau was
+        # reclassified to S under the length-only rule.
         z = np.linspace(0.0, 6.0, 121)  # 0.05 m spacing
         x = np.where((z >= 1.0) & (z <= 5.0), 0.035, 0.0)  # 0.035/0.20 = 0.175
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "L" in codes
+        assert "S" not in codes
+
+    def test_back_and_forth_sweep_is_S(self):
+        # F1.5a: an SED/5 S-curve (two bows: +x then -x) is S regardless
+        # of length, because back-and-forth is the defining direction
+        # pattern of S.
+        z = np.linspace(0.0, 8.0, 161)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z < 3.5)] = 0.040   # first bow (+x) → SED/5
+        x[(z >= 4.5) & (z <= 7.0)] = -0.040  # second bow (-x) → SED/5
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "S" in codes
+        assert "L" not in codes
+
+    def test_long_back_and_forth_stays_S(self):
+        # F1.5a: S has no maximum length. A 10 m back-and-forth sweep
+        # is still S, not L.
+        z = np.linspace(0.0, 12.0, 241)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z < 5.0)] = 0.040     # bow 1 (+x), 4 m
+        x[(z >= 6.0) & (z <= 11.0)] = -0.040  # bow 2 (-x), 5 m
         cl = np.column_stack([x, np.zeros_like(z), z])
         zones = classify_sweep_zones(cl, sed_obs_m=0.20)
         codes = [c for (_, _, c) in zones]
