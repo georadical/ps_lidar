@@ -275,19 +275,20 @@ def _polyline_length_z(centerline: np.ndarray) -> float:
 def classify_sweep_zones(
     centerline: Optional[np.ndarray],
     sed_obs_m: float,
-    upgrade_min_section_m: float = 3.0,
-    log_length_threshold_m: float = 6.1,
+    l_min_length_m: float = 5.0,
+    min_zone_length_by_code: Optional[dict] = None,
 ) -> List[tuple]:
     """Decompose a centerline polyline into Interpine sweep zones via a
-    sliding-window local-amplitude classifier (F1.1 algorithm).
+    per-node global-chord amplitude classifier (F1.1) with per-code
+    minimum-length enforcement (F1.2).
 
     This is the zone-aware sibling of :func:`classify_sweep`: where the
     single-code helper reduces the whole stem to one Interpine code by
-    the polyline's global max amplitude, this function walks the
-    polyline with a 4 m window (default) and assigns a code per node,
-    then coalesces consecutive same-code nodes into zones — recovering
-    cases where a 21 m stem labelled ``"1"`` globally actually breaks
-    into something like ``[8 (0-5 m), L (5-12 m), 1 (12-18 m), S (18-21 m)]``.
+    the polyline's global max amplitude, this function assigns a code
+    per node from its distance to the base-top chord, then coalesces
+    consecutive same-code nodes into zones — recovering cases where a
+    21 m stem labelled ``"1"`` globally actually breaks into something
+    like ``[8 (0-5 m), L (5-12 m), 1 (12-18 m), S (18-21 m)]``.
 
     Algorithm (see ``memory/reference_interpine_hqp_codes.md`` for the
     code-to-amplitude mapping it consumes):
@@ -308,17 +309,32 @@ def classify_sweep_zones(
     3. **Per-node code mapping**: ``ratio = amplitude / sed_obs_m``,
        then map to ``"8" / "LS" / "3" / "1" / "X"`` by the same severity
        thresholds as :func:`classify_sweep`. ``"LS"`` is a placeholder
-       resolved to ``"L"`` or ``"S"`` after coalescing, based on zone
-       length (≥ 6.1 m → L, else S).
+       resolved to ``"L"`` or ``"S"`` after coalescing (step 5).
     4. **Coalesce** consecutive same-code nodes into zones
        ``(z_start, z_end, code)``.
-    5. **Upgrade-rule enforcement** (Interpine HQP quickcard): a zone
-       with a *better* code that is shorter than ``upgrade_min_section_m``
-       and is sandwiched between two *worse* zones is **absorbed into
-       the worse neighbour**. The reverse — a short worse zone between
-       two better zones — keeps its worse code (kinks, local defects
-       don't average out). The rule iterates until stable, then
-       same-code zones are merged again.
+    5. **Resolve LS** by zone length: a SED/5 zone of length
+       ≥ ``l_min_length_m`` (default 5 m) is ``"L"`` (a genuine long-log
+       gentle sweep); a shorter SED/5 zone is **reclassified to** ``"S"``
+       — same amplitude class, but a length that, per the Interpine
+       definition, only supports short logs. This keeps the semantics
+       clean: an ``L`` is never reported below its operative length;
+       sub-5 m SED/5 sweep is what it physically is — an ``S``.
+    6. **Minimum-zone-length enforcement** (Interpine HQP upgrade rule,
+       per-code): a zone with a *better* code whose length is below its
+       code's operative minimum (``min_zone_length_by_code``) and is
+       sandwiched between two *worse* zones is **absorbed into the worse
+       neighbour**. The reverse — a short *worse* zone between two
+       better zones — keeps its worse code (kinks, local defects don't
+       average out). The rule iterates until stable, then same-code
+       zones are merged again.
+
+    The per-code minimums are **soft / operational, not normative**.
+    The amplitude thresholds (SED/8, SED/5, SED/3, SED/1) are anchored
+    in MPI's NZ log-grade tolerances; the section lengths come only from
+    Interpine's quickcard, which Interpine itself frames as an
+    operational segregation tool ("choose the option that best
+    segregates"), not a rigid standard. See
+    ``external_references/interpine/sweep_classification_literature_review.md``.
 
     Limitations
     -----------
@@ -339,15 +355,18 @@ def classify_sweep_zones(
         3 nodes returns an empty list.
     sed_obs_m : float
         Topmost-extracted-section diameter in metres. Zero or negative
-        returns an empty list.    upgrade_min_section_m : float, default 3.0
-        Minimum length a better-coded zone must have to survive the
-        upgrade rule. Interpine HQP quickcard: "Only Upgrade Branch
-        or Sweep Class … if > 3 m Section Between Zones of Lower
-        Quality".
-    log_length_threshold_m : float, default 6.1
-        Threshold for splitting the SED/5 amplitude class into ``L``
-        (length ≥ 6.1 m → "OK for logs > 6.1 m") vs ``S`` (length <
-        6.1 m → short-log only).
+        returns an empty list.
+    l_min_length_m : float, default 5.0
+        Minimum length for a SED/5 zone to qualify as ``"L"``. Below
+        this it is reclassified to ``"S"``. The Interpine quickcard
+        quotes 6 m for L; 5 m is used as the operative floor (the
+        quickcard lengths are soft per Interpine 2013).
+    min_zone_length_by_code : dict, optional
+        Per-code operative minimum zone length (m) for the absorption
+        pass. Defaults to ``{"8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0,
+        "1": 2.0}``. ``"X"`` is intentionally absent (min 0) — its
+        definition is a short severe section (0.3-1 m), so it is never
+        absorbed for being short.
 
     Returns
     -------
@@ -355,6 +374,10 @@ def classify_sweep_zones(
         Sorted by ``z_start`` ascending. Each tuple defines a contiguous
         zone of the polyline with its Interpine sweep code.
     """
+    if min_zone_length_by_code is None:
+        min_zone_length_by_code = {
+            "8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0, "1": 2.0,
+        }
     if centerline is None or sed_obs_m <= 0.0:
         return []
     cl = np.asarray(centerline, dtype=np.float64)
@@ -414,17 +437,17 @@ def classify_sweep_zones(
         codes_per_node[run_start],
     ))
 
-    # Resolve LS → L or S by zone length
+    # 5. Resolve LS → L (≥ l_min_length_m) or S (reclassified, shorter).
     zones = [
         (
             s, e,
-            ("L" if (e - s) >= log_length_threshold_m else "S")
+            ("L" if (e - s) >= l_min_length_m else "S")
             if c == "LS" else c
         )
         for (s, e, c) in zones
     ]
 
-    # 5. Upgrade-rule enforcement (iterate to fixed point)
+    # 6. Minimum-zone-length enforcement (per-code, iterate to fixed point)
     severity = {"8": 0, "L": 1, "S": 1, "3": 2, "1": 3, "X": 4}
     safety = 0
     while safety < 20:
@@ -435,13 +458,17 @@ def classify_sweep_zones(
         for k, (s, e, c) in enumerate(zones):
             length = e - s
             sev = severity.get(c, 0)
+            code_min = min_zone_length_by_code.get(c, 0.0)  # X → 0 (exempt)
 
             absorb = False
-            if k > 0 and k < len(zones) - 1 and length < upgrade_min_section_m:
+            if k > 0 and k < len(zones) - 1 and length < code_min:
                 prev_c = zones[k - 1][2]
                 next_c = zones[k + 1][2]
                 prev_sev = severity.get(prev_c, 0)
                 next_sev = severity.get(next_c, 0)
+                # Only a BETTER-than-both-neighbours zone is absorbed (the
+                # upgrade direction). A short WORSE zone keeps its code —
+                # local defects must not be averaged out.
                 if sev < prev_sev and sev < next_sev:
                     worse_code = prev_c if prev_sev >= next_sev else next_c
                     if new_zones and new_zones[-1][2] == worse_code:
