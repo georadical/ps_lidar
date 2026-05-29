@@ -319,22 +319,33 @@ def classify_sweep_zones(
        definition, only supports short logs. This keeps the semantics
        clean: an ``L`` is never reported below its operative length;
        sub-5 m SED/5 sweep is what it physically is — an ``S``.
-    6. **Minimum-zone-length enforcement** (Interpine HQP upgrade rule,
-       per-code): a zone with a *better* code whose length is below its
-       code's operative minimum (``min_zone_length_by_code``) and is
-       sandwiched between two *worse* zones is **absorbed into the worse
-       neighbour**. The reverse — a short *worse* zone between two
-       better zones — keeps its worse code (kinks, local defects don't
-       average out). The rule iterates until stable, then same-code
-       zones are merged again.
+    6. **Minimum-zone-length enforcement** (F1.3, symmetric noise
+       floor): any **non-X** zone shorter than its code's operative
+       minimum (``min_zone_length_by_code``) is **absorbed into the
+       higher-severity neighbour** (worst-wins). Includes boundary
+       zones — a single neighbour is enough to absorb into. Ties are
+       broken by the preceding neighbour for stability. ``X`` is
+       exempt because its 0.3-1 m short-severe definition makes
+       sub-operative length intentional.
+
+       This supersedes the asymmetric F1.2 behaviour that only
+       absorbed *better*-than-both-neighbours zones. The asymmetric
+       rule preserved local defects at any length but produced
+       sub-operational noise zones (0.4 m ``S``, 0.6 m ``3``, etc.)
+       that a PlotSafe operator would never tally. The Interpine
+       upgrade rule's ``> 3 m`` threshold implicitly assumes operative
+       lengths, so sub-operative zones fall outside the framework and
+       are correctly treated as polyline noise. Worked rationale and
+       trade-off in
+       ``external_references/interpine/sweep_classification_literature_review.md``
+       §6.
 
     The per-code minimums are **soft / operational, not normative**.
     The amplitude thresholds (SED/8, SED/5, SED/3, SED/1) are anchored
     in MPI's NZ log-grade tolerances; the section lengths come only from
     Interpine's quickcard, which Interpine itself frames as an
     operational segregation tool ("choose the option that best
-    segregates"), not a rigid standard. See
-    ``external_references/interpine/sweep_classification_literature_review.md``.
+    segregates"), not a rigid standard.
 
     Limitations
     -----------
@@ -447,7 +458,23 @@ def classify_sweep_zones(
         for (s, e, c) in zones
     ]
 
-    # 6. Minimum-zone-length enforcement (per-code, iterate to fixed point)
+    # 6. Minimum-zone-length enforcement (F1.3 symmetric noise floor)
+    # Any non-X zone shorter than its code's minimum length is absorbed
+    # into the higher-severity neighbour (worst-wins). Includes boundary
+    # zones (a single neighbour suffices). X is exempt — its
+    # 0.3-1 m definition makes it the only code whose existence at short
+    # length is intentional.
+    #
+    # F1.3 supersedes the asymmetric F1.2 behaviour (which only absorbed
+    # BETTER-than-both-neighbours zones). The asymmetric rule preserved
+    # localised defects at any length, but produced sub-operational
+    # noise zones (S of 0.4 m, "3" of 0.6 m, etc.) that an operator
+    # would never call out on a PlotSafe tally. The Interpine upgrade
+    # rule itself implicitly assumes operative lengths (its > 3 m
+    # threshold), so sub-operational zones fall outside the framework
+    # and are correctly treated as polyline noise. See
+    # ``external_references/interpine/sweep_classification_literature_review.md``
+    # §6 for the trade-off justification.
     severity = {"8": 0, "L": 1, "S": 1, "3": 2, "1": 3, "X": 4}
     safety = 0
     while safety < 20:
@@ -457,25 +484,28 @@ def classify_sweep_zones(
 
         for k, (s, e, c) in enumerate(zones):
             length = e - s
-            sev = severity.get(c, 0)
             code_min = min_zone_length_by_code.get(c, 0.0)  # X → 0 (exempt)
 
             absorb = False
-            if k > 0 and k < len(zones) - 1 and length < code_min:
-                prev_c = zones[k - 1][2]
-                next_c = zones[k + 1][2]
-                prev_sev = severity.get(prev_c, 0)
-                next_sev = severity.get(next_c, 0)
-                # Only a BETTER-than-both-neighbours zone is absorbed (the
-                # upgrade direction). A short WORSE zone keeps its code —
-                # local defects must not be averaged out.
-                if sev < prev_sev and sev < next_sev:
-                    worse_code = prev_c if prev_sev >= next_sev else next_c
-                    if new_zones and new_zones[-1][2] == worse_code:
+            if length < code_min:
+                # Collect neighbour codes (at most two; one at boundary).
+                candidates = []
+                if k > 0:
+                    pc = zones[k - 1][2]
+                    candidates.append((severity.get(pc, 0), pc))
+                if k < len(zones) - 1:
+                    nc = zones[k + 1][2]
+                    candidates.append((severity.get(nc, 0), nc))
+
+                if candidates:
+                    # Worst-wins: higher severity absorbs. Ties → first
+                    # candidate (prev neighbour) for stability.
+                    target_code = max(candidates, key=lambda t: t[0])[1]
+                    if new_zones and new_zones[-1][2] == target_code:
                         s0, _, _ = new_zones[-1]
-                        new_zones[-1] = (s0, e, worse_code)
+                        new_zones[-1] = (s0, e, target_code)
                     else:
-                        new_zones.append((s, e, worse_code))
+                        new_zones.append((s, e, target_code))
                     absorb = True
                     any_change = True
 

@@ -137,40 +137,79 @@ applies after the upgrade-rule pass to absorb noise-length zones into
 their higher-severity neighbour. The defaults are tunable per plot if
 operator calibration warrants.
 
-## 6. Asymmetric absorption rule — justification
+## 6. Symmetric noise-floor absorption rule — justification
 
 The zonal classifier (`classify_sweep_zones`) enforces minimum zone
-lengths **asymmetrically**:
+lengths **symmetrically** (F1.3, supersedes the F1.2 asymmetric rule):
 
-> **Only a zone that is BETTER than both its neighbours AND shorter
-> than its code's minimum length is absorbed (into the worse
-> neighbour). A WORSE zone keeps its code at any length — local defects
-> are never averaged out.**
+> **Any non-X zone shorter than its code's operative minimum is absorbed
+> into the higher-severity neighbour (worst-wins). Boundary zones — a
+> single neighbour — are absorbed too. `X` is exempt; its 0.3-1 m
+> short-severe definition is intrinsic.**
 
-### Why asymmetric — the source
+### From asymmetric (F1.2) to symmetric (F1.3) — what changed and why
 
-The Interpine HQP quickcard's **UPGRADE RULES** box states verbatim:
+The earlier F1.2 rule was asymmetric: only *better*-than-both-neighbours
+zones were absorbed (the upgrade direction), under the binding-constraint
+principle that "defects don't average out". A literal reading of the
+Interpine HQP quickcard's UPGRADE RULES box supports this:
 
 > "Only Upgrade Branch or Sweep Class (to **Smaller Branch Class or
 > Better Sweep Code**) if > 3 m Section Between Zones of Lower Quality."
 >
 > — *HQP Quickcard LiDAR pt 1.pdf*, UPGRADE RULES box.
 
-The rule is explicitly **one-directional**: the length gate applies
-only when *upgrading* (claiming a better/smaller code). It says nothing
-about downgrading — because a defect does not need a minimum length to
-count. This is the standard log-grading **binding-constraint
-principle**: a log is graded by its *worst* feature within the grading
-length, so a short stretch of worse sweep degrades the section, while a
-short stretch of better sweep cannot rescue it.
+The rule explicitly gates only *upgrades*; it says nothing about
+downgrades. F1.2 read that as "a worse zone keeps its code at any
+length".
 
-The recovery literature supports preserving short defects: sweep
-materially reduces sawn-timber recovery (straight 57.9 %, moderate
-52.0 %, severe 46.1 % — Cown et al. 1984, *NZJFS* 14(1):109-123;
-~7 % loss per 0.1 increase in sweep:diameter ratio — Ivković et al.
-2007, *Australian Forestry* 70(3):173-184). Averaging a short moderate
-or severe section into a surrounding "clean" code would overstate grade
-and risk placing defective wood in a high-value log.
+The first run on real-plot data (T460298B, 51 trees, 223 sweep zones)
+revealed the literal-asymmetric reading produces too much sub-operative
+noise: **131 / 223 zones (59 %)** were below their code minimum, almost
+all of them worse-than-neighbour zones preserved by the asymmetric rule:
+
+```
+Code   Violations / total   Median zone length
+S      52 / 69              1.6 m
+8      58 / 99              3.5 m
+3      20 / 38              2.6 m
+1       1 / 10              4.9 m
+```
+
+A field operator producing a PlotSafe stem tally would never call out a
+0.4-1 m S zone or a 0.6 m "3" zone — they sit below the operational
+resolution of the manual cruising protocol. The Interpine upgrade rule's
+**> 3 m threshold itself implicitly assumes operative lengths**: zones
+below 3 m are outside the framework rather than zones whose downgrade
+status the rule chooses to ignore.
+
+The F1.3 rule reinterprets the principle:
+
+> "Defects don't average out" applies **only to defects at operative
+> length** (≥ the code's minimum). Sub-operative zones are polyline
+> noise — at the polyline sampling resolution (0.2 m per node from the
+> 0.2 m section step), a 0.4-2 m zone is 2-10 nodes, well below the
+> stability threshold for amplitude classification. They are absorbed
+> into the surrounding code rather than preserved as defects.
+
+Real defects (≥ code minimum) are still preserved by construction — a
+3 m "3" or a 4 m "1" sits at its minimum and is not subject to absorption.
+Recovery-loss literature (Cown et al. 1984; Ivković et al. 2007) still
+matters at operative lengths but the data the operator can act on starts
+at those lengths anyway.
+
+### Absorption direction — worst-wins (conservative)
+
+When a short zone has two neighbours, the **higher-severity** code wins:
+the short zone is replaced with the worse neighbour's code. Ties (same
+severity on both sides) resolve to the preceding neighbour for stability.
+At a boundary (one neighbour) the short zone absorbs into that single
+neighbour regardless of severity.
+
+This is the *conservative* direction: if the algorithm cannot resolve
+a sub-operative zone, it errs toward the worse code, never artificially
+upgrading. The cascade behaviour (absorbed zones can shift their former
+neighbour's situation) is allowed to iterate to a fixed point.
 
 ### Worked examples
 
@@ -178,41 +217,51 @@ Severity order (best → worst): `8 < L = S < 3 < 1 < X`.
 Per-code minimum lengths: `8: 4 m, L: 4 m, S: 4 m, 3: 3 m, 1: 2 m`;
 `X` exempt.
 
-**Example A — better zone absorbed (upgrade direction, gated):**
+**Example A — short better zone absorbed (boundary):**
 Input zones `[1 (0-3 m), 8 (3-4 m), 1 (4-9 m)]`.
-- The `8` is 1 m, **better** than both `1` neighbours.
-- To *claim* an `8` (gun-barrel straight) requires ≥ 4 m. 1 m < 4 m.
-- → absorbed into the worse neighbour → `[1 (0-9 m)]`.
-- *Forestry reading*: a 1 m straight blip inside a sweepy stem does not
+- The `8` is 1 m. Worst-neighbour wins → `1`.
+- → `[1 (0-9 m)]`.
+- *Forestry reading*: a 1 m straight blip in a sweepy stem does not
   yield a merchantable straight log; the section is operationally `1`.
 
-**Example B — worse zone preserved (downgrade direction, NOT gated):**
-Input zones `[8 (0-4 m), 3 (4-6 m), 8 (6-10 m)]`.
-- The `3` is 2 m, **worse** than both `8` neighbours.
-- The upgrade rule does not apply (this is not an upgrade).
-- → the 2 m `3` **stays**, even though 2 m < its 3 m minimum →
-  `[8 (0-4 m), 3 (4-6 m), 8 (6-10 m)]`.
-- *Forestry reading*: a 2 m moderate-sweep defect is real; hiding it
-  would overstate quality and could route bad wood into a high grade.
-- Covered by `tests/test_stem_description.py::TestClassifySweepZones::
-  test_short_worse_zone_preserved`.
+**Example B — short worse zone absorbed (the F1.3 change vs F1.2):**
+Input zones `[8 (0-5 m), 3 (5-7 m), 8 (7-12 m)]`.
+- The `3` is 2 m, below its 3 m minimum. Both neighbours `8` (sev 0).
+- Worst-neighbour wins → `8`. Absorbed.
+- → `[8 (0-12 m)]`.
+- *Forestry reading*: a 2 m moderate-sweep defect sits below the
+  operative resolution of the tally; the operator would call out the
+  whole 12 m as a clean `8`.
+- Covered by
+  `tests/test_stem_description.py::TestClassifySweepZones::
+  test_short_worse_zone_absorbed_symmetrically`.
 
-**Example C — reclassification within the same amplitude class:**
+**Example C — short boundary zone absorbed:**
+Input zones `[8 (0-1 m), L (1-7 m), 8 (7-8 m)]`.
+- Both `8` caps are 1 m, single-neighbour boundary, < 4 m min.
+- Single neighbour L (sev 1). Absorbed.
+- → `[L (0-8 m)]`.
+- *Forestry reading*: the boundary `8` caps are chord-endpoint
+  artifacts of the global-chord amplitude metric, not real clean
+  sections. Filtering them out matches the operator's call.
+- Covered by `test_short_zone_at_boundary_absorbed`.
+
+**Example D — reclassification within the same amplitude class
+(unchanged from F1.2):**
 A SED/5 zone of 4 m (ratio in (1/8, 1/5]).
-- Not an upgrade or downgrade — same amplitude class.
+- Not an absorption — same amplitude class.
 - `L` requires ≥ 5 m (long-log capable). 4 m < 5 m → relabelled `S`.
-- Not absorbed into a neighbour; just renamed to the code that matches
-  its length (`S` = short-log gentle sweep).
+- Just renamed to the code that matches its length.
 - Covered by `test_short_sed5_zone_reclassified_to_S`.
 
-### Edge case — boundary zones
-
-A short zone at the very base or top of the stem has only one neighbour,
-so the "between two worse zones" condition cannot be satisfied; it is
-never absorbed. This is deliberate — there is no second side to confirm
-the surrounding quality. Covered implicitly by
-`test_min_length_absorbs_short_better_zone_between_worse` (the boundary
-`8` zones survive while the central one is absorbed).
+**Example E — exempt severe section:**
+Input zones `[8 (0-5 m), X (5-5.5 m), 8 (5.5-10 m)]`.
+- `X` is exempt from the length floor.
+- → preserved exactly: `[8 (0-5 m), X (5-5.5 m), 8 (5.5-10 m)]`.
+- *Forestry reading*: the `X` code is **defined** for 0.3-1 m severe
+  sections; the operator calls these out specifically because they
+  prevent a log from being placed on a truck.
+- Covered by `test_short_X_zone_preserved`.
 
 ### Future normative-traceability hook
 

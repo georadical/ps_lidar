@@ -357,23 +357,25 @@ class TestClassifySweepZones:
         assert zones[-1][2] == "8"
 
     def test_min_length_absorbs_short_better_zone_between_worse(self):
-        # Two "1" bows bracketing a 1 m gap that looks like "8" locally.
-        # The "8" gap (1 m < default min 4 m) is sandwiched between two
-        # worse "1" zones → absorbed. Endpoints on the stem axis (x=0).
-        z = np.linspace(0.0, 10.0, 101)  # 0.1 m spacing
+        # F1.3: a 1 m "8" gap between two "1" bows is below its 4 m min
+        # and absorbs into the surrounding "1". Boundary "8" zones in
+        # this layout are kept long enough (5 m each) to exceed the
+        # "8" minimum and survive.
+        z = np.linspace(0.0, 18.0, 181)  # 0.1 m spacing
         x = np.zeros_like(z)
-        x[(z >= 2.0) & (z < 4.5)] = 0.20   # first bow → "1"
-        x[(z > 5.5) & (z <= 8.0)] = 0.20   # second bow → "1"
+        x[(z >= 5.0) & (z < 8.0)] = 0.20   # first bow → "1" (3 m)
+        x[(z > 9.0) & (z <= 13.0)] = 0.20  # second bow → "1" (4 m)
         cl = np.column_stack([x, np.zeros_like(z), z])
 
         zones = classify_sweep_zones(cl, sed_obs_m=0.20)
         codes = [c for (_, _, c) in zones]
-        # Central "8" gap absorbed; boundary "8" zones stay (boundary
-        # zones are never absorbed — only one neighbour).
+        # Central "8" gap (1 m) absorbed into "1"; boundary "8" zones
+        # (5 m each) exceed the 4 m min and survive.
         assert codes == ["8", "1", "8"]
         assert zones[1][2] == "1"
-        assert zones[1][0] == pytest.approx(2.0, abs=0.2)
-        assert zones[1][1] == pytest.approx(8.0, abs=0.2)
+        # Central "1" zone now spans both bows + the absorbed gap
+        assert zones[1][0] == pytest.approx(5.0, abs=0.2)
+        assert zones[1][1] == pytest.approx(13.0, abs=0.2)
 
     def test_short_sed5_zone_reclassified_to_S(self):
         # SED/5 amplitude (ratio 0.175) over a 4 m plateau → "S"
@@ -396,21 +398,39 @@ class TestClassifySweepZones:
         assert "L" in codes
         assert "S" not in codes
 
-    def test_short_worse_zone_preserved(self):
-        # A 2 m "3" defect between two "8" zones stays "3" even though
-        # 2 m < its 3 m min — worse zones are never averaged out.
-        z = np.linspace(0.0, 10.0, 201)  # 0.05 m spacing
-        x = np.where((z >= 4.0) & (z <= 6.0), 0.05, 0.0)  # 0.05/0.20 = 0.25 → "3"
+    def test_short_worse_zone_absorbed_symmetrically(self):
+        # F1.3: a 2 m "3" between two ample "8" zones (5 m each, above
+        # the 4 m min) is below its 3 m min and absorbs into the
+        # surrounding "8", collapsing to a single "8" over the stem.
+        # Supersedes the F1.2 asymmetric preserve-defects behaviour.
+        z = np.linspace(0.0, 12.0, 241)  # 0.05 m spacing
+        x = np.where((z >= 5.0) & (z <= 7.0), 0.05, 0.0)  # 0.05/0.20 = 0.25 → "3"
         cl = np.column_stack([x, np.zeros_like(z), z])
         zones = classify_sweep_zones(cl, sed_obs_m=0.20)
         codes = [c for (_, _, c) in zones]
-        assert codes == ["8", "3", "8"]
-        # Central "3" preserved at ~2 m length
-        assert zones[1][2] == "3"
-        assert (zones[1][1] - zones[1][0]) == pytest.approx(2.0, abs=0.2)
+        assert codes == ["8"]
+        assert zones[0][0] == pytest.approx(0.0, abs=0.1)
+        assert zones[0][1] == pytest.approx(12.0, abs=0.1)
+
+    def test_short_zone_at_boundary_absorbed(self):
+        # F1.3: a short zone at the polyline boundary (single neighbour)
+        # is absorbed into that neighbour. Polyline has tiny "8" caps
+        # at base and top with a long L plateau in between; the caps
+        # should disappear, leaving a single L zone over the polyline.
+        z = np.linspace(0.0, 8.0, 161)
+        x = np.where((z >= 1.0) & (z <= 7.0), 0.040, 0.0)  # 0.04/0.20 = 0.20 → "LS" → "L" (6 m)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # Boundary "8" caps (1 m each, < 4 m min, single neighbour L)
+        # absorbed → single L zone over the whole polyline.
+        assert codes == ["L"]
+        assert zones[0][0] == pytest.approx(0.0, abs=0.1)
+        assert zones[0][1] == pytest.approx(8.0, abs=0.1)
 
     def test_short_X_zone_preserved(self):
-        # A 0.5 m severe "X" section is exempt from the length floor.
+        # X stays exempt from the length floor — its 0.3-1 m
+        # short-severe definition is intrinsic.
         z = np.linspace(0.0, 10.0, 201)
         x = np.where((z >= 4.75) & (z <= 5.25), 0.25, 0.0)  # 0.25/0.20 = 1.25 → "X"
         cl = np.column_stack([x, np.zeros_like(z), z])
