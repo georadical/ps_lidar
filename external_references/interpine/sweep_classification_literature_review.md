@@ -137,6 +137,83 @@ applies after the upgrade-rule pass to absorb noise-length zones into
 their higher-severity neighbour. The defaults are tunable per plot if
 operator calibration warrants.
 
+## 6. Asymmetric absorption rule — justification
+
+The zonal classifier (`classify_sweep_zones`) enforces minimum zone
+lengths **asymmetrically**:
+
+> **Only a zone that is BETTER than both its neighbours AND shorter
+> than its code's minimum length is absorbed (into the worse
+> neighbour). A WORSE zone keeps its code at any length — local defects
+> are never averaged out.**
+
+### Why asymmetric — the source
+
+The Interpine HQP quickcard's **UPGRADE RULES** box states verbatim:
+
+> "Only Upgrade Branch or Sweep Class (to **Smaller Branch Class or
+> Better Sweep Code**) if > 3 m Section Between Zones of Lower Quality."
+>
+> — *HQP Quickcard LiDAR pt 1.pdf*, UPGRADE RULES box.
+
+The rule is explicitly **one-directional**: the length gate applies
+only when *upgrading* (claiming a better/smaller code). It says nothing
+about downgrading — because a defect does not need a minimum length to
+count. This is the standard log-grading **binding-constraint
+principle**: a log is graded by its *worst* feature within the grading
+length, so a short stretch of worse sweep degrades the section, while a
+short stretch of better sweep cannot rescue it.
+
+The recovery literature supports preserving short defects: sweep
+materially reduces sawn-timber recovery (straight 57.9 %, moderate
+52.0 %, severe 46.1 % — Cown et al. 1984, *NZJFS* 14(1):109-123;
+~7 % loss per 0.1 increase in sweep:diameter ratio — Ivković et al.
+2007, *Australian Forestry* 70(3):173-184). Averaging a short moderate
+or severe section into a surrounding "clean" code would overstate grade
+and risk placing defective wood in a high-value log.
+
+### Worked examples
+
+Severity order (best → worst): `8 < L = S < 3 < 1 < X`.
+Per-code minimum lengths: `8: 4 m, L: 4 m, S: 4 m, 3: 3 m, 1: 2 m`;
+`X` exempt.
+
+**Example A — better zone absorbed (upgrade direction, gated):**
+Input zones `[1 (0-3 m), 8 (3-4 m), 1 (4-9 m)]`.
+- The `8` is 1 m, **better** than both `1` neighbours.
+- To *claim* an `8` (gun-barrel straight) requires ≥ 4 m. 1 m < 4 m.
+- → absorbed into the worse neighbour → `[1 (0-9 m)]`.
+- *Forestry reading*: a 1 m straight blip inside a sweepy stem does not
+  yield a merchantable straight log; the section is operationally `1`.
+
+**Example B — worse zone preserved (downgrade direction, NOT gated):**
+Input zones `[8 (0-4 m), 3 (4-6 m), 8 (6-10 m)]`.
+- The `3` is 2 m, **worse** than both `8` neighbours.
+- The upgrade rule does not apply (this is not an upgrade).
+- → the 2 m `3` **stays**, even though 2 m < its 3 m minimum →
+  `[8 (0-4 m), 3 (4-6 m), 8 (6-10 m)]`.
+- *Forestry reading*: a 2 m moderate-sweep defect is real; hiding it
+  would overstate quality and could route bad wood into a high grade.
+- Covered by `tests/test_stem_description.py::TestClassifySweepZones::
+  test_short_worse_zone_preserved`.
+
+**Example C — reclassification within the same amplitude class:**
+A SED/5 zone of 4 m (ratio in (1/8, 1/5]).
+- Not an upgrade or downgrade — same amplitude class.
+- `L` requires ≥ 5 m (long-log capable). 4 m < 5 m → relabelled `S`.
+- Not absorbed into a neighbour; just renamed to the code that matches
+  its length (`S` = short-log gentle sweep).
+- Covered by `test_short_sed5_zone_reclassified_to_S`.
+
+### Edge case — boundary zones
+
+A short zone at the very base or top of the stem has only one neighbour,
+so the "between two worse zones" condition cannot be satisfied; it is
+never absorbed. This is deliberate — there is no second side to confirm
+the surrounding quality. Covered implicitly by
+`test_min_length_absorbs_short_better_zone_between_worse` (the boundary
+`8` zones survive while the central one is absorbed).
+
 ### Future normative-traceability hook
 
 A derived `MPI_grade` column on each 6 m log window of the stem
