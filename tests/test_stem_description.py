@@ -510,6 +510,99 @@ class TestClassifySweepZones:
         assert "S" in codes
         assert "L" not in codes
 
+    def test_back_and_forth_high_amplitude_is_W(self):
+        # F1.5b: back-and-forth + max amplitude > 5 cm absolute → W
+        # (pulp quality), not S. Uses SED=0.30 so that an absolute
+        # amplitude of 5.5 cm still falls in the SED/5 bin (ratio
+        # 0.183 < 1/5), letting the W upgrade fire on LS zones.
+        z = np.linspace(0.0, 12.0, 241)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z < 5.0)] = 0.055      # 5.5 cm +x bow
+        x[(z >= 6.0) & (z <= 11.0)] = -0.055   # 5.5 cm −x bow
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.30)
+        codes = [c for (_, _, c) in zones]
+        assert "W" in codes
+        assert "S" not in codes
+
+    def test_back_and_forth_low_amplitude_stays_S(self):
+        # F1.5b: back-and-forth but max amplitude ≤ 5 cm → S (not W).
+        # Amplitude 4 cm < 5 cm floor.
+        z = np.linspace(0.0, 12.0, 241)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z < 5.0)] = 0.04      # 4 cm +x bow
+        x[(z >= 6.0) & (z <= 11.0)] = -0.04   # 4 cm −x bow
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "S" in codes
+        assert "W" not in codes
+
+    def test_K_detected_at_sharp_turn(self):
+        # F1.5b: a polyline with a sharp XY direction change at z≈5 m
+        # gets a K zone around that height. Build two straight
+        # segments meeting at 90°; the first runs in (+x, +z), the
+        # second in (+y, +z). Avoid duplicate nodes at the kink so the
+        # surrounding segments aren't degenerate.
+        z1 = np.linspace(0.0, 4.9, 50)         # excludes 5.0
+        z2 = np.linspace(5.0, 10.0, 51)
+        cl1 = np.column_stack([z1, np.zeros(50), z1])
+        cl2 = np.column_stack([np.full(51, 5.0), z2 - 5.0, z2])
+        cl = np.vstack([cl1, cl2])
+        # SED large so lateral offsets don't dominate amplitude bins;
+        # we're testing K (per-segment angle), not the sweep amplitude.
+        zones = classify_sweep_zones(cl, sed_obs_m=50.0)
+        codes = [c for (_, _, c) in zones]
+        assert "K" in codes
+        # K zone(s) should be short — ~0.5 m window around the kink.
+        k_lengths = [e - s for (s, e, c) in zones if c == "K"]
+        assert any(0.3 <= L <= 0.7 for L in k_lengths)
+
+    def test_no_K_when_turn_below_threshold(self):
+        # F1.5b: a gentle turn (< 15° default) does not produce K.
+        z = np.linspace(0.0, 10.0, 101)
+        x = np.where(z < 5.0, 0.0, 0.5 * (z - 5.0) / 5.0)
+        # Slope = 0.1 (rise 0.5 over 5) → ~5.7° turn at z=5. Well under 15°.
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=2.0)  # SED large
+        codes = [c for (_, _, c) in zones]
+        assert "K" not in codes
+
+    def test_K_exempt_from_length_absorption(self):
+        # F1.5b: a K zone (intrinsically ~0.5 m) is exempt — never
+        # absorbed into a longer neighbour even though 0.5 m < 4 m min.
+        z1 = np.linspace(0.0, 4.9, 50)
+        z2 = np.linspace(5.0, 10.0, 51)
+        cl1 = np.column_stack([z1, np.zeros(50), z1])
+        cl2 = np.column_stack([np.full(51, 5.0), z2 - 5.0, z2])
+        cl = np.vstack([cl1, cl2])
+        zones = classify_sweep_zones(cl, sed_obs_m=50.0)
+        codes = [c for (_, _, c) in zones]
+        # K must survive even though its length (~0.5 m) is below the
+        # typical code minimums (8/L/S = 4 m, 3 = 3 m, 1 = 2 m).
+        assert "K" in codes
+
+    def test_W_severity_above_3_below_1(self):
+        # F1.5b: a short cluster of "8" between a "W" anchor and a "1"
+        # anchor absorbs into "1" (the worst). Confirms W severity < 1.
+        z = np.linspace(0.0, 14.0, 281)
+        x = np.zeros_like(z)
+        # Left: W-character body (back-and-forth high amp), z 0-5.
+        x[(z >= 0.5) & (z < 2.5)] = 0.07      # +7cm
+        x[(z >= 2.5) & (z < 5.0)] = -0.07     # −7cm
+        # Middle gap z 5-6 (1 m of straight → "8")
+        # Right: stable "1" body z 6-10 (SED/1 amplitude)
+        x[(z >= 6.0) & (z < 10.0)] = 0.12     # 0.12 / 0.20 = 0.6 → "1"
+        # z 10-14 returns to axis ("8" tail)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # The whole polyline is back-and-forth (W on the left, 1 in the
+        # middle, axis on the right) — global verdict is W for LS-amp
+        # zones. The 1 m central "8" gap, sandwiched between a W anchor
+        # (sev 3) and a "1" anchor (sev 4), absorbs into "1" — the worst.
+        assert "1" in codes
+
     def test_long_sed5_zone_is_L(self):
         # Same SED/5 amplitude but a 6 m plateau (≥ 5 m) → "L".
         z = np.linspace(0.0, 8.0, 161)  # 0.05 m spacing

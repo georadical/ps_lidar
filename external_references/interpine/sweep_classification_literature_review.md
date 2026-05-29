@@ -306,26 +306,38 @@ per-zone would always read each zone as monotonic. **S has no maximum
 length** under the Interpine convention — a 10 m back-and-forth stays
 `S`. F1.4 noise-floor minimums still apply in step 6.
 
-**F1.5b (future)** — `W` and `K` defect-flag detection using the same
-primitive's other outputs:
-- `W` triggers when `n_bows ≥ 2` AND `max_abs_offset_m > 5 cm`
-  (absolute cm, not SED-fraction) over a 4 m window — pulp quality.
-- `K` triggers when `max_turn_deg` exceeds a threshold (e.g. 15-20°).
+**F1.5b (DONE)** — `W` and `K` detection wired in:
+- `W` upgrade in step 5: a back-and-forth verdict (`n_bows ≥ 2`)
+  with `max_abs_offset_m > 5 cm` (absolute, not SED-fraction) becomes
+  `W` instead of `S`. Reported in the `Sw` column at the same level
+  as `8 / L / S / 3 / 1 / X`.
+- `K` detection in step 3.5: per-segment XY turn-angle scan; nodes
+  whose adjacent segments meet at > 15° (default) get their codes
+  overridden to `K` within ± 0.25 m → ~ 0.5 m K zones after coalesce
+  (matches the quickcard's "Max 0.5 m" reference).
+- Severity ordering (Jorge's quickcard mapping): sawmill quality
+  `8 < L = S < 3` above the "Generally Pulp Quality" line; pulp
+  quality `W = K < 1 < X` below.
+- Min zone lengths: `W: 2 m` (defect-flag short min — not the
+  quickcard's 4 m observational window). `K` and `X` exempt from
+  the length floor (intrinsic short defect flags, always treated as
+  stable in `_is_stable`).
 
-`W`, `K`, `X` are **defect flags**, not geometry codes, so they carry
-short / exempt length minimums — a 2 m wobble is a legitimate `W`
-unlike a 2 m `S` which is sub-operational. The sub-operational
-alternating `S/3/S/3/S` cluster F1.4 currently folds into the
-surrounding `8` (tree 11 of T460298B) is the canonical `W` case once
-F1.5b lands.
-
-### Known limitation (F1.5a)
+### Known limitations (F1.5a + F1.5b)
 
 The global `n_bows` per centerline assumes one direction character
 per tree. A real tree with a consistent lower-trunk lean AND an
-upper-trunk wobble would be labelled `S` everywhere. In plantation
-radiata pine this single-character assumption holds in practice;
-revisit if real-data shows mixed patterns.
+upper-trunk wobble would be labelled `S` (or `W`) everywhere. In
+plantation radiata pine this single-character assumption holds in
+practice; revisit if real-data shows mixed patterns.
+
+The sub-operational alternating `S/3/S/3/S` cluster on tree 11 of
+T460298B (2 m of back-and-forth fragmented into S and 3 sub-zones)
+is the textbook `W` case but is **not** captured yet — its sub-zones
+are individually below their own mins and F1.4 absorbs the whole
+cluster into the surrounding `8`. Capturing it as `W` would require
+a region-merging pass that groups adjacent sweep zones into a single
+defect zone before applying the W test (F1.5c, future).
 
 ---
 

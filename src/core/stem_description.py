@@ -454,6 +454,9 @@ def classify_sweep_zones(
     sed_obs_m: float,
     min_zone_length_by_code: Optional[dict] = None,
     direction_deadband_m: float = 0.01,
+    w_amplitude_floor_m: float = 0.05,
+    k_angle_threshold_deg: float = 15.0,
+    k_zone_half_width_m: float = 0.25,
 ) -> List[tuple]:
     """Decompose a centerline polyline into Interpine sweep zones via a
     per-node global-chord amplitude classifier (F1.1) with per-code
@@ -545,6 +548,14 @@ def classify_sweep_zones(
     - ``L`` vs ``S`` is direction-aware in F1.5a (``n_bows`` from
       :func:`_polyline_direction_metrics`), matching the Interpine
       quickcard's "consistent direction" vs "back and forth" criterion.
+    - F1.5b adds ``W`` (back-and-forth with absolute amplitude > 5 cm,
+      pulp quality) and ``K`` (sharp XY direction change). Both are
+      reported in the ``Sw`` column at the same level as 8/L/S/3/1/X.
+      Severity sits between ``3`` and ``1``: per Jorge's quickcard
+      mapping, sawmill-quality codes (``8 / L / S / 3``) sit above the
+      "Generally Pulp Quality" line and pulp-quality codes
+      (``W / K / 1 / X``) below it. ``K`` is intrinsically a point
+      defect (~0.5 m, like ``X``) and is exempt from the length floor.
 
     Parameters
     ----------
@@ -561,12 +572,30 @@ def classify_sweep_zones(
         count as bows. 1 cm is well above the centroid noise floor
         and well below the cm-scale of a genuine sweep, giving a
         clean L vs S split.
+    w_amplitude_floor_m : float, default 0.05 (5 cm)
+        Absolute-amplitude floor (m) for upgrading a back-and-forth
+        verdict from ``S`` to ``W`` in step 5. Matches the Interpine
+        quickcard's "> 5 cm" rule for wobble (pulp quality). Note this
+        is an **absolute** centimetres threshold, distinct from the
+        SED-fraction amplitudes used for 8/L/S/3/1/X.
+    k_angle_threshold_deg : float, default 15.0
+        Per-segment turn-angle threshold (deg) for K detection in step
+        3.5. Set ≤ 0 to disable K detection. 15° is a noticeable
+        change-of-direction without being extreme; tune up if real
+        data shows spurious K firings on natural curvature.
+    k_zone_half_width_m : float, default 0.25
+        Half-width (m) of the K override window centred on a detected
+        kink — resulting K zones are ~ 2 × this value (~ 0.5 m by
+        default), matching the quickcard's "Max 0.5 m" reference.
     min_zone_length_by_code : dict, optional
         Per-code operative minimum zone length (m) for the absorption
         pass. Defaults to ``{"8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0,
-        "1": 2.0}``. ``"X"`` is intentionally absent (min 0) — its
-        definition is a short severe section (0.3-1 m), so it is never
-        absorbed for being short.
+        "W": 2.0, "K": 0.0, "1": 2.0}``. ``"X"`` is intentionally
+        absent (min 0). ``X`` and ``K`` are defect-flag codes and are
+        always treated as stable (never absorbed for being short).
+        ``W`` carries a short defect-flag minimum (2 m, not the
+        quickcard's 4 m observational window) per the user-confirmed
+        treatment of W as a pulp-quality flag.
 
     Returns
     -------
@@ -576,7 +605,14 @@ def classify_sweep_zones(
     """
     if min_zone_length_by_code is None:
         min_zone_length_by_code = {
-            "8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0, "1": 2.0,
+            "8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0,
+            # W is a defect flag (pulp quality); user spec — short min
+            # (2 m), not the 4 m observational window of the quickcard.
+            "W": 2.0,
+            # K is a point-defect flag (quickcard "Max 0.5 m"); exempt
+            # from the length floor like X.
+            "K": 0.0,
+            "1": 2.0,
         }
     if centerline is None or sed_obs_m <= 0.0:
         return []
@@ -620,6 +656,34 @@ def classify_sweep_zones(
         else:
             codes_per_node.append("X")
 
+    # 3.5. K detection (F1.5b): per-segment XY turn-angle scan. For each
+    # interior node where the angle between the incoming and outgoing
+    # segments exceeds ``k_angle_threshold_deg``, override the codes of
+    # nodes within ±``k_zone_half_width_m`` of that z to ``"K"``. The
+    # subsequent coalesce will materialise these as ~0.5 m K zones.
+    if (
+        k_angle_threshold_deg > 0.0
+        and k_zone_half_width_m > 0.0
+        and n >= 3
+    ):
+        xy = cl[:, :2]
+        segs = np.diff(xy, axis=0)
+        seg_len = np.linalg.norm(segs, axis=1)
+        for i in range(1, n - 1):
+            la = float(seg_len[i - 1])
+            lb = float(seg_len[i])
+            if la < 1e-9 or lb < 1e-9:
+                continue
+            cos_ang = float(np.clip(
+                np.dot(segs[i - 1], segs[i]) / (la * lb), -1.0, 1.0,
+            ))
+            ang_deg = float(np.degrees(np.arccos(cos_ang)))
+            if ang_deg > k_angle_threshold_deg:
+                z_kink = float(z[i])
+                for j in range(n):
+                    if abs(float(z[j]) - z_kink) <= k_zone_half_width_m:
+                        codes_per_node[j] = "K"
+
     # 4. Coalesce consecutive same-code nodes into zones
     zones: List[tuple] = []
     run_start = 0
@@ -655,8 +719,22 @@ def classify_sweep_zones(
         cl, deadband_m=direction_deadband_m,
     )
     is_back_and_forth = global_dir["n_bows"] >= 2
+    is_high_amp = global_dir["max_abs_offset_m"] > w_amplitude_floor_m
+    # F1.5b: W upgrade. A back-and-forth pattern with absolute amplitude
+    # above 5 cm (default) is a Wobble (pulp quality), not gentle S.
+    # `W` is reported in the Sw column at the same level as 8/L/S/3/1/X
+    # per Jorge's quickcard mapping (severity placed between 3 and 1 —
+    # see step 6 severity dict). The amplitude threshold is **absolute
+    # centimetres**, distinct from the SED-fraction amplitudes used for
+    # 8/L/S/3/1/X.
+    if is_back_and_forth and is_high_amp:
+        ls_target = "W"
+    elif is_back_and_forth:
+        ls_target = "S"
+    else:
+        ls_target = "L"
     zones = [
-        (s, e, ("S" if is_back_and_forth else "L") if c == "LS" else c)
+        (s, e, ls_target if c == "LS" else c)
         for (s, e, c) in zones
     ]
 
@@ -682,12 +760,21 @@ def classify_sweep_zones(
     # rule's > 3 m threshold implicitly assumes operative lengths. See
     # ``external_references/interpine/sweep_classification_literature_review.md``
     # §6.
-    severity = {"8": 0, "L": 1, "S": 1, "3": 2, "1": 3, "X": 4}
+    # F1.5b severity order: 8 < L=S < 3 < W=K < 1 < X.
+    # Per Jorge's mapping of the quickcard Sw column: good-for-sawmill
+    # codes (8, L, S, 3) sit above the "Generally Pulp Quality" line;
+    # pulp-quality codes (W, K, 1, X) sit below. Within pulp quality,
+    # severity increases W=K < 1 < X.
+    severity = {
+        "8": 0, "L": 1, "S": 1, "3": 2,
+        "W": 3, "K": 3, "1": 4, "X": 5,
+    }
 
     def _is_stable(zone: tuple) -> bool:
         s, e, c = zone
-        if c == "X":
-            return True  # exempt — always an anchor
+        # X and K are intrinsically short defect flags — always stable.
+        if c == "X" or c == "K":
+            return True
         return (e - s) >= min_zone_length_by_code.get(c, 0.0)
 
     stable_flags = [_is_stable(zn) for zn in zones]
