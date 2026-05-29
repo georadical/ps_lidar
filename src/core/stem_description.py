@@ -319,24 +319,30 @@ def classify_sweep_zones(
        definition, only supports short logs. This keeps the semantics
        clean: an ``L`` is never reported below its operative length;
        sub-5 m SED/5 sweep is what it physically is — an ``S``.
-    6. **Minimum-zone-length enforcement** (F1.3, symmetric noise
-       floor): any **non-X** zone shorter than its code's operative
-       minimum (``min_zone_length_by_code``) is **absorbed into the
-       higher-severity neighbour** (worst-wins). Includes boundary
-       zones — a single neighbour is enough to absorb into. Ties are
-       broken by the preceding neighbour for stability. ``X`` is
-       exempt because its 0.3-1 m short-severe definition makes
-       sub-operative length intentional.
+    6. **Minimum-zone-length enforcement** (F1.4, cluster-aware noise
+       floor): a zone is *short* if its length is below its code's
+       operative minimum (``min_zone_length_by_code``); ``X`` is exempt
+       (its 0.3-1 m definition is intrinsic, so it is always *stable*).
+       Maximal **runs** of consecutive short zones are absorbed as a
+       block into the worst (higher-severity) **stable** anchor on
+       either side, skipping over the other short zones in the run.
+       Boundary runs (one stable side, or none) absorb into the single
+       available anchor — or, if the whole polyline is sub-operational,
+       collapse to the worst code present.
 
-       This supersedes the asymmetric F1.2 behaviour that only
-       absorbed *better*-than-both-neighbours zones. The asymmetric
-       rule preserved local defects at any length but produced
-       sub-operational noise zones (0.4 m ``S``, 0.6 m ``3``, etc.)
-       that a PlotSafe operator would never tally. The Interpine
-       upgrade rule's ``> 3 m`` threshold implicitly assumes operative
-       lengths, so sub-operative zones fall outside the framework and
-       are correctly treated as polyline noise. Worked rationale and
-       trade-off in
+       This supersedes the per-zone F1.3 pass, which absorbed each short
+       zone into its immediate worst neighbour and **ping-ponged on
+       clusters** of adjacent short zones (e.g. ``S/3/S/3/S`` over 2 m
+       between two long ``8`` zones): each short zone's worst neighbour
+       was another short zone, so the cluster collapsed inward
+       (swapping ``S``↔``3``) and never reached the surrounding stable
+       ``8``. Anchoring whole runs to the nearest stable zone fixes
+       this in one deterministic pass.
+
+       The F1.3/F1.2 rationale still holds: sub-operational zones are
+       polyline noise (the polyline samples every ~0.2 m); the
+       Interpine upgrade rule's ``> 3 m`` threshold implicitly assumes
+       operative lengths. Worked rationale and trade-off in
        ``external_references/interpine/sweep_classification_literature_review.md``
        §6.
 
@@ -458,69 +464,80 @@ def classify_sweep_zones(
         for (s, e, c) in zones
     ]
 
-    # 6. Minimum-zone-length enforcement (F1.3 symmetric noise floor)
-    # Any non-X zone shorter than its code's minimum length is absorbed
-    # into the higher-severity neighbour (worst-wins). Includes boundary
-    # zones (a single neighbour suffices). X is exempt — its
+    # 6. Minimum-zone-length enforcement (F1.4 cluster-aware noise floor)
+    # Any non-X zone shorter than its code's minimum length is "short".
+    # Maximal RUNS of consecutive short zones are absorbed as a block
+    # into the worst (higher-severity) STABLE anchor on either side,
+    # skipping over the other short zones in the run. X is exempt — its
     # 0.3-1 m definition makes it the only code whose existence at short
-    # length is intentional.
+    # length is intentional, so X acts as a stable anchor / run splitter.
     #
-    # F1.3 supersedes the asymmetric F1.2 behaviour (which only absorbed
-    # BETTER-than-both-neighbours zones). The asymmetric rule preserved
-    # localised defects at any length, but produced sub-operational
-    # noise zones (S of 0.4 m, "3" of 0.6 m, etc.) that an operator
-    # would never call out on a PlotSafe tally. The Interpine upgrade
-    # rule itself implicitly assumes operative lengths (its > 3 m
-    # threshold), so sub-operational zones fall outside the framework
-    # and are correctly treated as polyline noise. See
+    # F1.4 supersedes the per-zone F1.3 pass, which absorbed each short
+    # zone into its immediate worst neighbour. That ping-ponged on
+    # CLUSTERS of adjacent short zones (e.g. S/3/S/3/S over 2 m between
+    # two long "8" zones): each short zone's worst neighbour was another
+    # short zone, so the cluster collapsed inward (swapping S<->3) and
+    # never reached the surrounding stable "8" — leaving sub-operational
+    # noise in the output. Anchoring runs to the nearest STABLE zone
+    # fixes this in a single deterministic pass.
+    #
+    # F1.3/F1.2 rationale still holds: sub-operational zones are polyline
+    # noise (the polyline samples every ~0.2 m); the Interpine upgrade
+    # rule's > 3 m threshold implicitly assumes operative lengths. See
     # ``external_references/interpine/sweep_classification_literature_review.md``
-    # §6 for the trade-off justification.
+    # §6.
     severity = {"8": 0, "L": 1, "S": 1, "3": 2, "1": 3, "X": 4}
-    safety = 0
-    while safety < 20:
-        safety += 1
-        new_zones: List[tuple] = []
-        any_change = False
 
-        for k, (s, e, c) in enumerate(zones):
-            length = e - s
-            code_min = min_zone_length_by_code.get(c, 0.0)  # X → 0 (exempt)
+    def _is_stable(zone: tuple) -> bool:
+        s, e, c = zone
+        if c == "X":
+            return True  # exempt — always an anchor
+        return (e - s) >= min_zone_length_by_code.get(c, 0.0)
 
-            absorb = False
-            if length < code_min:
-                # Collect neighbour codes (at most two; one at boundary).
-                candidates = []
-                if k > 0:
-                    pc = zones[k - 1][2]
-                    candidates.append((severity.get(pc, 0), pc))
-                if k < len(zones) - 1:
-                    nc = zones[k + 1][2]
-                    candidates.append((severity.get(nc, 0), nc))
+    stable_flags = [_is_stable(zn) for zn in zones]
+    n_zones = len(zones)
+    new_zones: List[tuple] = []
+    k = 0
+    while k < n_zones:
+        if stable_flags[k]:
+            new_zones.append(zones[k])
+            k += 1
+            continue
+        # Maximal run of consecutive short zones: [k, j)
+        j = k
+        while j < n_zones and not stable_flags[j]:
+            j += 1
+        run_start = zones[k][0]
+        run_end = zones[j - 1][1]
+        # Anchors: nearest stable zone on each side (None at a boundary).
+        candidates = []
+        if k > 0:
+            lc = zones[k - 1][2]
+            candidates.append((severity.get(lc, 0), lc))
+        if j < n_zones:
+            rc = zones[j][2]
+            candidates.append((severity.get(rc, 0), rc))
+        if candidates:
+            target = max(candidates, key=lambda t: t[0])[1]
+        else:
+            # No stable anchor anywhere (whole polyline sub-operational):
+            # keep the worst code present in the run as a single zone.
+            target = max(
+                (severity.get(c, 0), c) for (_s, _e, c) in zones[k:j]
+            )[1]
+        new_zones.append((run_start, run_end, target))
+        k = j
 
-                if candidates:
-                    # Worst-wins: higher severity absorbs. Ties → first
-                    # candidate (prev neighbour) for stability.
-                    target_code = max(candidates, key=lambda t: t[0])[1]
-                    if new_zones and new_zones[-1][2] == target_code:
-                        s0, _, _ = new_zones[-1]
-                        new_zones[-1] = (s0, e, target_code)
-                    else:
-                        new_zones.append((s, e, target_code))
-                    absorb = True
-                    any_change = True
+    # Final coalesce of adjacent same-code zones.
+    coalesced: List[tuple] = []
+    for (s, e, c) in new_zones:
+        if coalesced and coalesced[-1][2] == c:
+            s0, _, _ = coalesced[-1]
+            coalesced[-1] = (s0, e, c)
+        else:
+            coalesced.append((s, e, c))
 
-            if not absorb:
-                if new_zones and new_zones[-1][2] == c:
-                    s0, _, _ = new_zones[-1]
-                    new_zones[-1] = (s0, e, c)
-                else:
-                    new_zones.append((s, e, c))
-
-        zones = new_zones
-        if not any_change:
-            break
-
-    return zones
+    return coalesced
 
 
 def classify_sweep(

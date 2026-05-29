@@ -438,6 +438,50 @@ class TestClassifySweepZones:
         codes = [c for (_, _, c) in zones]
         assert "X" in codes
 
+    def test_cluster_of_short_zones_absorbed_into_stable_anchors(self):
+        # F1.4: reproduces the real-data bug (tree 11 in
+        # tree_inventory08.xlsx) — a ~2 m cluster of alternating
+        # S/3/S/3/S short zones between two long "8" zones. F1.3
+        # ping-ponged S<->3 and left the noise; F1.4 absorbs the whole
+        # run into the surrounding stable "8".
+        z = np.linspace(0.0, 20.0, 401)  # 0.05 m spacing
+        x = np.zeros_like(z)
+        # Alternating amplitudes over z in [8, 10):
+        #   0.035/0.20 = 0.175 → "S";  0.055/0.20 = 0.275 → "3".
+        for lo, hi, amp in [
+            (8.0, 8.4, 0.035), (8.4, 8.8, 0.055), (8.8, 9.2, 0.035),
+            (9.2, 9.6, 0.055), (9.6, 10.0, 0.035),
+        ]:
+            x[(z >= lo) & (z < hi)] = amp
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # Whole 2 m cluster collapses into the surrounding "8".
+        assert codes == ["8"]
+        assert zones[0][0] == pytest.approx(0.0, abs=0.1)
+        assert zones[0][1] == pytest.approx(20.0, abs=0.1)
+
+    def test_cluster_absorbs_into_worst_stable_anchor(self):
+        # A short cluster between an "8" (left, stable) and a "1" (right,
+        # stable) absorbs into the worse anchor "1". Endpoints return to
+        # the axis (x=0) so the base-top chord stays vertical.
+        z = np.linspace(0.0, 20.0, 401)
+        x = np.zeros_like(z)
+        # Short cluster z 8-10 (S/3 alternation).
+        for lo, hi, amp in [(8.0, 8.6, 0.035), (8.6, 9.2, 0.055),
+                            (9.2, 10.0, 0.035)]:
+            x[(z >= lo) & (z < hi)] = amp
+        # Stable "1" body z 10-16 (6 m ≥ 2 m min), back to axis by z=16.
+        x[(z >= 10.0) & (z < 16.0)] = 0.12  # 0.12/0.20 = 0.6 → "1"
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # 8 (0-8) | cluster→1 (worst anchor) merged with 1 body | 8 (16-20)
+        assert codes == ["8", "1", "8"]
+        # The cluster (8-10) absorbed into "1": the 1 zone starts at ~8, not 10
+        assert zones[1][2] == "1"
+        assert zones[1][0] == pytest.approx(8.0, abs=0.2)
+
     def test_zones_cover_polyline_contiguously(self):
         cl = self._straight_polyline(z_top=15.0, n=76)
         zones = classify_sweep_zones(cl, sed_obs_m=0.20)

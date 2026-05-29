@@ -273,6 +273,51 @@ conventions. Out of scope for F1.2 but planned for after F2.
 
 ---
 
+## 7. Direction pattern (L / S / W / K) — a shared, mostly-unimplemented discriminator
+
+The quickcard separates the gentle-sweep codes **not by amplitude and
+length alone, but also by direction pattern**:
+
+| Code | Amplitude | Length / window | Direction | Outcome |
+|------|-----------|-----------------|-----------|---------|
+| `L`  | SED/5     | ≥ 6 m           | **consistent (single) direction** | OK for logs > 6.1 m |
+| `S`  | SED/5     | ~ 4 m           | **back and forth** (reversals) | short logs < 6.1 m |
+| `W`  | **> 5 cm absolute** (not an SED fraction) | 4 m window | **back and forth**, larger | "generally pulp quality" |
+| `K`  | —         | single segment  | **sharp** single direction change | — |
+
+`L` is the *only* consistent-direction sweep. `S`, `W`, `K` all hinge
+on direction reversals / sharp direction change. Note `W` is measured
+in **absolute centimetres (> 5 cm)**, unlike the SED-fraction geometry
+codes — confirmed from the quickcard W panel ("Wobble / Movement Back
+and Forth / > 5 cm", 4 m window).
+
+### Current implementation status (honest)
+
+`src/core/stem_description.py::classify_sweep_zones` distinguishes
+`L` from `S` by **length only** (`l_min_length_m`: a SED/5 zone ≥ 5 m
+→ `L`, else `S`). It does **not** inspect direction at all. Consequences:
+
+- A 7 m **back-and-forth** sweep is mislabelled `L` (should be `S`/`W`).
+- A 4 m **consistent** sweep is mislabelled `S` (should be `L` if ≥ 6 m).
+- `W` and `K` are **not detected**.
+
+### The shared primitive (future work — step F1.5)
+
+All four cases need the same missing primitive: **count direction
+reversals (and detect sharp angle changes) along the polyline within a
+window**. Build it once and it (a) corrects the L/S split, (b) detects
+`W` (back-and-forth above 5 cm absolute), and (c) detects `K` (sharp
+change). 
+
+`W`, `K` (like `X`) are **defect flags**, not geometry codes, so they
+carry short / exempt length minimums — a 2 m wobble is a legitimate
+`W`, unlike a 2 m `S` which is sub-operational for a geometry code. The
+sub-operational alternating `S/3/S/3/S` cluster that F1.4 currently
+folds into the surrounding `8` (observed on tree 11 of T460298B) is the
+canonical `W` once this primitive exists.
+
+---
+
 ## Sources (live links, in priority order)
 
 1. [MPI — NZ log grades for radiata pine](https://www.mpi.govt.nz/forestry/forest-industry-and-workforce/forestry-wood-processing-data/new-zealand-log-grades-for-radiata-pine) — **authoritative**.
