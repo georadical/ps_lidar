@@ -9,3 +9,6 @@ notebooks/cache/
 
 outputs/
 
+# Claude Code worktree storage (harness-managed; see reference_branch_workflow memory)
+.claude/
+

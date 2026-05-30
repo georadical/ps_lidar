@@ -1,0 +1,1053 @@
+"""Tests for ``src.core.stem_description`` — Coverage sheet + Interpine
+HQP Stem_Description schema.
+
+Synthetic-only tests; this module is a pure consumer of upstream
+dataclass outputs (``TrunkExtractionResult``, ``SectionResult``,
+``TreeMetrics``, per-tree centerlines), so each test wires up a minimal
+in-memory stub instead of running the full pipeline.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import List
+
+import numpy as np
+import pytest
+
+from src.core.dendrometry import TreeMetrics
+from src.core.stem_description import (
+    CoverageMetrics,
+    _count_swings,
+    _extract_bow_peaks,
+    _max_deviation_from_baseline,
+    _max_turn_angle_deg,
+    _polyline_direction_metrics,
+    _polyline_length_z,
+    _topmost_valid_section_index,
+    build_stem_description_rows,
+    build_taper_rows,
+    classify_sweep,
+    classify_sweep_zones,
+    compute_coverage_metrics,
+    coverage_metrics_to_dataframe,
+    stem_description_to_dataframe,
+    taper_to_dataframe,
+)
+from src.core.trunk_validation import SectionResult, StemCleaningConfig
+
+
+# ===========================================================================
+# Stubs and helpers
+# ===========================================================================
+
+@dataclass
+class _StubTrunkResult:
+    """Duck-typed stand-in for TrunkExtractionResult; this module only
+    reads ``tree_ids`` and ``tree_axes``."""
+    tree_ids: np.ndarray
+    tree_axes: list
+
+
+def _smooth_xy(x: np.ndarray, window: int = 5) -> np.ndarray:
+    """Apply a moving-mean smoothing to a synthetic lateral-offset
+    array. Mirrors the F1 moving-median smoothing applied to real
+    centerlines by :func:`build_centerline_from_sections`, so test
+    polylines built with ``np.where`` step transitions don't fire
+    spurious K detection on the 3D angle metric."""
+    x = np.asarray(x, dtype=np.float64)
+    if window <= 1 or len(x) < window:
+        return x
+    pad = window // 2
+    padded = np.pad(x, pad, mode="edge")
+    kernel = np.ones(window, dtype=np.float64) / window
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _make_section_result(
+    tree_ids: List[int],
+    sections: np.ndarray,
+    a: np.ndarray,
+    b: np.ndarray,
+) -> SectionResult:
+    """Build a SectionResult with the ellipse fields populated."""
+    R = np.where((a > 0) & (b > 0), np.sqrt(a * b), 0.0)
+    theta = np.zeros_like(a)
+    check = np.where(R > 0.0, 0.0, 1.0)
+    sector_pct = np.where(R > 0.0, 100.0, 0.0)
+    return SectionResult(
+        X_c=np.zeros_like(R),
+        Y_c=np.zeros_like(R),
+        R=R,
+        check=check,
+        sector_pct=sector_pct,
+        sections=sections,
+        tree_ids=list(tree_ids),
+        config=StemCleaningConfig(),
+        a=a,
+        b=b,
+        theta=theta,
+    )
+
+
+def _make_tree_metrics(
+    tree_id: int,
+    *,
+    height_total: float,
+    dbh: float = 0.30,
+    z_base: float = 0.0,
+    z_top: float = None,
+    is_oval_at_dbh: bool = False,
+) -> TreeMetrics:
+    z_top = z_top if z_top is not None else z_base + height_total
+    return TreeMetrics(
+        tree_id=tree_id,
+        valid_at_dbh=True,
+        dbh_section_height=1.30,
+        dbh=dbh,
+        dbh_major=dbh,
+        dbh_minor=dbh,
+        ovality_at_dbh=1.0,
+        is_oval_at_dbh=is_oval_at_dbh,
+        z_base=z_base,
+        z_top=z_top,
+        height_total=height_total,
+        n_points=1000,
+        n_valid_sections=10,
+    )
+
+
+# ===========================================================================
+# Unit tests — internal helpers
+# ===========================================================================
+
+class TestTopmostValidSectionIndex:
+
+    def test_empty_returns_minus_one(self):
+        assert _topmost_valid_section_index(np.array([])) == -1
+
+    def test_all_invalid_returns_minus_one(self):
+        assert _topmost_valid_section_index(np.array([0.0, 0.0, 0.0])) == -1
+
+    def test_mixed_returns_highest_valid_index(self):
+        # Valid at index 1, 3, 4 (4 is the topmost).
+        assert _topmost_valid_section_index(
+            np.array([0.0, 0.15, 0.0, 0.20, 0.18, 0.0])
+        ) == 4
+
+    def test_all_valid_returns_last(self):
+        assert _topmost_valid_section_index(np.array([0.10, 0.12, 0.14])) == 2
+
+
+class TestMaxDeviationFromBaseline:
+
+    def test_too_few_points_returns_zero(self):
+        # 2 points cannot have any deviation by definition.
+        assert _max_deviation_from_baseline(np.zeros((2, 3))) == 0.0
+
+    def test_perfectly_straight_polyline_zero_deviation(self):
+        # Three points on the same z axis → all on the base-top line.
+        cl = np.array([
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 2.0],
+        ])
+        assert _max_deviation_from_baseline(cl) == pytest.approx(0.0, abs=1e-12)
+
+    def test_bow_deviation_matches_geometry(self):
+        # Vertical axis from (0, 0, 0) to (0, 0, 2). A middle node at
+        # (0.5, 0, 1) sits 0.5 m perpendicular to that axis.
+        cl = np.array([
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 1.0],
+            [0.0, 0.0, 2.0],
+        ])
+        assert _max_deviation_from_baseline(cl) == pytest.approx(0.5, abs=1e-9)
+
+    def test_invariant_under_axis_swap(self):
+        # Same bow but oriented along Y instead of X — still 0.5 m amplitude.
+        cl = np.array([
+            [0.0, 0.0, 0.0],
+            [0.0, 0.5, 1.0],
+            [0.0, 0.0, 2.0],
+        ])
+        assert _max_deviation_from_baseline(cl) == pytest.approx(0.5, abs=1e-9)
+
+
+class TestPolylineLengthZ:
+
+    def test_z_extent(self):
+        cl = np.array([
+            [0.0, 0.0, 1.5],
+            [0.0, 0.0, 3.5],
+            [0.0, 0.0, 8.5],
+        ])
+        assert _polyline_length_z(cl) == pytest.approx(7.0)
+
+
+# ===========================================================================
+# Unit tests — classify_sweep
+# ===========================================================================
+
+class TestClassifySweep:
+
+    @staticmethod
+    def _bow_centerline(amplitude_m: float, z_top_m: float = 10.0):
+        """Three-node polyline: base at origin, top at (0, 0, z_top), middle
+        node displaced by ``amplitude_m`` in +x at z = z_top / 2."""
+        return np.array([
+            [0.0, 0.0, 0.0],
+            [amplitude_m, 0.0, z_top_m / 2.0],
+            [0.0, 0.0, z_top_m],
+        ])
+
+    def test_none_centerline_returns_none(self):
+        assert classify_sweep(None, sed_obs_m=0.20) is None
+
+    def test_zero_sed_returns_none(self):
+        cl = self._bow_centerline(0.01)
+        assert classify_sweep(cl, sed_obs_m=0.0) is None
+
+    def test_too_few_nodes_returns_none(self):
+        cl = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 5.0]])
+        assert classify_sweep(cl, sed_obs_m=0.20) is None
+
+    def test_gun_barrel_8_for_tiny_amplitude(self):
+        # SED 0.20 m → SED/8 = 0.025 m. Amplitude 0.01 m → ratio = 0.05 < 1/8.
+        cl = self._bow_centerline(0.01)
+        assert classify_sweep(cl, sed_obs_m=0.20) == "8"
+
+    def test_long_log_L_for_consistent_sweep_above_threshold(self):
+        # SED 0.20 → SED/5 = 0.04. Amplitude 0.035 → ratio 0.175, between
+        # 1/8 (0.125) and 1/5 (0.20). Length 10 m ≥ 6.1 m → "L".
+        cl = self._bow_centerline(0.035, z_top_m=10.0)
+        assert classify_sweep(cl, sed_obs_m=0.20) == "L"
+
+    def test_short_log_S_when_below_log_length_threshold(self):
+        # Same amplitude/SED but z_top 5 m < 6.1 → "S".
+        cl = self._bow_centerline(0.035, z_top_m=5.0)
+        assert classify_sweep(cl, sed_obs_m=0.20) == "S"
+
+    def test_moderate_sweep_3(self):
+        # SED 0.20 → SED/3 ≈ 0.0667. Amplitude 0.05 → ratio 0.25, in
+        # (1/5, 1/3] → "3".
+        cl = self._bow_centerline(0.05)
+        assert classify_sweep(cl, sed_obs_m=0.20) == "3"
+
+    def test_excessive_sweep_1(self):
+        # SED 0.20 → SED/1 = 0.20. Amplitude 0.10 → ratio 0.5, in (1/3, 1] → "1".
+        cl = self._bow_centerline(0.10)
+        assert classify_sweep(cl, sed_obs_m=0.20) == "1"
+
+    def test_severe_sweep_X_for_amplitude_above_sed(self):
+        # Amplitude 0.30 > SED 0.20 → ratio 1.5 → "X".
+        cl = self._bow_centerline(0.30)
+        assert classify_sweep(cl, sed_obs_m=0.20) == "X"
+
+
+# ===========================================================================
+# Integration tests — compute_coverage_metrics
+# ===========================================================================
+
+class TestComputeCoverageMetrics:
+
+    def test_basic_single_tree_with_canopy(self):
+        # Tree 0: stem labelled to z ∈ [0.1, 18.0], but canopy extends to
+        # z = 22.0 with points in a 1 m radius column around the basal
+        # centroid (5.0, 5.0). HT_cloud should be 22.0.
+        sections = np.arange(0.3, 18.0, 0.2)
+        n_secs = len(sections)
+        a = np.full((1, n_secs), 0.15)
+        b = np.full((1, n_secs), 0.15)
+        sr = _make_section_result([0], sections, a, b)
+
+        # Cloud: 1000 stem points around (5, 5) up to z=18; 500 canopy
+        # points around (5, 5) at z up to 22.
+        rng = np.random.default_rng(seed=0)
+        stem_xy = rng.uniform(-0.2, 0.2, size=(1000, 2)) + np.array([5.0, 5.0])
+        stem_z = rng.uniform(0.1, 18.0, size=1000)
+        canopy_xy = rng.uniform(-0.8, 0.8, size=(500, 2)) + np.array([5.0, 5.0])
+        canopy_z = rng.uniform(18.0, 22.0, size=500)
+        xyz = np.vstack([
+            np.column_stack([stem_xy[:, 0], stem_xy[:, 1], stem_z]),
+            np.column_stack([canopy_xy[:, 0], canopy_xy[:, 1], canopy_z]),
+        ])
+        # tree_ids: stem points labelled 0, canopy points unlabelled (-1)
+        tree_ids = np.concatenate([
+            np.full(1000, 0, dtype=np.int32),
+            np.full(500, -1, dtype=np.int32),
+        ])
+
+        trunk_result = _StubTrunkResult(
+            tree_ids=tree_ids,
+            tree_axes=[{"tree_id": 0, "centroid": (5.0, 5.0)}],
+        )
+
+        tm = _make_tree_metrics(
+            tree_id=0,
+            height_total=17.9,  # 18.0 - 0.1
+            dbh=0.30,
+            z_base=0.1,
+            z_top=18.0,
+        )
+
+        cov = compute_coverage_metrics(
+            xyz, trunk_result, sr, [tm], crown_buffer_radius=2.5,
+        )
+        assert len(cov) == 1
+        c = cov[0]
+        assert c.tree_id == 0
+        # HT_cloud should reach the canopy region (z up to 22).
+        assert c.ht_cloud_m == pytest.approx(22.0, abs=0.1)
+        assert c.ht_stem_m == pytest.approx(17.9)
+        # RH ≈ 17.9 / 22 ≈ 0.81
+        assert c.rh_obs == pytest.approx(17.9 / 22.0, abs=0.01)
+        assert c.dbh_cm == pytest.approx(30.0)
+        # SED at topmost valid section: a = b = 0.15 → diameter 0.30 m = 30 cm.
+        assert c.valid_sed is True
+        assert c.sed_obs_cm == pytest.approx(30.0)
+
+    def test_no_valid_section_sets_valid_sed_false(self):
+        # All sections invalid (a = b = 0) → no SED to report.
+        sections = np.arange(0.3, 5.0, 0.2)
+        n_secs = len(sections)
+        a = np.zeros((1, n_secs))
+        b = np.zeros((1, n_secs))
+        sr = _make_section_result([0], sections, a, b)
+
+        xyz = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 5.0]])
+        tree_ids = np.array([0, 0], dtype=np.int32)
+        trunk_result = _StubTrunkResult(
+            tree_ids=tree_ids,
+            tree_axes=[{"tree_id": 0, "centroid": (0.0, 0.0)}],
+        )
+        tm = _make_tree_metrics(tree_id=0, height_total=4.0, z_top=5.0)
+
+        cov = compute_coverage_metrics(xyz, trunk_result, sr, [tm])
+        assert cov[0].valid_sed is False
+        assert cov[0].sed_obs_cm == 0.0
+
+
+# ===========================================================================
+# Integration tests — build_stem_description_rows
+# ===========================================================================
+
+class TestCountSwings:
+    """Zigzag swing counter with prominence deadband (F1.5 primitive)."""
+
+    def test_straight_profile_zero_swings(self):
+        assert _count_swings(np.zeros(20), deadband=0.01) == 0
+
+    def test_single_bow_one_swing(self):
+        # Rise to peak, fall back: one direction reversal at the peak.
+        s = np.array([0.0, 3.0, 6.0, 9.0, 6.0, 3.0, 0.0])
+        assert _count_swings(s, deadband=0.01) == 1
+
+    def test_s_curve_two_swings(self):
+        # Bow +, bow −: two reversals (peak and trough).
+        s = np.array([0.0, 5.0, 0.0, -5.0, 0.0])
+        assert _count_swings(s, deadband=0.01) == 2
+
+    def test_deadband_ignores_jitter(self):
+        # Single bow with a 0.5-unit dip on the plateau (the bow itself
+        # peaks at 9 units). The dip is well below the deadband, the
+        # bow excursion is well above → 1 swing, not 3 spurious ones.
+        s = np.array([0.0, 5.0, 9.0, 8.5, 9.0, 5.0, 0.0])
+        assert _count_swings(s, deadband=1.0) == 1
+
+    def test_camel_back_counted(self):
+        # Two peaks on the same side: 0 → 5 → 2 → 8 → 0. Three swings.
+        s = np.array([0.0, 5.0, 2.0, 8.0, 0.0])
+        assert _count_swings(s, deadband=0.01) == 3
+
+    def test_short_input_returns_zero(self):
+        assert _count_swings(np.array([1.0, 2.0]), deadband=0.01) == 0
+
+
+class TestExtractBowPeaks:
+    """Per-bow peak extraction (F1.5b primitive for W detection)."""
+
+    def test_straight_profile_no_peaks(self):
+        # No direction determined → empty peaks list.
+        assert _extract_bow_peaks(np.zeros(20), deadband=0.01) == []
+
+    def test_single_bow_one_peak(self):
+        # 0 → 9 → 0 has 1 swing (peak at 9) and 1 final open peak (0).
+        # But the second monotonic segment (the descent to 0) ends at
+        # the start value, so its running extreme has |abs| ≤ |9|. Both
+        # peaks reported; max = 9.
+        s = np.array([0.0, 3.0, 6.0, 9.0, 6.0, 3.0, 0.0])
+        peaks = _extract_bow_peaks(s, deadband=0.01)
+        assert len(peaks) == 2  # n_bows=1 swing + 1 open final bow
+        assert max(peaks) == pytest.approx(9.0)
+
+    def test_s_curve_two_peaks(self):
+        # 0 → 5 → 0 → −5 → 0: two swings → 3 bow segments → 3 peaks.
+        # Peaks (absolute values): 5, 5, 0 (final descent back to 0
+        # has running extreme of 0 from the new low pivot).
+        s = np.array([0.0, 5.0, 0.0, -5.0, 0.0])
+        peaks = _extract_bow_peaks(s, deadband=0.01)
+        assert len(peaks) == 3
+        # Both reversal-confirmed bows had |peak| = 5.
+        assert max(peaks) == pytest.approx(5.0)
+
+    def test_deadband_filters_small_peaks(self):
+        # A tiny wobble below deadband doesn't create a bow.
+        s = np.array([0.0, 0.5, 0.0, 0.4, 0.0])  # all < deadband 1.0
+        peaks = _extract_bow_peaks(s, deadband=1.0)
+        assert peaks == []
+
+    def test_asymmetric_bows(self):
+        # 0 → 2 → 0 → 8 → 0: small bow then big bow. The peak of each
+        # bow is captured independently; max = 8.
+        s = np.array([0.0, 2.0, 0.0, 8.0, 0.0])
+        peaks = _extract_bow_peaks(s, deadband=0.01)
+        assert max(peaks) == pytest.approx(8.0)
+
+
+class TestPolylineDirectionMetrics:
+
+    def test_straight_polyline_zero_metrics(self):
+        z = np.linspace(0.0, 10.0, 21)
+        cl = np.column_stack([np.zeros(21), np.zeros(21), z])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] == 0
+        assert m["max_abs_offset_m"] == pytest.approx(0.0, abs=1e-9)
+        assert m["max_turn_deg"] == pytest.approx(0.0, abs=1e-6)
+
+    def test_single_bow_one(self):
+        # Endpoints on axis, a bow in the middle.
+        z = np.linspace(0.0, 10.0, 101)
+        x = np.where((z >= 3.0) & (z <= 7.0), 0.10, 0.0)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] == 1
+        assert m["max_abs_offset_m"] == pytest.approx(0.10, abs=0.005)
+
+    def test_s_curve_two_bows(self):
+        # +x bow then −x bow.
+        z = np.linspace(0.0, 12.0, 121)
+        x = np.zeros_like(z)
+        x[(z >= 2.0) & (z <= 5.0)] = 0.10
+        x[(z >= 7.0) & (z <= 10.0)] = -0.10
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] >= 2
+
+    def test_degenerate_inputs(self):
+        # Fewer than 3 nodes → zero metrics.
+        m = _polyline_direction_metrics(np.zeros((2, 3)))
+        assert m["n_bows"] == 0
+        # Coincident endpoints (axis_len_sq ≈ 0) → zero metrics.
+        cl = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
+        m = _polyline_direction_metrics(cl)
+        assert m["n_bows"] == 0
+
+    def test_max_bow_peak_isolates_pca_axis_amplitude(self):
+        # F1.5b regression: ``max_abs_offset_m`` is the global max
+        # 3-D perpendicular norm — it includes off-axis components and
+        # so over-flags W on trees with gentle per-bow amplitude plus
+        # off-axis jitter. ``max_bow_peak_m`` is computed from the
+        # PCA-projected signed profile and so isolates the dominant
+        # sweep direction's per-bow amplitude.
+        # Build: ±3 cm bows in x (PCA dominant axis) plus one 5 cm
+        # outlier in y at a node between bows.
+        z = np.linspace(0.0, 12.0, 121)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z <= 4.0)] = 0.03      # +3 cm bow
+        x[(z >= 7.0) & (z <= 10.0)] = -0.03    # −3 cm bow
+        y = np.zeros_like(z)
+        # Off-axis perpendicular outlier at z = 6 (where x = 0).
+        idx_outlier = int(np.argmin(np.abs(z - 6.0)))
+        y[idx_outlier] = 0.05
+        cl = np.column_stack([x, y, z])
+        m = _polyline_direction_metrics(cl)
+        # Global norm at the outlier is 5 cm — triggers the old W rule.
+        assert m["max_abs_offset_m"] >= 0.045
+        # PCA-projected per-bow peak stays at ≈ 3 cm — gentle, not W.
+        assert m["max_bow_peak_m"] < 0.04
+        # Back-and-forth pattern still registers (2+ bows in x).
+        assert m["n_bows"] >= 2
+
+
+class TestMaxTurnAngleDeg:
+
+    def test_straight_line_zero(self):
+        cl = np.column_stack([
+            np.zeros(5), np.zeros(5), np.arange(5, dtype=float),
+        ])
+        assert _max_turn_angle_deg(cl) == pytest.approx(0.0, abs=1e-9)
+
+    def test_right_angle_xy_turn_is_60deg_in_3d(self):
+        # The F1.5b primitive uses 3D segments (not XY-projected) so
+        # that mm-scale XY jitter between near-vertical sections does
+        # not produce spurious tens-of-degrees per-segment angles on
+        # real data. A right-angle XY turn between two diagonals of
+        # equal z-rise is 60° in 3D, not 90°.
+        cl = np.array([
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 1.0],
+            [1.0, 1.0, 2.0],
+        ])
+        # 3D segments (1,0,1) and (0,1,1): cos = 1/2 → 60°.
+        assert _max_turn_angle_deg(cl) == pytest.approx(60.0, abs=1e-6)
+
+
+class TestClassifySweepZones:
+    """Zone-aware sliding-window classifier (F1.1)."""
+
+    @staticmethod
+    def _straight_polyline(z_top: float = 10.0, n: int = 21) -> np.ndarray:
+        z = np.linspace(0.0, z_top, n)
+        return np.column_stack([np.zeros(n), np.zeros(n), z])
+
+    def test_empty_inputs_return_empty(self):
+        assert classify_sweep_zones(None, 0.2) == []
+        assert classify_sweep_zones(self._straight_polyline(), 0.0) == []
+        assert classify_sweep_zones(np.zeros((2, 3)), 0.2) == []
+
+    def test_straight_polyline_single_8_zone(self):
+        cl = self._straight_polyline(z_top=10.0, n=21)
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        assert len(zones) == 1
+        assert zones[0][2] == "8"
+        # Spans the whole polyline
+        assert zones[0][0] == pytest.approx(0.0)
+        assert zones[0][1] == pytest.approx(10.0)
+
+    def test_localised_bow_creates_worse_central_zone(self):
+        # Polyline ~21 m long, endpoints on the stem axis (x=0), with a
+        # localised bow at z ∈ [10, 14] where x drifts to 0.2 m.
+        # Distance to base-top chord: 0 outside the bow, 0.2 inside.
+        # ratio = 0.2 / SED 0.2 = 1.0 → "1" inside, "8" outside.
+        z = np.linspace(0.0, 21.0, 106)  # 0.2 m spacing
+        x = np.zeros_like(z)
+        bow_mask = (z >= 10.0) & (z <= 14.0)
+        x[bow_mask] = 0.20
+        cl = np.column_stack([x, np.zeros_like(z), z])
+
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "1" in codes
+        assert "8" in codes
+        # First zone covers the lower clean section
+        assert zones[0][0] == pytest.approx(0.0, abs=0.5)
+        assert zones[0][2] == "8"
+        # Last zone covers the upper clean section
+        assert zones[-1][1] == pytest.approx(21.0, abs=0.5)
+        assert zones[-1][2] == "8"
+
+    def test_min_length_absorbs_short_better_zone_between_worse(self):
+        # F1.3: a 1 m "8" gap between two "1" bows is below its 4 m min
+        # and absorbs into the surrounding "1". Boundary "8" zones in
+        # this layout are kept long enough (5 m each) to exceed the
+        # "8" minimum and survive.
+        z = np.linspace(0.0, 18.0, 181)  # 0.1 m spacing
+        x_raw = np.zeros_like(z)
+        # Bow amplitude 0.18 sits cleanly inside the "1" bin
+        # (ratio 0.9 / 1.0 < 1.0); 0.20 would land exactly on the bin
+        # boundary and become "X" under floating-point noise.
+        x_raw[(z >= 5.0) & (z < 8.0)] = 0.18   # first bow → "1" (3 m)
+        x_raw[(z > 9.0) & (z <= 13.0)] = 0.18  # second bow → "1" (4 m)
+        x = _smooth_xy(x_raw, window=5)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+
+        # Disable K detection for this test (k_angle_threshold_deg
+        # large): its purpose is F1.4 absorption logic, and the 1 m
+        # V-shape gap between the two bows is geometrically a real
+        # kink that K would correctly fire on under defaults. K is
+        # exercised by its own dedicated tests above.
+        zones = classify_sweep_zones(
+            cl, sed_obs_m=0.20, k_angle_threshold_deg=999.0,
+        )
+        codes = [c for (_, _, c) in zones]
+        # Central "8" gap (1 m) absorbed into "1"; boundary "8" zones
+        # (5 m each) exceed the 4 m min and survive.
+        assert codes == ["8", "1", "8"]
+        assert zones[1][2] == "1"
+        # Central "1" zone now spans both bows + the absorbed gap
+        assert zones[1][0] == pytest.approx(5.0, abs=0.3)
+        assert zones[1][1] == pytest.approx(13.0, abs=0.3)
+
+    def test_consistent_single_bow_is_L_regardless_of_length(self):
+        # F1.5a: a SED/5 plateau (single consistent bow) is L even at
+        # the shortest operative length, because direction (not length)
+        # decides L vs S. Previously this same 4 m plateau was
+        # reclassified to S under the length-only rule.
+        z = np.linspace(0.0, 6.0, 121)  # 0.05 m spacing
+        x = np.where((z >= 1.0) & (z <= 5.0), 0.035, 0.0)  # 0.035/0.20 = 0.175
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "L" in codes
+        assert "S" not in codes
+
+    def test_back_and_forth_sweep_is_S(self):
+        # F1.5a: an SED/5 S-curve (two bows: +x then -x) is S regardless
+        # of length, because back-and-forth is the defining direction
+        # pattern of S.
+        z = np.linspace(0.0, 8.0, 161)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z < 3.5)] = 0.040   # first bow (+x) → SED/5
+        x[(z >= 4.5) & (z <= 7.0)] = -0.040  # second bow (-x) → SED/5
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "S" in codes
+        assert "L" not in codes
+
+    def test_long_back_and_forth_stays_S(self):
+        # F1.5a: S has no maximum length. A 10 m back-and-forth sweep
+        # is still S, not L.
+        z = np.linspace(0.0, 12.0, 241)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z < 5.0)] = 0.040     # bow 1 (+x), 4 m
+        x[(z >= 6.0) & (z <= 11.0)] = -0.040  # bow 2 (-x), 5 m
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "S" in codes
+        assert "L" not in codes
+
+    def test_back_and_forth_high_amplitude_is_W(self):
+        # F1.5b.4: W requires back-and-forth + peak ≥ 5 cm absolute +
+        # **wobble region length ≤ 4 m**. The wobble region is the
+        # contiguous span of LS / 3 zones (bridging short "8" gaps).
+        # Use a 4 m sine polyline with multiple bows — fragments into
+        # short alternating LS / 8 zones but the wobble region spans
+        # ~ 4 m, eligible for W. SED=0.30 keeps peaks (5.5 cm) in LS
+        # bin (ratio 0.183 < 1/5).
+        z = np.linspace(0.0, 4.0, 81)
+        x = 0.055 * np.sin(2 * np.pi * z / 2.0)  # 2-period sine: 4 bows
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.30)
+        codes = [c for (_, _, c) in zones]
+        assert "W" in codes
+        assert "S" not in codes
+
+    def test_long_high_amplitude_back_and_forth_is_S_not_W(self):
+        # F1.5b.4 length cap: a back-and-forth pattern with peak ≥ 5 cm
+        # but **wobble region > 4 m** falls back to S (sustained
+        # extended pattern, not a localised defect-flag). Quickcard
+        # W is illustrated over 4 m extent; longer spans are sweepy
+        # stem characteristic, not pulp defect-puntual.
+        z = np.linspace(0.0, 12.0, 241)
+        x = np.zeros_like(z)
+        # Two 4 m bows separated by 1 m gap → wobble region ≈ 9 m > 4 m.
+        x[(z >= 1.0) & (z < 5.0)] = 0.055
+        x[(z >= 6.0) & (z < 10.0)] = -0.055
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.30)
+        codes = [c for (_, _, c) in zones]
+        # Wobble region too long to be W → falls back to S.
+        assert "W" not in codes
+        assert "S" in codes
+
+    def test_back_and_forth_low_amplitude_stays_S(self):
+        # F1.5b: back-and-forth but max amplitude ≤ 5 cm → S (not W).
+        # Amplitude 4 cm < 5 cm floor.
+        z = np.linspace(0.0, 12.0, 241)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z < 5.0)] = 0.04      # 4 cm +x bow
+        x[(z >= 6.0) & (z <= 11.0)] = -0.04   # 4 cm −x bow
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "S" in codes
+        assert "W" not in codes
+
+    def test_K_detected_at_sharp_turn(self):
+        # F1.5b: a polyline with a sharp XY direction change at z≈5 m
+        # gets a K zone around that height. Build two straight
+        # segments meeting at 90°; the first runs in (+x, +z), the
+        # second in (+y, +z). Avoid duplicate nodes at the kink so the
+        # surrounding segments aren't degenerate.
+        z1 = np.linspace(0.0, 4.9, 50)         # excludes 5.0
+        z2 = np.linspace(5.0, 10.0, 51)
+        cl1 = np.column_stack([z1, np.zeros(50), z1])
+        cl2 = np.column_stack([np.full(51, 5.0), z2 - 5.0, z2])
+        cl = np.vstack([cl1, cl2])
+        # SED large so lateral offsets don't dominate amplitude bins;
+        # we're testing K (per-segment angle), not the sweep amplitude.
+        zones = classify_sweep_zones(cl, sed_obs_m=50.0)
+        codes = [c for (_, _, c) in zones]
+        assert "K" in codes
+        # K zone(s) should be short — ~0.5 m window around the kink.
+        k_lengths = [e - s for (s, e, c) in zones if c == "K"]
+        assert any(0.3 <= L <= 0.7 for L in k_lengths)
+
+    def test_no_K_when_turn_below_threshold(self):
+        # F1.5b: a gentle turn (< 15° default) does not produce K.
+        z = np.linspace(0.0, 10.0, 101)
+        x = np.where(z < 5.0, 0.0, 0.5 * (z - 5.0) / 5.0)
+        # Slope = 0.1 (rise 0.5 over 5) → ~5.7° turn at z=5. Well under 15°.
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=2.0)  # SED large
+        codes = [c for (_, _, c) in zones]
+        assert "K" not in codes
+
+    def test_K_exempt_from_length_absorption(self):
+        # F1.5b: a K zone (intrinsically ~0.5 m) is exempt — never
+        # absorbed into a longer neighbour even though 0.5 m < 4 m min.
+        z1 = np.linspace(0.0, 4.9, 50)
+        z2 = np.linspace(5.0, 10.0, 51)
+        cl1 = np.column_stack([z1, np.zeros(50), z1])
+        cl2 = np.column_stack([np.full(51, 5.0), z2 - 5.0, z2])
+        cl = np.vstack([cl1, cl2])
+        zones = classify_sweep_zones(cl, sed_obs_m=50.0)
+        codes = [c for (_, _, c) in zones]
+        # K must survive even though its length (~0.5 m) is below the
+        # typical code minimums (8/L/S = 4 m, 3 = 3 m, 1 = 2 m).
+        assert "K" in codes
+
+    def test_W_severity_above_3_below_1(self):
+        # F1.5b: a short cluster of "8" between a "W" anchor and a "1"
+        # anchor absorbs into "1" (the worst). Confirms W severity < 1.
+        z = np.linspace(0.0, 14.0, 281)
+        x = np.zeros_like(z)
+        # Left: W-character body (back-and-forth high amp), z 0-5.
+        x[(z >= 0.5) & (z < 2.5)] = 0.07      # +7cm
+        x[(z >= 2.5) & (z < 5.0)] = -0.07     # −7cm
+        # Middle gap z 5-6 (1 m of straight → "8")
+        # Right: stable "1" body z 6-10 (SED/1 amplitude)
+        x[(z >= 6.0) & (z < 10.0)] = 0.12     # 0.12 / 0.20 = 0.6 → "1"
+        # z 10-14 returns to axis ("8" tail)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # The whole polyline is back-and-forth (W on the left, 1 in the
+        # middle, axis on the right) — global verdict is W for LS-amp
+        # zones. The 1 m central "8" gap, sandwiched between a W anchor
+        # (sev 3) and a "1" anchor (sev 4), absorbs into "1" — the worst.
+        assert "1" in codes
+
+    def test_long_sed5_zone_is_L(self):
+        # Same SED/5 amplitude but a 6 m plateau (≥ 5 m) → "L".
+        z = np.linspace(0.0, 8.0, 161)  # 0.05 m spacing
+        x = np.where((z >= 1.0) & (z <= 7.0), 0.035, 0.0)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "L" in codes
+        assert "S" not in codes
+
+    def test_short_worse_zone_absorbed_symmetrically(self):
+        # F1.3: a 2 m "3" between two ample "8" zones (5 m each, above
+        # the 4 m min) is below its 3 m min and absorbs into the
+        # surrounding "8", collapsing to a single "8" over the stem.
+        # Supersedes the F1.2 asymmetric preserve-defects behaviour.
+        z = np.linspace(0.0, 12.0, 241)  # 0.05 m spacing
+        x = np.where((z >= 5.0) & (z <= 7.0), 0.05, 0.0)  # 0.05/0.20 = 0.25 → "3"
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert codes == ["8"]
+        assert zones[0][0] == pytest.approx(0.0, abs=0.1)
+        assert zones[0][1] == pytest.approx(12.0, abs=0.1)
+
+    def test_short_zone_at_boundary_absorbed(self):
+        # F1.3: a short zone at the polyline boundary (single neighbour)
+        # is absorbed into that neighbour. Polyline has tiny "8" caps
+        # at base and top with a long L plateau in between; the caps
+        # should disappear, leaving a single L zone over the polyline.
+        z = np.linspace(0.0, 8.0, 161)
+        x = np.where((z >= 1.0) & (z <= 7.0), 0.040, 0.0)  # 0.04/0.20 = 0.20 → "LS" → "L" (6 m)
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # Boundary "8" caps (1 m each, < 4 m min, single neighbour L)
+        # absorbed → single L zone over the whole polyline.
+        assert codes == ["L"]
+        assert zones[0][0] == pytest.approx(0.0, abs=0.1)
+        assert zones[0][1] == pytest.approx(8.0, abs=0.1)
+
+    def test_short_X_zone_preserved(self):
+        # X stays exempt from the length floor — its 0.3-1 m
+        # short-severe definition is intrinsic.
+        z = np.linspace(0.0, 10.0, 201)
+        x = np.where((z >= 4.75) & (z <= 5.25), 0.25, 0.0)  # 0.25/0.20 = 1.25 → "X"
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        assert "X" in codes
+
+    def test_cluster_of_short_zones_absorbed_into_stable_anchors(self):
+        # F1.4: reproduces the real-data bug (tree 11 in
+        # tree_inventory08.xlsx) — a ~2 m cluster of alternating
+        # S/3/S/3/S short zones between two long "8" zones. F1.3
+        # ping-ponged S<->3 and left the noise; F1.4 absorbs the whole
+        # run into the surrounding stable "8".
+        z = np.linspace(0.0, 20.0, 401)  # 0.05 m spacing
+        x = np.zeros_like(z)
+        # Alternating amplitudes over z in [8, 10):
+        #   0.035/0.20 = 0.175 → "S";  0.055/0.20 = 0.275 → "3".
+        for lo, hi, amp in [
+            (8.0, 8.4, 0.035), (8.4, 8.8, 0.055), (8.8, 9.2, 0.035),
+            (9.2, 9.6, 0.055), (9.6, 10.0, 0.035),
+        ]:
+            x[(z >= lo) & (z < hi)] = amp
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # Whole 2 m cluster collapses into the surrounding "8".
+        assert codes == ["8"]
+        assert zones[0][0] == pytest.approx(0.0, abs=0.1)
+        assert zones[0][1] == pytest.approx(20.0, abs=0.1)
+
+    def test_cluster_absorbs_into_worst_stable_anchor(self):
+        # A short cluster between an "8" (left, stable) and a "1" (right,
+        # stable) absorbs into the worse anchor "1". Endpoints return to
+        # the axis (x=0) so the base-top chord stays vertical.
+        # Note: F1.5b.4 detects W on short back-and-forth clusters with
+        # peak ≥ 5 cm. To keep this test focused on the cluster-absorption
+        # logic (not W detection), the middle amplitude is set to 4.5 cm
+        # — still in the SED/3 ("3") bin but below the 5 cm W threshold.
+        z = np.linspace(0.0, 20.0, 401)
+        x = np.zeros_like(z)
+        # Short cluster z 8-10 (S/3 alternation, peak below W floor).
+        for lo, hi, amp in [(8.0, 8.6, 0.035), (8.6, 9.2, 0.045),
+                            (9.2, 10.0, 0.035)]:
+            x[(z >= lo) & (z < hi)] = amp
+        # Stable "1" body z 10-16 (6 m ≥ 2 m min), back to axis by z=16.
+        x[(z >= 10.0) & (z < 16.0)] = 0.12  # 0.12/0.20 = 0.6 → "1"
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # 8 (0-8) | cluster→1 (worst anchor) merged with 1 body | 8 (16-20)
+        assert codes == ["8", "1", "8"]
+        # The cluster (8-10) absorbed into "1": the 1 zone starts at ~8, not 10
+        assert zones[1][2] == "1"
+        assert zones[1][0] == pytest.approx(8.0, abs=0.2)
+
+    def test_fragmented_short_W_captured(self):
+        # F1.5b.4: a short cluster with a moderate-amp middle (peak
+        # ≥ 5 cm) and back-and-forth global pattern produces a W zone
+        # in the middle (defect-flag) — fragmented sub-operational
+        # W detection that the previous F1.4 absorption would have
+        # folded into the surrounding "1" (textbook W case per
+        # literature review §7 known limitation, now captured).
+        z = np.linspace(0.0, 20.0, 401)
+        x = np.zeros_like(z)
+        # Cluster z 8-10: amp 5.5 cm → "3" bin, ≥ 5 cm peak.
+        for lo, hi, amp in [(8.0, 8.6, 0.035), (8.6, 9.2, 0.055),
+                            (9.2, 10.0, 0.035)]:
+            x[(z >= lo) & (z < hi)] = amp
+        # Stable "1" body z 10-16, back to axis by z=16.
+        x[(z >= 10.0) & (z < 16.0)] = 0.12
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # The middle "3" (0.6 m, peak 5.5 cm, global back-and-forth)
+        # upgrades to W; W is stable above its 0.5 m min, so the
+        # cluster splits around the W instead of fully absorbing.
+        assert "W" in codes
+
+    def test_zones_cover_polyline_contiguously(self):
+        cl = self._straight_polyline(z_top=15.0, n=76)
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        # No gaps between zones
+        for k in range(len(zones) - 1):
+            assert zones[k][1] == pytest.approx(zones[k + 1][0], abs=0.3)
+
+
+class TestBuildStemDescriptionRows:
+    """Sparse-row schema: base + DBH + end-of-zone Sw + optional F.
+    Dense diameter samples live on the separate Taper sheet."""
+
+    def test_sparse_rows_base_dbh_and_endofzone_sweep(self):
+        # Single tree with valid sections at z = 0.3, 1.3, 2.3 (Δz_top=2.3).
+        sections = np.array([0.3, 1.3, 2.3, 3.3])
+        a = np.array([[0.15, 0.14, 0.13, 0.0]])  # 0.0 marks invalid
+        b = np.array([[0.15, 0.14, 0.13, 0.0]])
+        sr = _make_section_result([42], sections, a, b)
+
+        tm = _make_tree_metrics(tree_id=42, height_total=2.5, dbh=0.28)
+        cov = CoverageMetrics(
+            tree_id=42,
+            ht_cloud_m=3.0, ht_stem_m=2.5, rh_obs=0.83,
+            dbh_cm=28.0, sed_obs_cm=26.0,
+            sed_obs_height_m=2.3, valid_sed=True,
+        )
+        cl = np.array([
+            [0.0, 0.0, 0.3],
+            [0.0, 0.0, 1.3],
+            [0.0, 0.0, 2.3],
+        ])
+
+        rows = build_stem_description_rows(
+            plot_id="T_TEST",
+            tree_metrics=[tm],
+            coverage_metrics=[cov],
+            section_result=sr,
+            tree_centerlines=[cl],
+        )
+
+        # Expected: base + DBH + Sw end-of-zone = 3 rows (no F since not oval).
+        assert len(rows) == 3
+        assert all(r["PlotId"] == "T_TEST" for r in rows)
+        assert all(r["TreeNumber"] == 42 for r in rows)
+
+        # Base marker
+        base = rows[0]
+        assert base["Position"] == 0.0
+        assert np.isnan(base["Diameter"])
+
+        # DBH row
+        dbh_row = rows[1]
+        assert dbh_row["Position"] == pytest.approx(1.30)
+        assert dbh_row["Diameter"] == pytest.approx(280.0, abs=0.1)
+        assert np.isnan(dbh_row["Sw"]) and np.isnan(dbh_row["F"])
+
+        # End-of-zone Sw row
+        sw_row = rows[2]
+        assert sw_row["Position"] == pytest.approx(2.3)
+        assert sw_row["Sw"] == "8"
+        assert np.isnan(sw_row["Diameter"])
+
+    def test_oval_tree_emits_ovality_feature_row(self):
+        sections = np.array([1.3])
+        a = np.array([[0.20]])
+        b = np.array([[0.20]])
+        sr = _make_section_result([1], sections, a, b)
+
+        tm = _make_tree_metrics(
+            tree_id=1, height_total=10.0, is_oval_at_dbh=True,
+        )
+        cov = CoverageMetrics(
+            tree_id=1, ht_cloud_m=12.0, ht_stem_m=10.0, rh_obs=0.83,
+            dbh_cm=40.0, sed_obs_cm=40.0, sed_obs_height_m=1.3, valid_sed=True,
+        )
+        # No centerline (so no sweep row)
+        rows = build_stem_description_rows(
+            plot_id="T_OVAL",
+            tree_metrics=[tm],
+            coverage_metrics=[cov],
+            section_result=sr,
+            tree_centerlines=[None],
+        )
+        f_rows = [r for r in rows
+                  if not (isinstance(r["F"], float) and np.isnan(r["F"]))]
+        assert len(f_rows) == 1
+        assert f_rows[0]["F"] == "O1.2+"
+
+    def test_invalid_dbh_skips_dbh_row(self):
+        sections = np.array([2.3, 3.3])
+        a = np.array([[0.18, 0.17]])
+        b = np.array([[0.18, 0.17]])
+        sr = _make_section_result([2], sections, a, b)
+
+        tm = _make_tree_metrics(tree_id=2, height_total=3.0)
+        tm.valid_at_dbh = False
+        tm.dbh = 0.0
+        cov = CoverageMetrics(
+            tree_id=2, ht_cloud_m=5.0, ht_stem_m=3.0, rh_obs=0.60,
+            dbh_cm=0.0, sed_obs_cm=34.0, sed_obs_height_m=3.3, valid_sed=True,
+        )
+        cl = np.array([
+            [0.0, 0.0, 2.3],
+            [0.0, 0.0, 2.8],
+            [0.0, 0.0, 3.3],
+        ])
+        rows = build_stem_description_rows(
+            plot_id="P", tree_metrics=[tm], coverage_metrics=[cov],
+            section_result=sr, tree_centerlines=[cl],
+        )
+        # base + Sw end-of-zone (no DBH row, no F)
+        assert len(rows) == 2
+        positions = [r["Position"] for r in rows]
+        assert positions[0] == 0.0
+        assert positions[1] == pytest.approx(3.3)
+
+
+class TestBuildTaperRows:
+
+    def test_targets_dbh_then_integer_meters(self):
+        # Sections every 0.2 m from 0.3 to 5.3 m. Topmost valid at z=5.3.
+        sections = np.round(np.arange(0.3, 5.31, 0.2), 1)
+        n = len(sections)
+        a = np.full((1, n), 0.20)
+        b = np.full((1, n), 0.20)
+        sr = _make_section_result([7], sections, a, b)
+
+        tm = _make_tree_metrics(tree_id=7, height_total=5.0, z_top=5.3)
+        rows = build_taper_rows([tm], sr, z_start=1.30, z_step=1.0)
+
+        positions = [r["Position_m"] for r in rows]
+        # Expected: 1.3, 2.0, 3.0, 4.0, 5.0
+        assert positions == pytest.approx([1.3, 2.0, 3.0, 4.0, 5.0])
+        # All diameters from a=b=0.20 → 400 mm
+        assert all(r["Diameter_mm"] == pytest.approx(400.0, abs=0.1) for r in rows)
+        assert all(r["Tree_ID"] == 7 for r in rows)
+
+    def test_skips_when_no_valid_section_near_target(self):
+        # Only one valid section at 1.3; all others invalid.
+        sections = np.array([0.3, 1.3, 2.3, 3.3])
+        a = np.array([[0.0, 0.20, 0.0, 0.0]])
+        b = np.array([[0.0, 0.20, 0.0, 0.0]])
+        sr = _make_section_result([3], sections, a, b)
+        tm = _make_tree_metrics(tree_id=3, height_total=3.0, z_top=3.3)
+        rows = build_taper_rows([tm], sr, z_start=1.30, z_step=1.0)
+        # Only the DBH target (1.3) finds a valid section.
+        assert len(rows) == 1
+        assert rows[0]["Position_m"] == pytest.approx(1.3)
+
+    def test_no_valid_section_emits_no_rows(self):
+        sections = np.array([0.3, 1.3, 2.3])
+        a = np.zeros((1, 3))
+        b = np.zeros((1, 3))
+        sr = _make_section_result([4], sections, a, b)
+        tm = _make_tree_metrics(tree_id=4, height_total=2.0, z_top=2.3)
+        assert build_taper_rows([tm], sr) == []
+
+    def test_z_step_2m(self):
+        # z_step=2 → targets 1.3, 2.0, 4.0, 6.0 ...
+        sections = np.round(np.arange(0.3, 7.51, 0.2), 1)
+        n = len(sections)
+        a = np.full((1, n), 0.18)
+        b = np.full((1, n), 0.18)
+        sr = _make_section_result([8], sections, a, b)
+        tm = _make_tree_metrics(tree_id=8, height_total=7.0, z_top=7.3)
+        rows = build_taper_rows([tm], sr, z_start=1.30, z_step=2.0)
+        positions = [r["Position_m"] for r in rows]
+        assert positions == pytest.approx([1.3, 2.0, 4.0, 6.0])
+
+
+class TestTaperDataframe:
+
+    def test_columns_in_canonical_order(self):
+        rows = [
+            {"Tree_ID": 1, "Position_m": 1.3, "Diameter_mm": 300.0},
+            {"Tree_ID": 1, "Position_m": 2.0, "Diameter_mm": 290.0},
+        ]
+        df = taper_to_dataframe(rows)
+        assert list(df.columns) == ["Tree_ID", "Position_m", "Diameter_mm"]
+        assert len(df) == 2
+
+
+class TestDataframeConverters:
+
+    def test_coverage_dataframe_columns_in_expected_order(self):
+        c = CoverageMetrics(
+            tree_id=7,
+            ht_cloud_m=20.0, ht_stem_m=15.0, rh_obs=0.75,
+            dbh_cm=32.0, sed_obs_cm=12.0, sed_obs_height_m=14.5,
+            valid_sed=True,
+        )
+        df = coverage_metrics_to_dataframe([c])
+        assert list(df.columns) == [
+            "Tree_ID", "HT_cloud_m", "HT_stem_m", "RH_obs", "DBH_cm",
+            "SED_obs_cm", "SED_obs_height_m",
+        ]
+        assert df.iloc[0]["Tree_ID"] == 7
+        assert df.iloc[0]["RH_obs"] == 0.75
+
+    def test_stem_description_dataframe_uses_interpine_column_order(self):
+        rows = [{
+            "PlotId": "P1", "TreeNumber": 1, "StemNo": 0, "Level": 0,
+            "Position": 1.3, "Diameter": 300.0,
+            "Br": float("nan"), "Sw": float("nan"), "F": float("nan"),
+        }]
+        df = stem_description_to_dataframe(rows)
+        assert list(df.columns) == [
+            "PlotId", "TreeNumber", "StemNo", "Level",
+            "Position", "Diameter", "Br", "Sw", "F",
+        ]

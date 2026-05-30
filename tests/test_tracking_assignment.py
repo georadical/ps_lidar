@@ -1,0 +1,1745 @@
+"""Tests for ``src.core.tracking_assignment`` — Phase 1B real (GS block).
+
+GS.1 (``filter_by_verticality``) is exercised here with two synthetic
+clouds:
+
+  * a vertical pillar (stem-like) → must be kept,
+  * a horizontal slab (ground / canopy-like) → must be rejected.
+
+The function is a thin wrapper over the well-tested
+``compute_verticality_mask_early_exit``, so we don't repeat the
+exhaustive numerical coverage that lives in
+``tests/test_segmentation.py`` and the feature tests. What we validate
+here is the **API contract** at the GS.1 surface and the qualitative
+keep/reject behaviour on synthetic geometric extremes.
+"""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from src.core.ellipse_fitting import EllipseFitConfig
+from src.core.tracking_assignment import (
+    Cluster2D,
+    ClusterEllipse,
+    HorizontalSlice,
+    Track,
+    TrackNode,
+    TrackingAssignmentConfig,
+    TrackingAssignmentResult,
+    assign_tree_ids_from_tracks,
+    assign_trees_by_curved_cylinder,
+    assign_trees_by_tracking,
+    bootstrap_tracks_from_basal_stripe,
+    build_tracking_audit_table,
+    build_tree_axes_from_tracks,
+    cluster_slice,
+    export_tracking_audit_table,
+    filter_by_verticality,
+    fit_ellipses_in_slice,
+    slice_horizontal_global,
+    track_clusters_vertical,
+    tracking_result_to_trunk_extraction_result,
+)
+from src.core.trunk_extraction import TrunkExtractionResult
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+def _vertical_pillar(
+    n: int = 4000,
+    radius: float = 0.15,
+    height: float = 8.0,
+    centre_xy=(0.0, 0.0),
+    rng_seed: int = 0,
+) -> np.ndarray:
+    """Cylindrical column aligned with +z — high verticality everywhere."""
+    rng = np.random.default_rng(seed=rng_seed)
+    z = rng.uniform(0.0, height, size=n)
+    a = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    x = centre_xy[0] + radius * np.cos(a)
+    y = centre_xy[1] + radius * np.sin(a)
+    return np.column_stack([x, y, z]).astype(np.float64)
+
+
+def _horizontal_slab(
+    n: int = 4000,
+    side: float = 4.0,
+    z: float = 0.05,
+    rng_seed: int = 1,
+) -> np.ndarray:
+    """Flat layer at fixed z (ground-like) — verticality near zero."""
+    rng = np.random.default_rng(seed=rng_seed)
+    x = rng.uniform(-side / 2.0, side / 2.0, size=n)
+    y = rng.uniform(-side / 2.0, side / 2.0, size=n)
+    z_arr = np.full(n, z, dtype=np.float64) + rng.normal(0, 0.005, size=n)
+    return np.column_stack([x, y, z_arr]).astype(np.float64)
+
+
+# ===========================================================================
+# API-contract tests
+# ===========================================================================
+
+class TestFilterByVerticalityContract:
+
+    def test_returns_filtered_cloud_and_mask_aligned(self):
+        xyz = _vertical_pillar(n=2000)
+        filt, mask = filter_by_verticality(xyz, verbose=False)
+
+        assert isinstance(filt, np.ndarray)
+        assert isinstance(mask, np.ndarray)
+        assert mask.dtype == bool
+        assert mask.shape == (xyz.shape[0],)
+        # Subset relationship: filtered = xyz[mask]
+        np.testing.assert_array_equal(filt, xyz[mask])
+
+    def test_rejects_invalid_xyz_shape(self):
+        with pytest.raises(ValueError):
+            filter_by_verticality(np.zeros((10, 2)))
+        with pytest.raises(ValueError):
+            filter_by_verticality(np.zeros((10,)))
+
+    def test_rejects_out_of_range_threshold(self):
+        xyz = _vertical_pillar(n=100)
+        with pytest.raises(ValueError):
+            filter_by_verticality(xyz, threshold=-0.1)
+        with pytest.raises(ValueError):
+            filter_by_verticality(xyz, threshold=1.5)
+
+
+# ===========================================================================
+# Qualitative keep/reject behaviour
+# ===========================================================================
+
+class TestFilterByVerticalityBehaviour:
+
+    def test_pillar_mostly_kept(self):
+        # A near-perfect vertical pillar must retain the vast majority
+        # of its points at the default threshold.
+        xyz = _vertical_pillar(n=4000, radius=0.15, height=8.0)
+        _filt, mask = filter_by_verticality(xyz, threshold=0.7)
+        keep_ratio = float(mask.mean())
+        assert keep_ratio >= 0.90, f"pillar keep ratio {keep_ratio:.2%} too low"
+
+    def test_horizontal_slab_mostly_rejected(self):
+        # A horizontal slab should have very low verticality and be
+        # mostly rejected. We accept up to ~20% keep rate to absorb
+        # edge-of-slab voxels whose pgeof neighbourhood includes the
+        # vertical jitter in z noise (σ=5 mm). The strong qualitative
+        # test is the asymmetry vs the pillar, exercised below.
+        xyz = _horizontal_slab(n=4000, side=4.0)
+        _filt, mask = filter_by_verticality(xyz, threshold=0.7)
+        keep_ratio = float(mask.mean())
+        assert keep_ratio <= 0.20, f"slab keep ratio {keep_ratio:.2%} too high"
+
+    def test_mixed_cloud_separates_components(self):
+        # Combined pillar + slab: the pillar portion of the output mask
+        # should be mostly True, the slab portion mostly False.
+        pillar = _vertical_pillar(n=3000, radius=0.15, height=8.0)
+        slab = _horizontal_slab(n=3000, side=4.0, z=0.05)
+        xyz = np.concatenate([pillar, slab], axis=0)
+
+        _filt, mask = filter_by_verticality(xyz, threshold=0.7)
+
+        pillar_keep = float(mask[: pillar.shape[0]].mean())
+        slab_keep = float(mask[pillar.shape[0]:].mean())
+
+        # Asymmetry: the pillar side must keep far more points than the
+        # slab side — that's the whole point of the filter.
+        assert pillar_keep > slab_keep + 0.5, (
+            f"pillar keep {pillar_keep:.2%} vs slab keep {slab_keep:.2%} "
+            "— not enough separation"
+        )
+
+    def test_threshold_monotonicity(self):
+        # Higher threshold → fewer points kept (monotonically).
+        xyz = _vertical_pillar(n=4000, radius=0.15, height=8.0)
+        _f1, m1 = filter_by_verticality(xyz, threshold=0.5)
+        _f2, m2 = filter_by_verticality(xyz, threshold=0.85)
+        assert m1.sum() >= m2.sum(), (
+            f"raising threshold did not shrink the kept set: "
+            f"{m1.sum()} vs {m2.sum()}"
+        )
+
+
+# ===========================================================================
+# GS.2 — slice_horizontal_global
+# ===========================================================================
+
+def _uniform_pillar(n: int, height: float, rng_seed: int = 0) -> np.ndarray:
+    """Pillar with z uniform on [0, height] — used to test slice membership."""
+    rng = np.random.default_rng(seed=rng_seed)
+    z = rng.uniform(0.0, height, size=n)
+    a = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    x = 0.15 * np.cos(a)
+    y = 0.15 * np.sin(a)
+    return np.column_stack([x, y, z]).astype(np.float64)
+
+
+class TestSliceHorizontalGlobalContract:
+
+    def test_returns_list_of_horizontal_slices(self):
+        xyz = _uniform_pillar(n=500, height=5.0)
+        slices = slice_horizontal_global(xyz, z_min=0.5, z_max=4.5)
+        assert isinstance(slices, list)
+        assert all(isinstance(s, HorizontalSlice) for s in slices)
+
+    def test_empty_cloud_still_returns_slabs(self):
+        # Empty input → every slab is still listed, but with empty
+        # indices arrays. Lets downstream callers track coverage gaps.
+        xyz = np.empty((0, 3), dtype=np.float64)
+        slices = slice_horizontal_global(xyz, z_min=0.0, z_max=5.0, slab_step=1.0)
+        assert len(slices) == 5
+        for s in slices:
+            assert s.indices.size == 0
+
+    def test_rejects_invalid_shape(self):
+        with pytest.raises(ValueError):
+            slice_horizontal_global(np.zeros((10, 2)))
+
+    def test_rejects_invalid_z_range(self):
+        xyz = _uniform_pillar(n=100, height=5.0)
+        with pytest.raises(ValueError):
+            slice_horizontal_global(xyz, z_min=5.0, z_max=5.0)
+        with pytest.raises(ValueError):
+            slice_horizontal_global(xyz, z_min=5.0, z_max=2.0)
+
+    def test_rejects_non_positive_step_or_thickness(self):
+        xyz = _uniform_pillar(n=100, height=5.0)
+        with pytest.raises(ValueError):
+            slice_horizontal_global(xyz, slab_step=0.0)
+        with pytest.raises(ValueError):
+            slice_horizontal_global(xyz, slab_step=-1.0)
+        with pytest.raises(ValueError):
+            slice_horizontal_global(xyz, slab_half_thickness=0.0)
+
+
+class TestSliceHorizontalGlobalBehaviour:
+
+    def test_slab_centres_match_arange(self):
+        # Slab centres are np.arange(z_min, z_max, step).
+        xyz = _uniform_pillar(n=500, height=10.0)
+        slices = slice_horizontal_global(
+            xyz, z_min=0.5, z_max=9.5, slab_step=1.0,
+        )
+        expected_centres = np.arange(0.5, 9.5, 1.0)
+        actual_centres = np.array([s.z_centre for s in slices])
+        np.testing.assert_array_equal(actual_centres, expected_centres)
+
+    def test_slab_bounds_are_centre_plus_minus_half(self):
+        xyz = _uniform_pillar(n=100, height=5.0)
+        slices = slice_horizontal_global(
+            xyz, z_min=1.0, z_max=3.0, slab_step=1.0, slab_half_thickness=0.3,
+        )
+        # Two slabs at z=1.0, 2.0
+        s0 = slices[0]
+        assert s0.z_centre == 1.0
+        assert s0.z_low == pytest.approx(0.7)
+        assert s0.z_high == pytest.approx(1.3)
+
+    def test_indices_actually_in_z_range(self):
+        # Every index returned must point to a point whose z is in the
+        # slab's [z_low, z_high) range.
+        rng = np.random.default_rng(seed=42)
+        n = 5000
+        z = rng.uniform(0.0, 10.0, size=n)
+        x = rng.uniform(-1, 1, size=n)
+        y = rng.uniform(-1, 1, size=n)
+        xyz = np.column_stack([x, y, z])
+
+        slices = slice_horizontal_global(
+            xyz, z_min=0.5, z_max=9.5, slab_step=1.0,
+        )
+        for s in slices:
+            assigned_z = xyz[s.indices, 2]
+            assert np.all(assigned_z >= s.z_low)
+            assert np.all(assigned_z < s.z_high)
+
+    def test_no_overlap_no_gap_when_half_equals_step_over_two(self):
+        # The canonical config: step=1.0, half=0.5 → with slab centres
+        # at np.arange(z_min, z_max, step) = [0.5, 1.5, ..., 8.5], the
+        # slabs cover the half-open range [0.0, 9.0). Every point in
+        # that range must be assigned to exactly one slab.
+        rng = np.random.default_rng(seed=7)
+        n = 4000
+        # Restrict the point cloud to the coverage range so the test
+        # actually probes the no-gap-no-overlap property.
+        z = rng.uniform(0.0, 9.0, size=n)
+        x = rng.uniform(-1, 1, size=n)
+        y = rng.uniform(-1, 1, size=n)
+        xyz = np.column_stack([x, y, z])
+
+        slices = slice_horizontal_global(
+            xyz, z_min=0.5, z_max=9.5, slab_step=1.0, slab_half_thickness=0.5,
+        )
+        total_assigned = sum(s.indices.size for s in slices)
+        assert total_assigned == n, (
+            f"expected {n} assignments, got {total_assigned} "
+            "— either gap or overlap"
+        )
+
+        # No duplicates: union of all index arrays has n unique elements.
+        all_idx = np.concatenate([s.indices for s in slices])
+        assert np.unique(all_idx).size == n
+
+    def test_overlap_when_half_greater_than_step_over_two(self):
+        # Slabs overlap: a point near a slab boundary may appear in two.
+        rng = np.random.default_rng(seed=7)
+        n = 1000
+        z = rng.uniform(0.0, 5.0, size=n)
+        x = np.zeros(n)
+        y = np.zeros(n)
+        xyz = np.column_stack([x, y, z])
+
+        slices = slice_horizontal_global(
+            xyz, z_min=0.5, z_max=4.5, slab_step=1.0, slab_half_thickness=0.7,
+        )
+        total_assigned = sum(s.indices.size for s in slices)
+        # Some points are in two slabs → total assigned exceeds n
+        # (provided the centre z range has decent coverage).
+        assert total_assigned > int(0.8 * n) and total_assigned <= 2 * n
+
+    def test_pillar_distributes_points_across_slabs(self):
+        # A uniform-z pillar should put roughly equal counts in each slab.
+        xyz = _uniform_pillar(n=10000, height=10.0)
+        slices = slice_horizontal_global(
+            xyz, z_min=0.5, z_max=9.5, slab_step=1.0, slab_half_thickness=0.5,
+        )
+        counts = np.array([s.indices.size for s in slices])
+        # 9 slabs covering 9 m of a 10 m uniform pillar → ~1000 each.
+        # Allow ±25 % variance for the uniform draw.
+        assert counts.min() > 700
+        assert counts.max() < 1300
+
+
+# ===========================================================================
+# GS.3 — cluster_slice (DBSCAN on slice XY)
+# ===========================================================================
+
+def _ring_at_z(
+    cx: float, cy: float, radius: float, z: float,
+    n: int = 200, rng_seed: int = 0,
+) -> np.ndarray:
+    """Generate `n` points forming an XY ring at a fixed height."""
+    rng = np.random.default_rng(seed=rng_seed)
+    a = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    x = cx + radius * np.cos(a)
+    y = cy + radius * np.sin(a)
+    z_arr = np.full(n, z, dtype=np.float64) + rng.normal(0, 0.01, size=n)
+    return np.column_stack([x, y, z_arr]).astype(np.float64)
+
+
+def _whole_slice(xyz: np.ndarray, z_centre: float) -> HorizontalSlice:
+    """Build a HorizontalSlice that selects all of `xyz`."""
+    return HorizontalSlice(
+        z_centre=z_centre,
+        z_low=z_centre - 100.0,
+        z_high=z_centre + 100.0,
+        indices=np.arange(xyz.shape[0], dtype=np.int64),
+    )
+
+
+class TestClusterSliceContract:
+
+    def test_returns_list_of_cluster2d(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl)
+        assert isinstance(clusters, list)
+        assert all(isinstance(c, Cluster2D) for c in clusters)
+
+    def test_empty_slice_returns_empty_list(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        empty = HorizontalSlice(
+            z_centre=10.0, z_low=9.5, z_high=10.5,
+            indices=np.empty(0, dtype=np.int64),
+        )
+        assert cluster_slice(xyz, empty) == []
+
+    def test_indices_refer_to_input_xyz_not_slice_subset(self):
+        # Build a cloud where the slice selects a non-contiguous subset
+        # and verify the returned cluster indices are in the input-cloud
+        # coordinate system.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=120)
+        noise_before = np.random.default_rng(7).normal(size=(50, 3))
+        noise_before[:, 2] = -10.0  # well below slab
+        noise_after = np.random.default_rng(8).normal(size=(50, 3))
+        noise_after[:, 2] = 100.0   # well above slab
+        xyz = np.vstack([noise_before, ring, noise_after])
+
+        # Slice spans only the ring region.
+        slice_obj = HorizontalSlice(
+            z_centre=1.5, z_low=1.0, z_high=2.0,
+            indices=np.arange(50, 50 + 120, dtype=np.int64),
+        )
+        clusters = cluster_slice(xyz, slice_obj, eps=0.05, min_samples=5)
+        assert len(clusters) >= 1
+        # All cluster indices must be inside [50, 170)
+        for c in clusters:
+            assert c.indices.min() >= 50
+            assert c.indices.max() < 50 + 120
+
+    def test_rejects_invalid_shape(self):
+        with pytest.raises(ValueError):
+            cluster_slice(np.zeros((10, 2)), _whole_slice(np.zeros((10, 3)), 0.0))
+
+    def test_rejects_non_positive_eps_or_min_samples(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=50)
+        sl = _whole_slice(xyz, z_centre=1.5)
+        with pytest.raises(ValueError):
+            cluster_slice(xyz, sl, eps=0.0)
+        with pytest.raises(ValueError):
+            cluster_slice(xyz, sl, eps=-0.05)
+        with pytest.raises(ValueError):
+            cluster_slice(xyz, sl, min_samples=0)
+
+
+class TestClusterSliceBehaviour:
+
+    def test_single_well_formed_ring_makes_one_cluster(self):
+        xyz = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 1
+        c = clusters[0]
+        assert c.n_points == 200
+        # Centroid near (0, 0)
+        np.testing.assert_allclose(c.centroid_xy, [0.0, 0.0], atol=0.02)
+
+    def test_two_well_separated_rings_make_two_clusters(self):
+        # Two rings centred 2 m apart — way more than eps=0.10
+        ring_a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=1)
+        ring_b = _ring_at_z(2.0, 0.0, 0.15, 1.5, n=200, rng_seed=2)
+        xyz = np.vstack([ring_a, ring_b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 2
+        # Each cluster has ~200 points (no cross-contamination).
+        sizes = sorted(c.n_points for c in clusters)
+        assert sizes == [200, 200]
+
+    def test_pure_noise_returns_no_clusters(self):
+        rng = np.random.default_rng(seed=42)
+        # Scatter sparse random points so DBSCAN labels everything as noise
+        # at the default min_samples=10.
+        xyz = rng.uniform(-5.0, 5.0, size=(80, 3))
+        xyz[:, 2] = 1.5
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.05, min_samples=10)
+        assert clusters == []
+
+    def test_eps_monotonicity(self):
+        # Two rings 0.4 m apart. Small eps separates them; large eps
+        # merges them.
+        ring_a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=1)
+        ring_b = _ring_at_z(0.4, 0.0, 0.15, 1.5, n=200, rng_seed=2)
+        xyz = np.vstack([ring_a, ring_b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+
+        small_eps = cluster_slice(xyz, sl, eps=0.05, min_samples=5)
+        big_eps = cluster_slice(xyz, sl, eps=0.30, min_samples=5)
+        assert len(small_eps) >= len(big_eps), (
+            f"raising eps did not reduce cluster count: "
+            f"{len(small_eps)} → {len(big_eps)}"
+        )
+
+    def test_centroid_matches_mean_of_cluster_points(self):
+        ring = _ring_at_z(1.0, 2.5, 0.15, 1.5, n=200, rng_seed=9)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 1
+        c = clusters[0]
+        expected = ring[c.indices, :2].mean(axis=0)
+        np.testing.assert_allclose(c.centroid_xy, expected, atol=1e-9)
+
+
+class TestClusterSliceVoxelised:
+    """Voxel pre-aggregation path: voxelise the slab → DBSCAN on
+    centroids → expand voxel labels back to original points. The
+    cluster.indices field MUST still point into the original input
+    cloud, same contract as the raw-DBSCAN path."""
+
+    def test_rejects_negative_voxel_resolution(self):
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200)
+        sl = _whole_slice(ring, z_centre=1.5)
+        with pytest.raises(ValueError):
+            cluster_slice(ring, sl, voxel_resolution=-0.05)
+
+    def test_voxel_zero_equals_legacy_path(self):
+        # voxel_resolution=0 must reproduce the legacy raw-DBSCAN path
+        # bit for bit.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=42)
+        sl = _whole_slice(ring, z_centre=1.5)
+        legacy = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        explicit_zero = cluster_slice(
+            ring, sl, eps=0.10, min_samples=5, voxel_resolution=0.0,
+        )
+        assert len(legacy) == len(explicit_zero)
+        for a, b in zip(legacy, explicit_zero):
+            np.testing.assert_array_equal(a.indices, b.indices)
+
+    def test_voxelised_finds_single_ring(self):
+        # 800 points around a single ring → after 0.05 m voxelisation
+        # ~20 voxels along the perimeter. eps=0.10 connects neighbours,
+        # min_samples=3 (per-voxel count) recovers one cluster.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=800, rng_seed=11)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(
+            ring, sl,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        assert len(clusters) == 1
+        # All 800 raw points should be in the cluster (no noise drop
+        # since every voxel is part of the perimeter cluster).
+        assert clusters[0].n_points == 800
+        # Centroid still ≈ ring centre.
+        np.testing.assert_allclose(
+            clusters[0].centroid_xy, [0.0, 0.0], atol=0.03,
+        )
+
+    def test_voxelised_separates_two_rings(self):
+        # Two well-separated rings → two voxelised clusters.
+        a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=400, rng_seed=1)
+        b = _ring_at_z(2.0, 0.0, 0.15, 1.5, n=400, rng_seed=2)
+        xyz = np.vstack([a, b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(
+            xyz, sl,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        assert len(clusters) == 2
+
+    def test_voxelised_cluster_indices_point_to_original_cloud(self):
+        # Sandwich the ring between unrelated points so we can verify
+        # the cluster indices are in the GLOBAL coordinate system,
+        # not voxel-local.
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=400, rng_seed=3)
+        noise_before = np.random.default_rng(7).normal(size=(50, 3))
+        noise_before[:, 2] = -10.0
+        noise_after = np.random.default_rng(8).normal(size=(50, 3))
+        noise_after[:, 2] = 100.0
+        xyz = np.vstack([noise_before, ring, noise_after])
+
+        # Slice covers only the ring.
+        slice_obj = HorizontalSlice(
+            z_centre=1.5, z_low=1.0, z_high=2.0,
+            indices=np.arange(50, 50 + 400, dtype=np.int64),
+        )
+        clusters = cluster_slice(
+            xyz, slice_obj,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        assert len(clusters) == 1
+        c = clusters[0]
+        assert c.indices.min() >= 50
+        assert c.indices.max() < 50 + 400
+
+    def test_voxelisation_significantly_reduces_points_per_voxel(self):
+        # Sanity: with 4000 points densely packed in a 1 m × 1 m square
+        # and voxel_resolution=0.05 → at most 400 voxels (20×20 grid).
+        # The voxelised DBSCAN should see ≤400 entries vs 4000 raw.
+        rng = np.random.default_rng(seed=99)
+        x = rng.uniform(-0.5, 0.5, size=4000)
+        y = rng.uniform(-0.5, 0.5, size=4000)
+        z = np.full(4000, 1.5) + rng.normal(0, 0.01, size=4000)
+        xyz = np.column_stack([x, y, z]).astype(np.float64)
+        sl = _whole_slice(xyz, z_centre=1.5)
+
+        # Voxelise with relatively forgiving DBSCAN params; the test
+        # only checks that we get clusters at all (i.e. the voxelised
+        # path doesn't crash on a dense square) — quality is exercised
+        # by the ring tests above.
+        clusters = cluster_slice(
+            xyz, sl,
+            eps=0.10, min_samples=3, voxel_resolution=0.05,
+        )
+        # Should produce at least one (big) cluster.
+        assert len(clusters) >= 1
+        # The kept-point sum must not exceed the input count.
+        total_assigned = sum(c.n_points for c in clusters)
+        assert total_assigned <= 4000
+
+
+# ===========================================================================
+# GS.4 — fit_ellipses_in_slice
+# ===========================================================================
+
+def _stem_ellipse_config(**overrides) -> EllipseFitConfig:
+    """Loose-ish EllipseFitConfig sized for synthetic test rings
+    (radius ~0.15 m, ~150 points per ring). Mirrors the helper used
+    in `test_ellipse_fitting.py`."""
+    base = dict(
+        min_points_section=40,
+        r_min=0.05,
+        r_max=0.40,
+        inner_ratio=0.5,
+        max_inner_points=5,
+        n_sectors=16,
+        min_sectors=9,
+        sector_width=0.02,
+        ransac_n_iters=200,
+        ransac_tau_sampson=0.005,
+        min_inlier_fraction=0.6,
+        min_aspect_ratio=0.5,
+        cluster_eps=0.02,
+    )
+    base.update(overrides)
+    return EllipseFitConfig(**base)
+
+
+class TestFitEllipsesInSliceContract:
+
+    def test_empty_input_returns_empty_list(self):
+        xyz = np.empty((0, 3), dtype=np.float64)
+        cfg = _stem_ellipse_config()
+        assert fit_ellipses_in_slice(xyz, [], cfg) == []
+
+    def test_returns_list_of_cluster_ellipse(self):
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=150, rng_seed=0)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng)
+        assert isinstance(results, list)
+        assert all(isinstance(r, ClusterEllipse) for r in results)
+
+
+class TestFitEllipsesInSliceBehaviour:
+
+    def test_single_ring_fitted_within_tolerance(self):
+        ring = _ring_at_z(0.5, -0.5, 0.15, 1.5, n=200, rng_seed=0)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng)
+        assert len(results) == 1
+        r = results[0]
+        # Indices preserved
+        np.testing.assert_array_equal(r.indices, clusters[0].indices)
+        # Geometry recovered
+        assert abs(r.xc - 0.5) < 5e-3
+        assert abs(r.yc - (-0.5)) < 5e-3
+        assert abs(r.a - 0.15) < 5e-3
+        assert abs(r.b - 0.15) < 5e-3
+        assert r.a >= r.b  # convention
+        assert r.check_status in (0, 1)
+        assert r.n_points == clusters[0].n_points
+
+    def test_two_clusters_both_fitted(self):
+        ring_a = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=1)
+        ring_b = _ring_at_z(2.0, 0.0, 0.15, 1.5, n=200, rng_seed=2)
+        xyz = np.vstack([ring_a, ring_b])
+        sl = _whole_slice(xyz, z_centre=1.5)
+        clusters = cluster_slice(xyz, sl, eps=0.10, min_samples=5)
+        assert len(clusters) == 2  # sanity from GS.3
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, clusters, cfg, rng=rng)
+        assert len(results) == 2
+        # Centres match the two ring centroids (order may vary).
+        centres = sorted([(r.xc, r.yc) for r in results])
+        np.testing.assert_allclose(centres[0], (0.0, 0.0), atol=5e-3)
+        np.testing.assert_allclose(centres[1], (2.0, 0.0), atol=5e-3)
+
+    def test_undersized_cluster_dropped(self):
+        # 10 points → below min_points_section=40 → _fit_ellipse_check
+        # returns status 2 with zeros → dropped by the filter.
+        rng_geom = np.random.default_rng(seed=0)
+        n = 10
+        a = rng_geom.uniform(0.0, 2.0 * np.pi, size=n)
+        x = 0.15 * np.cos(a)
+        y = 0.15 * np.sin(a)
+        z = np.full(n, 1.5)
+        xyz = np.column_stack([x, y, z])
+        cluster = Cluster2D(
+            indices=np.arange(n, dtype=np.int64),
+            centroid_xy=np.array([0.0, 0.0]),
+            n_points=n,
+        )
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, [cluster], cfg, rng=rng)
+        assert results == []
+
+    def test_pure_noise_cluster_dropped(self):
+        # Random points spread over a 1 m square at fixed z → no ellipse
+        # passes the quality checks → cluster dropped.
+        rng_geom = np.random.default_rng(seed=99)
+        n = 200
+        x = rng_geom.uniform(-0.5, 0.5, size=n)
+        y = rng_geom.uniform(-0.5, 0.5, size=n)
+        z = np.full(n, 1.5)
+        xyz = np.column_stack([x, y, z])
+        cluster = Cluster2D(
+            indices=np.arange(n, dtype=np.int64),
+            centroid_xy=np.array([0.0, 0.0]),
+            n_points=n,
+        )
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, [cluster], cfg, rng=rng)
+        assert results == []
+
+    def test_a_at_least_b_invariant(self):
+        # Even on a slightly elongated ellipse, the wrapper must respect
+        # the a ≥ b convention.
+        rng_geom = np.random.default_rng(seed=3)
+        n = 200
+        t = np.linspace(0.0, 2.0 * np.pi, n, endpoint=False)
+        x = 0.18 * np.cos(t)
+        y = 0.12 * np.sin(t)
+        z = np.full(n, 1.5)
+        xyz = np.column_stack([x, y, z])
+        cluster = Cluster2D(
+            indices=np.arange(n, dtype=np.int64),
+            centroid_xy=np.array([0.0, 0.0]),
+            n_points=n,
+        )
+        cfg = _stem_ellipse_config()
+        rng = np.random.default_rng(seed=42)
+
+        results = fit_ellipses_in_slice(xyz, [cluster], cfg, rng=rng)
+        assert len(results) == 1
+        r = results[0]
+        assert r.a >= r.b
+        assert abs(r.a - 0.18) < 5e-3
+        assert abs(r.b - 0.12) < 5e-3
+
+    def test_reproducible_with_seed(self):
+        ring = _ring_at_z(0.0, 0.0, 0.15, 1.5, n=200, rng_seed=11)
+        sl = _whole_slice(ring, z_centre=1.5)
+        clusters = cluster_slice(ring, sl, eps=0.10, min_samples=5)
+        cfg = _stem_ellipse_config()
+
+        rng_a = np.random.default_rng(seed=999)
+        rng_b = np.random.default_rng(seed=999)
+        ra = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng_a)
+        rb = fit_ellipses_in_slice(ring, clusters, cfg, rng=rng_b)
+        assert ra == rb
+
+
+# ===========================================================================
+# GS.5 — track_clusters_vertical (vertical greedy matching)
+# ===========================================================================
+
+def _mock_ellipse(xc: float, yc: float, a: float = 0.15, b: float = 0.15,
+                   theta: float = 0.0) -> ClusterEllipse:
+    """Construct a minimal ClusterEllipse for tracking-only tests
+    (without going through RANSAC). Indices are a placeholder; tracking
+    only reads ``xc, yc``."""
+    return ClusterEllipse(
+        indices=np.empty(0, dtype=np.int64),
+        xc=xc, yc=yc, a=a, b=b, theta=theta,
+        sector_pct=100.0, check_status=0, n_points=200,
+    )
+
+
+class TestTrackClustersVerticalContract:
+
+    def test_empty_input_returns_empty_list(self):
+        assert track_clusters_vertical([], []) == []
+
+    def test_rejects_mismatched_lengths(self):
+        with pytest.raises(ValueError):
+            track_clusters_vertical([1.0, 2.0], [[_mock_ellipse(0, 0)]])
+
+    def test_rejects_non_positive_params(self):
+        with pytest.raises(ValueError):
+            track_clusters_vertical(
+                [1.0], [[_mock_ellipse(0, 0)]], max_xy_jump=0.0,
+            )
+        with pytest.raises(ValueError):
+            track_clusters_vertical(
+                [1.0], [[_mock_ellipse(0, 0)]], max_gap_slabs=0,
+            )
+
+
+class TestTrackClustersVerticalBehaviour:
+
+    def test_single_aligned_stem_becomes_one_track(self):
+        # Same ellipse position at every slab → one track with all nodes.
+        z_centres = [1.0, 2.0, 3.0, 4.0, 5.0]
+        slabs = [[_mock_ellipse(0.0, 0.0)] for _ in z_centres]
+
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 1
+        t = tracks[0]
+        assert t.n_nodes == 5
+        # Nodes are ordered by z ascending
+        node_z = [n.z for n in t.nodes]
+        assert node_z == z_centres
+
+    def test_two_parallel_stems_become_two_tracks(self):
+        # Two pillars 2 m apart in XY, both consistent across slabs.
+        z_centres = [1.0, 2.0, 3.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0), _mock_ellipse(2.0, 0.0)]
+            for _ in z_centres
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 2
+        assert all(t.n_nodes == 3 for t in tracks)
+
+    def test_tolerates_one_missing_slab(self):
+        # Same stem at z=1, no ellipse at z=2, same stem at z=3 →
+        # one track of 2 nodes (skip z=2). max_gap_slabs=1 (default).
+        z_centres = [1.0, 2.0, 3.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [],  # gap
+            [_mock_ellipse(0.0, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        # max_gap_slabs default is 1 → gap of exactly 1 IS allowed.
+        # (slab idx jumps from 0 → 2, gap = 2; just over the budget).
+        # We need max_gap_slabs=2 to bridge it.
+        tracks_relaxed = track_clusters_vertical(
+            z_centres, slabs, max_gap_slabs=2,
+        )
+        assert len(tracks_relaxed) == 1
+        assert tracks_relaxed[0].n_nodes == 2
+
+    def test_does_not_bridge_excessive_gap(self):
+        # Gap exceeds budget → two separate tracks.
+        z_centres = [1.0, 2.0, 3.0, 4.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [],
+            [],
+            [_mock_ellipse(0.0, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs, max_gap_slabs=2)
+        assert len(tracks) == 2
+
+    def test_jump_above_threshold_breaks_track(self):
+        # Same nominal stem but XY jumps by 1 m between adjacent slabs —
+        # exceeds default max_xy_jump=0.30 → two separate tracks.
+        z_centres = [1.0, 2.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [_mock_ellipse(1.0, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 2
+        # Each track has one node.
+        assert all(t.n_nodes == 1 for t in tracks)
+
+    def test_inclined_stem_tracked_when_jump_under_threshold(self):
+        # Stem inclined by ~10 cm per slab → well below max_xy_jump=0.30
+        # → single track.
+        z_centres = [1.0, 2.0, 3.0, 4.0]
+        slabs = [
+            [_mock_ellipse(0.0 + 0.1 * i, 0.0)]
+            for i in range(4)
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 1
+        assert tracks[0].n_nodes == 4
+
+    def test_greedy_picks_closest_when_multiple_candidates(self):
+        # Slab 1 has one ellipse at (0, 0).
+        # Slab 2 has two candidates: (0.05, 0) very close, and
+        # (0.20, 0) further. The track must claim the closer one
+        # (0.05); the further one starts its own track.
+        z_centres = [1.0, 2.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0)],
+            [_mock_ellipse(0.05, 0.0), _mock_ellipse(0.20, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        assert len(tracks) == 2
+        # The longer track is the original one extended.
+        long_track = max(tracks, key=lambda t: t.n_nodes)
+        assert long_track.n_nodes == 2
+        # And its top node is the close ellipse.
+        assert long_track.nodes[-1].ellipse.xc == pytest.approx(0.05)
+
+    def test_global_cost_sort_avoids_pathological_greedy(self):
+        # Two tracks competing for the same ellipse: a per-track greedy
+        # would let the first-seen track claim it; the global-cost sort
+        # prefers the track whose match is closer.
+        # Slab 1: two ellipses at (0,0) and (0.20,0).
+        # Slab 2: one ellipse at (0.18, 0).
+        # Per-track greedy in order [0,0]→(0.18) might claim it
+        # (distance 0.18). But the (0.20,0) track has distance 0.02 —
+        # it should win.
+        z_centres = [1.0, 2.0]
+        slabs = [
+            [_mock_ellipse(0.0, 0.0), _mock_ellipse(0.20, 0.0)],
+            [_mock_ellipse(0.18, 0.0)],
+        ]
+        tracks = track_clusters_vertical(z_centres, slabs, max_xy_jump=0.30)
+        # 3 tracks total: (0,0) singleton, (0.20,0)→(0.18,0) extended,
+        # because slabs above only had one match-able ellipse.
+        # Actually it's 2 tracks: (0,0) alone, and (0.20)→(0.18) chained.
+        # The (0.20,0)→(0.18,0) track wins the match.
+        long_track = max(tracks, key=lambda t: t.n_nodes)
+        assert long_track.n_nodes == 2
+        assert long_track.nodes[0].ellipse.xc == pytest.approx(0.20)
+        assert long_track.nodes[1].ellipse.xc == pytest.approx(0.18)
+
+    def test_track_properties(self):
+        z_centres = [1.0, 2.0, 3.0]
+        slabs = [[_mock_ellipse(0.0, 0.0)] for _ in z_centres]
+        tracks = track_clusters_vertical(z_centres, slabs)
+        t = tracks[0]
+        assert t.z_bottom == 1.0
+        assert t.z_top == 3.0
+        assert t.n_nodes == 3
+
+
+# ===========================================================================
+# GS.6 — bootstrap_tracks_from_basal_stripe
+# ===========================================================================
+
+def _track_from_z_values(zs: list, xc: float = 0.0, yc: float = 0.0) -> Track:
+    """Build a Track at fixed (xc, yc) with one node per z in `zs`."""
+    nodes = [TrackNode(z=z, ellipse=_mock_ellipse(xc, yc)) for z in zs]
+    return Track(nodes=nodes)
+
+
+class TestBootstrapTracksFromBasalStripeContract:
+
+    def test_empty_input_returns_empty(self):
+        assert bootstrap_tracks_from_basal_stripe([], 0.5, 2.0) == []
+
+    def test_rejects_inverted_stripe_bounds(self):
+        with pytest.raises(ValueError):
+            bootstrap_tracks_from_basal_stripe(
+                [_track_from_z_values([1.0])], 2.0, 0.5,
+            )
+
+    def test_rejects_non_positive_min_track_length(self):
+        with pytest.raises(ValueError):
+            bootstrap_tracks_from_basal_stripe(
+                [_track_from_z_values([1.0])], 0.5, 2.0, min_track_length=0,
+            )
+
+
+class TestBootstrapTracksFromBasalStripeBehaviour:
+
+    def test_track_rooted_in_stripe_is_kept(self):
+        # Track starts at z=1.0 (inside stripe 0.5-2.0) → kept.
+        t = _track_from_z_values([1.0, 2.0, 3.0, 4.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == [t]
+
+    def test_track_rooted_above_stripe_is_dropped(self):
+        # Lowest node at z=5 → above stripe top 2.0 → dropped.
+        t = _track_from_z_values([5.0, 6.0, 7.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == []
+
+    def test_track_rooted_below_stripe_is_dropped(self):
+        # Lowest node at z=0.1 → below stripe floor 0.5 → dropped.
+        # (Defensive: usually filter_by_verticality removes ground, but
+        # this guards against bad calibration on z-normalisation.)
+        t = _track_from_z_values([0.1, 1.5, 3.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == []
+
+    def test_boundary_inclusive(self):
+        # z_bottom equal to stripe boundaries → kept (inclusive bounds).
+        t_low = _track_from_z_values([0.5, 1.0])
+        t_high = _track_from_z_values([2.0, 3.0])
+        survivors = bootstrap_tracks_from_basal_stripe(
+            [t_low, t_high], 0.5, 2.0,
+        )
+        assert survivors == [t_low, t_high]
+
+    def test_mixed_tracks_filtered_correctly(self):
+        # 4 tracks: 2 rooted, 2 floating. Only the rooted ones survive.
+        rooted_a = _track_from_z_values([1.0, 2.0, 3.0], xc=0.0)
+        rooted_b = _track_from_z_values([1.2, 2.2], xc=2.0)
+        floating_canopy = _track_from_z_values([8.0, 9.0], xc=0.5)
+        floating_high = _track_from_z_values([15.0], xc=3.0)
+
+        survivors = bootstrap_tracks_from_basal_stripe(
+            [rooted_a, floating_canopy, rooted_b, floating_high],
+            0.5, 2.0,
+        )
+        # Order preserved.
+        assert survivors == [rooted_a, rooted_b]
+
+    def test_min_track_length_filter(self):
+        # Two rooted tracks; one is length 1, the other length 3.
+        # min_track_length=2 keeps only the longer one.
+        short = _track_from_z_values([1.0])
+        long = _track_from_z_values([1.0, 2.0, 3.0])
+        survivors = bootstrap_tracks_from_basal_stripe(
+            [short, long], 0.5, 2.0, min_track_length=2,
+        )
+        assert survivors == [long]
+
+    def test_min_track_length_default_keeps_singletons(self):
+        # Default min_track_length=1 keeps singletons that satisfy the
+        # basal-stripe constraint.
+        t = _track_from_z_values([1.0])
+        survivors = bootstrap_tracks_from_basal_stripe([t], 0.5, 2.0)
+        assert survivors == [t]
+
+    def test_order_preserved(self):
+        # Filtering must not reshuffle the relative order of survivors.
+        rooted = [
+            _track_from_z_values([1.0, 2.0], xc=float(i))
+            for i in range(5)
+        ]
+        # Sprinkle some floaters
+        floaters = [_track_from_z_values([10.0], xc=float(i)) for i in range(3)]
+        mixed = []
+        for r, f in zip(rooted, floaters + [None] * (len(rooted) - len(floaters))):
+            mixed.append(r)
+            if f is not None:
+                mixed.append(f)
+
+        survivors = bootstrap_tracks_from_basal_stripe(mixed, 0.5, 2.0)
+        # Survivors are exactly the rooted ones, in input order.
+        assert survivors == rooted
+
+
+# ===========================================================================
+# GS.7 — assign_tree_ids_from_tracks
+# ===========================================================================
+
+def _ellipse_with_indices(indices: np.ndarray) -> ClusterEllipse:
+    """Build a ClusterEllipse carrying the given indices (xy/a/b/theta
+    irrelevant for the assignment test)."""
+    return ClusterEllipse(
+        indices=np.asarray(indices, dtype=np.int64),
+        xc=0.0, yc=0.0, a=0.15, b=0.15, theta=0.0,
+        sector_pct=100.0, check_status=0, n_points=int(len(indices)),
+    )
+
+
+def _track_with_indices(per_node_indices: list, z_values: list) -> Track:
+    """Build a Track whose nodes carry the given index arrays."""
+    nodes = [
+        TrackNode(z=z, ellipse=_ellipse_with_indices(idx))
+        for z, idx in zip(z_values, per_node_indices)
+    ]
+    return Track(nodes=nodes)
+
+
+class TestAssignTreeIdsContract:
+
+    def test_empty_tracks_returns_all_unassigned(self):
+        res = assign_tree_ids_from_tracks([], n_points=10)
+        assert isinstance(res, TrackingAssignmentResult)
+        assert res.n_trees == 0
+        assert res.tree_ids.shape == (10,)
+        assert res.stem_ids.shape == (10,)
+        assert np.all(res.tree_ids == -1)
+        assert np.all(res.stem_ids == 0)
+        assert res.tracks == []
+
+    def test_arrays_have_correct_dtypes(self):
+        res = assign_tree_ids_from_tracks([], n_points=5)
+        assert res.tree_ids.dtype == np.int32
+        assert res.stem_ids.dtype == np.int32
+
+    def test_rejects_negative_n_points(self):
+        with pytest.raises(ValueError):
+            assign_tree_ids_from_tracks([], n_points=-1)
+
+    def test_rejects_out_of_range_indices(self):
+        t = _track_with_indices(
+            per_node_indices=[np.array([100, 200])], z_values=[1.0],
+        )
+        with pytest.raises(ValueError):
+            assign_tree_ids_from_tracks([t], n_points=50)
+
+    def test_zero_n_points_with_empty_tracks(self):
+        res = assign_tree_ids_from_tracks([], n_points=0)
+        assert res.tree_ids.shape == (0,)
+        assert res.stem_ids.shape == (0,)
+
+
+class TestAssignTreeIdsBehaviour:
+
+    def test_single_track_single_node(self):
+        # 20 points, one track owns indices [3, 7, 11].
+        t = _track_with_indices(
+            per_node_indices=[np.array([3, 7, 11])], z_values=[1.0],
+        )
+        res = assign_tree_ids_from_tracks([t], n_points=20)
+        assert res.n_trees == 1
+        expected = np.full(20, -1, dtype=np.int32)
+        expected[[3, 7, 11]] = 0
+        np.testing.assert_array_equal(res.tree_ids, expected)
+        # stem_id stays 0 everywhere (no bifurcations yet).
+        assert np.all(res.stem_ids == 0)
+
+    def test_multiple_tracks_get_consecutive_ids(self):
+        ta = _track_with_indices([np.array([0, 1, 2])], [1.0])
+        tb = _track_with_indices([np.array([5, 6])], [1.0])
+        tc = _track_with_indices([np.array([10])], [1.0])
+        res = assign_tree_ids_from_tracks([ta, tb, tc], n_points=12)
+        assert res.n_trees == 3
+        assert list(res.tree_ids[[0, 1, 2]]) == [0, 0, 0]
+        assert list(res.tree_ids[[5, 6]]) == [1, 1]
+        assert int(res.tree_ids[10]) == 2
+        # Unassigned points stay at -1.
+        assert int(res.tree_ids[3]) == -1
+        assert int(res.tree_ids[11]) == -1
+
+    def test_indices_from_multiple_nodes_aggregated(self):
+        # A multi-node track: its tree_id covers ALL indices from
+        # every node.
+        t = _track_with_indices(
+            per_node_indices=[
+                np.array([0, 1]),
+                np.array([10, 11]),
+                np.array([20, 21]),
+            ],
+            z_values=[1.0, 2.0, 3.0],
+        )
+        res = assign_tree_ids_from_tracks([t], n_points=30)
+        assigned = np.where(res.tree_ids == 0)[0]
+        np.testing.assert_array_equal(assigned, [0, 1, 10, 11, 20, 21])
+
+    def test_first_write_wins_on_conflict(self):
+        # Two tracks share index 5. First track stamps tree_id=0; the
+        # second tries to stamp tree_id=1 but is denied.
+        ta = _track_with_indices([np.array([5, 6])], [1.0])
+        tb = _track_with_indices([np.array([5, 7])], [1.0])
+        res = assign_tree_ids_from_tracks([ta, tb], n_points=10)
+        assert int(res.tree_ids[5]) == 0   # first writer
+        assert int(res.tree_ids[6]) == 0
+        assert int(res.tree_ids[7]) == 1   # tb claimed this one cleanly
+
+    def test_result_carries_input_tracks(self):
+        ta = _track_with_indices([np.array([0])], [1.0])
+        tb = _track_with_indices([np.array([1])], [1.0])
+        res = assign_tree_ids_from_tracks([ta, tb], n_points=5)
+        assert res.tracks == [ta, tb]
+
+    def test_empty_node_indices_dont_break(self):
+        # A track whose node carries no indices (defensive case;
+        # shouldn't happen post-GS.4 since failed fits are dropped).
+        t = _track_with_indices(
+            per_node_indices=[np.empty(0, dtype=np.int64), np.array([3])],
+            z_values=[1.0, 2.0],
+        )
+        res = assign_tree_ids_from_tracks([t], n_points=10)
+        assert int(res.tree_ids[3]) == 0
+        # Other points still -1.
+        mask_other = np.ones(10, dtype=bool)
+        mask_other[3] = False
+        assert np.all(res.tree_ids[mask_other] == -1)
+
+
+# ===========================================================================
+# GS.8 — assign_trees_by_tracking (orchestrator) + compatibility shim
+# ===========================================================================
+
+def _tall_cylinder(
+    n_per_m: int = 300,
+    radius: float = 0.15,
+    height: float = 8.0,
+    centre_xy=(0.0, 0.0),
+    rng_seed: int = 0,
+) -> np.ndarray:
+    """A dense vertical cylinder for end-to-end orchestrator tests."""
+    rng = np.random.default_rng(seed=rng_seed)
+    n = int(n_per_m * height)
+    z = rng.uniform(0.0, height, size=n)
+    a = rng.uniform(0.0, 2.0 * np.pi, size=n)
+    x = centre_xy[0] + radius * np.cos(a)
+    y = centre_xy[1] + radius * np.sin(a)
+    return np.column_stack([x, y, z]).astype(np.float64)
+
+
+class TestAssignTreesByTrackingContract:
+
+    def test_rejects_invalid_xyz_shape(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_tracking(np.zeros((10, 2)))
+
+    def test_returns_tracking_assignment_result(self):
+        xyz = _tall_cylinder()
+        result = assign_trees_by_tracking(xyz)
+        assert isinstance(result, TrackingAssignmentResult)
+        assert result.tree_ids.shape == (xyz.shape[0],)
+        assert result.stem_ids.shape == (xyz.shape[0],)
+
+
+class TestAssignTreesByTrackingBehaviour:
+
+    def test_single_cylinder_assigned_to_one_tree(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            # Basal stripe must cover where the cylinder starts (z ~ 0).
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        assert result.n_trees == 1
+        # Assigned point fraction should be substantial (a vertical
+        # cylinder is exactly the inlier shape).
+        assigned_frac = (result.tree_ids >= 0).mean()
+        assert assigned_frac > 0.20, (
+            f"too few points assigned: {assigned_frac:.2%}"
+        )
+
+    def test_two_parallel_cylinders_assigned_to_two_trees(self):
+        a = _tall_cylinder(centre_xy=(0.0, 0.0), height=8.0, rng_seed=1)
+        b = _tall_cylinder(centre_xy=(2.5, 0.0), height=8.0, rng_seed=2)
+        xyz = np.vstack([a, b])
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        assert result.n_trees == 2
+
+        # Each cylinder should map to one tree id. The first cylinder
+        # is indices [0, n_a), the second [n_a, n_total).
+        n_a = a.shape[0]
+        first_ids = np.unique(result.tree_ids[:n_a])
+        second_ids = np.unique(result.tree_ids[n_a:])
+        # Drop -1 (unassigned)
+        first_assigned = set(int(i) for i in first_ids if i >= 0)
+        second_assigned = set(int(i) for i in second_ids if i >= 0)
+        # The two cylinders end up with disjoint tree IDs.
+        assert first_assigned and second_assigned
+        assert first_assigned.isdisjoint(second_assigned)
+
+    def test_empty_cloud_produces_zero_trees(self):
+        xyz = np.empty((0, 3), dtype=np.float64)
+        result = assign_trees_by_tracking(xyz)
+        assert result.n_trees == 0
+        assert result.tree_ids.shape == (0,)
+
+
+class TestBuildTreeAxesFromTracks:
+
+    def test_axes_match_tracks_count(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        axes = build_tree_axes_from_tracks(xyz, result)
+        assert len(axes) == result.n_trees
+
+    def test_axis_fields_present(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0, basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        if result.n_trees == 0:
+            pytest.skip("no trees recovered — calibration drift, not the contract")
+        ax = build_tree_axes_from_tracks(xyz, result)[0]
+        assert "tree_id" in ax
+        assert "centroid" in ax
+        assert "direction" in ax
+        assert "line_point" in ax
+        assert "z_min" in ax
+        assert "z_max" in ax
+        # Direction unit norm and z-positive (sign convention).
+        d = ax["direction"]
+        assert d[2] > 0.0
+        assert abs(np.linalg.norm(d) - 1.0) < 1e-9
+        # Centroid is 3D
+        assert np.asarray(ax["centroid"]).shape == (3,)
+
+    def test_vertical_cylinder_direction_is_near_z(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0, basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        if result.n_trees == 0:
+            pytest.skip("no trees recovered — calibration drift, not the contract")
+        ax = build_tree_axes_from_tracks(xyz, result)[0]
+        d = ax["direction"]
+        # A perfectly vertical cylinder must produce a direction within
+        # a few degrees of +z.
+        assert d[2] > 0.95
+
+
+class TestTrackingResultToTrunkExtractionResult:
+
+    def test_shim_returns_compatible_trunk_extraction_result(self):
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0, basal_stripe_z_high=1.5,
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        shim = tracking_result_to_trunk_extraction_result(xyz, result)
+
+        assert isinstance(shim, TrunkExtractionResult)
+        assert shim.tree_ids.shape == (xyz.shape[0],)
+        assert shim.trunk_mask.shape == (xyz.shape[0],)
+        assert shim.trunk_mask.dtype == bool
+        # trunk_mask == (tree_ids >= 0) by construction.
+        np.testing.assert_array_equal(shim.trunk_mask, result.tree_ids >= 0)
+        assert shim.n_trees == result.n_trees
+        assert len(shim.tree_axes) == result.n_trees
+
+
+# ===========================================================================
+# GS.8b — build_tracking_audit_table
+# ===========================================================================
+
+def _track_full(
+    z_values: list, xc: float = 0.0, yc: float = 0.0,
+    a: float = 0.15, b: float = 0.15, sector_pct: float = 80.0,
+    indices_per_node: list = None,
+) -> Track:
+    """Build a Track where every node carries a populated ellipse +
+    optional per-node index arrays. Lets the audit tests exercise the
+    real arithmetic over `track.nodes`."""
+    if indices_per_node is None:
+        indices_per_node = [np.empty(0, dtype=np.int64)] * len(z_values)
+    nodes = []
+    for z, idx in zip(z_values, indices_per_node):
+        ellipse = ClusterEllipse(
+            indices=np.asarray(idx, dtype=np.int64),
+            xc=xc, yc=yc, a=a, b=b, theta=0.0,
+            sector_pct=sector_pct, check_status=0,
+            n_points=int(len(idx)),
+        )
+        nodes.append(TrackNode(z=z, ellipse=ellipse))
+    return Track(nodes=nodes)
+
+
+def _make_tracking_result(tracks: list, n_points: int = 100) -> TrackingAssignmentResult:
+    """Helper: build a TrackingAssignmentResult by running the GS.7
+    assignment over a constructed track list."""
+    return assign_tree_ids_from_tracks(tracks, n_points=n_points)
+
+
+class TestBuildTrackingAuditTable:
+
+    def test_empty_tracks_returns_empty_dataframe(self):
+        import pandas as pd
+        result = _make_tracking_result([], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        assert isinstance(df, pd.DataFrame)
+        assert df.empty
+
+    def test_rejects_non_positive_slab_step(self):
+        result = _make_tracking_result([], n_points=0)
+        with pytest.raises(ValueError):
+            build_tracking_audit_table(
+                np.empty((0, 3)), result, slab_step=0.0,
+            )
+
+    def test_single_clean_track_metrics(self):
+        # Track with 5 nodes spanning 4 m of z (slabs 1m apart),
+        # each node carries 20 points → 100 points total.
+        indices_per_node = [
+            np.arange(0, 20),
+            np.arange(20, 40),
+            np.arange(40, 60),
+            np.arange(60, 80),
+            np.arange(80, 100),
+        ]
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0, 4.0, 5.0],
+            a=0.15, b=0.15,
+            sector_pct=80.0,
+            indices_per_node=indices_per_node,
+        )
+        result = _make_tracking_result([track], n_points=100)
+        df = build_tracking_audit_table(
+            np.zeros((100, 3)), result, slab_step=1.0,
+        )
+        assert len(df) == 1
+        row = df.iloc[0]
+        assert int(row["tree_id"]) == 0
+        assert int(row["n_nodes"]) == 5
+        assert float(row["z_bottom"]) == 1.0
+        assert float(row["z_top"]) == 5.0
+        assert float(row["z_extent"]) == 4.0
+        assert float(row["gap_fraction"]) == pytest.approx(0.0, abs=1e-9)
+        assert int(row["n_points"]) == 100
+        assert float(row["mean_radius"]) == pytest.approx(0.15, abs=1e-4)
+        assert float(row["radius_cv"]) == pytest.approx(0.0, abs=1e-9)
+        assert float(row["mean_aspect_ratio"]) == pytest.approx(1.0, abs=1e-9)
+        assert float(row["mean_sector_pct"]) == pytest.approx(80.0, abs=1e-9)
+
+    def test_gap_fraction_detects_holes(self):
+        # 3 nodes at z=1, 5, 9 → spans 8 m, but should have ~9 nodes
+        # at 1 m spacing → gap_fraction ≈ 1 − 3/9 = 0.667.
+        track = _track_full(z_values=[1.0, 5.0, 9.0])
+        result = _make_tracking_result([track], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        row = df.iloc[0]
+        assert float(row["gap_fraction"]) == pytest.approx(2.0 / 3.0, abs=1e-2)
+
+    def test_singleton_track_no_extent(self):
+        # Singleton (1 node) → z_extent=0, gap_fraction=0 (expected=1),
+        # density=0 (no volume).
+        track = _track_full(z_values=[1.0])
+        result = _make_tracking_result([track], n_points=5)
+        df = build_tracking_audit_table(
+            np.zeros((5, 3)), result, slab_step=1.0,
+        )
+        row = df.iloc[0]
+        assert int(row["n_nodes"]) == 1
+        assert float(row["z_extent"]) == 0.0
+        assert float(row["gap_fraction"]) == 0.0
+        assert float(row["density_pts_per_m3"]) == 0.0
+
+    def test_oval_track_higher_aspect_ratio(self):
+        # Strong oval cluster (a=0.30, b=0.10) → aspect 3.0 (FP-like).
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0],
+            a=0.30, b=0.10,
+            sector_pct=60.0,
+        )
+        result = _make_tracking_result([track], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        assert float(df.iloc[0]["mean_aspect_ratio"]) == pytest.approx(3.0, abs=1e-3)
+
+    def test_density_separates_real_vs_fp_proxy(self):
+        # Real-ish: 5000 pts in a 10 m × r=0.15 stem → density ≈ 7074
+        idx_real = np.arange(0, 5000)
+        real = _track_full(
+            z_values=[i + 1.0 for i in range(11)],
+            a=0.15, b=0.15,
+            indices_per_node=[idx_real[i*500:(i+1)*500] for i in range(10)] + [np.empty(0, dtype=np.int64)],
+        )
+        # FP-ish: 50 pts in a 2 m × r=0.10 ellipsoid → density ≈ 795
+        idx_fp = np.arange(5000, 5050)
+        fp = _track_full(
+            z_values=[10.0, 11.0, 12.0],
+            a=0.10, b=0.10,
+            indices_per_node=[idx_fp[:17], idx_fp[17:34], idx_fp[34:]],
+        )
+        result = _make_tracking_result([real, fp], n_points=5050)
+        df = build_tracking_audit_table(
+            np.zeros((5050, 3)), result, slab_step=1.0,
+        )
+        d_real = float(df.iloc[0]["density_pts_per_m3"])
+        d_fp = float(df.iloc[1]["density_pts_per_m3"])
+        # Real density should be an order of magnitude larger than FP density.
+        assert d_real > 5 * d_fp
+
+
+class TestExportTrackingAuditTable:
+
+    def test_writes_csv_to_path(self, tmp_path):
+        track = _track_full(z_values=[1.0, 2.0, 3.0])
+        result = _make_tracking_result([track], n_points=10)
+        df = build_tracking_audit_table(
+            np.zeros((10, 3)), result, slab_step=1.0,
+        )
+        path = tmp_path / "tracking_audit.csv"
+        out_path = export_tracking_audit_table(df, path)
+        assert out_path == path
+        assert path.exists()
+        # Roundtrip: header + 1 data row.
+        with path.open("r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        assert len(lines) == 2  # header + 1 row
+        assert "tree_id" in lines[0]
+
+
+# ===========================================================================
+# GS.7b — assign_trees_by_curved_cylinder
+# ===========================================================================
+
+def _cloud_in_box(
+    n: int,
+    xy_centre=(0.0, 0.0), xy_radius: float = 0.30,
+    z_low: float = 0.0, z_high: float = 5.0,
+    rng_seed: int = 0,
+) -> np.ndarray:
+    """A small XYZ box of random points used to probe curved-cylinder
+    assignment without depending on the upstream GS chain."""
+    rng = np.random.default_rng(seed=rng_seed)
+    x = rng.uniform(xy_centre[0] - xy_radius, xy_centre[0] + xy_radius, size=n)
+    y = rng.uniform(xy_centre[1] - xy_radius, xy_centre[1] + xy_radius, size=n)
+    z = rng.uniform(z_low, z_high, size=n)
+    return np.column_stack([x, y, z]).astype(np.float64)
+
+
+class TestAssignTreesByCurvedCylinderContract:
+
+    def test_rejects_invalid_xyz(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(np.zeros((10, 2)), [])
+
+    def test_rejects_non_positive_radius_factor(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(
+                np.zeros((10, 3)), [], radius_factor=0.0,
+            )
+
+    def test_rejects_inverted_radius_bounds(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(
+                np.zeros((10, 3)), [], radius_min=0.5, radius_max=0.1,
+            )
+
+    def test_rejects_negative_z_margin(self):
+        with pytest.raises(ValueError):
+            assign_trees_by_curved_cylinder(
+                np.zeros((10, 3)), [], z_margin=-0.1,
+            )
+
+    def test_empty_tracks_returns_all_unassigned(self):
+        xyz = _cloud_in_box(n=20)
+        result = assign_trees_by_curved_cylinder(xyz, [])
+        assert isinstance(result, TrackingAssignmentResult)
+        assert result.n_trees == 0
+        assert result.tree_ids.shape == (20,)
+        assert np.all(result.tree_ids == -1)
+
+
+class TestAssignTreesByCurvedCylinderBehaviour:
+
+    def test_single_vertical_track_captures_tube(self):
+        # Vertical track at (0, 0): nodes at z=1,2,3,4,5, all radius
+        # a=0.15. Points within 1.5 × 0.15 = 0.225 m of the axis at
+        # z in [0.5, 5.5] (with z_margin=0.5) must be assigned.
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0, 4.0, 5.0],
+            xc=0.0, yc=0.0, a=0.15, b=0.15,
+        )
+
+        # Build a cloud: 200 points well inside the tube, 200 well outside.
+        rng = np.random.default_rng(seed=7)
+        z_inside = rng.uniform(1.0, 5.0, size=200)
+        r_inside = rng.uniform(0.0, 0.10, size=200)  # < 0.225 → inside
+        a_inside = rng.uniform(0.0, 2.0 * np.pi, size=200)
+        inside_xyz = np.column_stack([
+            r_inside * np.cos(a_inside),
+            r_inside * np.sin(a_inside),
+            z_inside,
+        ])
+
+        z_outside = rng.uniform(1.0, 5.0, size=200)
+        r_outside = rng.uniform(1.0, 2.0, size=200)  # far outside
+        a_outside = rng.uniform(0.0, 2.0 * np.pi, size=200)
+        outside_xyz = np.column_stack([
+            r_outside * np.cos(a_outside),
+            r_outside * np.sin(a_outside),
+            z_outside,
+        ])
+
+        xyz = np.vstack([inside_xyz, outside_xyz])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5,
+        )
+
+        # First 200 (inside) → assigned. Last 200 (outside) → unassigned.
+        assert np.all(result.tree_ids[:200] == 0)
+        assert np.all(result.tree_ids[200:] == -1)
+
+    def test_two_parallel_tracks_disjoint_assignment(self):
+        # Two vertical tracks 2 m apart in XY, tubes of radius 0.225 →
+        # no overlap. Each track captures its own cluster.
+        track_a = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=0.0, yc=0.0, a=0.15, b=0.15,
+        )
+        track_b = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=2.0, yc=0.0, a=0.15, b=0.15,
+        )
+        # 100 points near each axis.
+        rng = np.random.default_rng(seed=8)
+        cloud_a = np.column_stack([
+            rng.normal(0.0, 0.05, size=100),
+            rng.normal(0.0, 0.05, size=100),
+            rng.uniform(1.0, 3.0, size=100),
+        ])
+        cloud_b = np.column_stack([
+            rng.normal(2.0, 0.05, size=100),
+            rng.normal(0.0, 0.05, size=100),
+            rng.uniform(1.0, 3.0, size=100),
+        ])
+        xyz = np.vstack([cloud_a, cloud_b])
+
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track_a, track_b], radius_factor=1.5,
+        )
+
+        # cloud_a points get tree_id 0; cloud_b get tree_id 1.
+        assert np.all(result.tree_ids[:100] == 0)
+        assert np.all(result.tree_ids[100:] == 1)
+
+    def test_overlapping_tubes_tie_broken_by_normalised_distance(self):
+        # Two tracks at (0,0) and (0.20, 0). Tubes overlap. A point at
+        # (0.05, 0) is closer to track 0 in normalised units → tree_id 0.
+        # A point at (0.18, 0) is closer to track 1 → tree_id 1.
+        track_a = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=0.0, yc=0.0, a=0.15, b=0.15,
+        )
+        track_b = _track_full(
+            z_values=[1.0, 2.0, 3.0], xc=0.20, yc=0.0, a=0.15, b=0.15,
+        )
+        xyz = np.array([
+            [0.05, 0.0, 2.0],  # closer to a (norm_dist = 0.05/0.225 ≈ 0.22)
+            [0.18, 0.0, 2.0],  # closer to b (norm_dist = 0.02/0.225 ≈ 0.09)
+        ])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track_a, track_b], radius_factor=1.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+        assert int(result.tree_ids[1]) == 1
+
+    def test_curved_track_captures_inclined_points(self):
+        # Track inclined: XY drifts +0.5 m per slab. Points along that
+        # drift should be assigned even though they're 1+ m from the
+        # bottom node's XY.
+        track = _track_full(
+            z_values=[1.0, 2.0, 3.0, 4.0, 5.0], a=0.15, b=0.15,
+        )
+        # Manually patch XY of the nodes via a fresh track build —
+        # _track_full uses a constant (xc, yc), so I rebuild here.
+        nodes = []
+        for i, z in enumerate([1.0, 2.0, 3.0, 4.0, 5.0]):
+            ell = ClusterEllipse(
+                indices=np.empty(0, dtype=np.int64),
+                xc=0.5 * i, yc=0.0,
+                a=0.15, b=0.15, theta=0.0,
+                sector_pct=80.0, check_status=0, n_points=0,
+            )
+            nodes.append(TrackNode(z=z, ellipse=ell))
+        inclined_track = Track(nodes=nodes)
+
+        # A point along the inclined axis: (1.0, 0, 3.0) (at z=3, the
+        # axis sits at x = 0.5 · 2 = 1.0).
+        xyz = np.array([[1.0, 0.0, 3.0]])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [inclined_track], radius_factor=1.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+
+    def test_singleton_track_spherical_assignment(self):
+        # Track with one node → spherical buffer around it.
+        track = _track_full(z_values=[2.0], xc=0.0, yc=0.0, a=0.15, b=0.15)
+        # Point within 0.225 m of (0, 0, 2.0) → assigned.
+        # Point beyond → unassigned.
+        xyz = np.array([
+            [0.0, 0.0, 2.0],       # at the node
+            [0.10, 0.10, 2.0],     # ~0.14 m from node, inside
+            [1.0, 0.0, 2.0],       # 1 m away, outside
+        ])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+        assert int(result.tree_ids[1]) == 0
+        assert int(result.tree_ids[2]) == -1
+
+    def test_z_margin_extends_polyline_endpoints(self):
+        # Track spans z=[1, 3]. With z_margin=0.5, points at z=0.6 or
+        # z=3.4 still get assigned (clamped to the nearest endpoint).
+        # Without the margin (z_margin=0), they would fall outside.
+        track = _track_full(z_values=[1.0, 3.0], xc=0.0, yc=0.0, a=0.15, b=0.15)
+        xyz = np.array([
+            [0.0, 0.0, 0.6],
+            [0.0, 0.0, 3.4],
+            [0.0, 0.0, 0.4],   # well outside the margin (z=0.4 < 1−0.5 = 0.5)
+            [0.0, 0.0, 3.6],   # well outside the margin (z=3.6 > 3+0.5 = 3.5)
+        ])
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5, z_margin=0.5,
+        )
+        assert int(result.tree_ids[0]) == 0
+        assert int(result.tree_ids[1]) == 0
+        assert int(result.tree_ids[2]) == -1
+        assert int(result.tree_ids[3]) == -1
+
+    def test_radius_clipping_bounds(self):
+        # A track with absurdly small `a` (degenerate fit). Without
+        # radius_min, the tube collapses; with radius_min=0.05 the
+        # tube has a 0.05 m floor that captures nearby points.
+        track = _track_full(
+            z_values=[1.0, 2.0], xc=0.0, yc=0.0, a=0.001, b=0.001,
+        )
+        xyz = np.array([[0.03, 0.0, 1.5]])  # 3 cm from axis
+        # With radius_factor=1.5 and a=0.001 → effective radius
+        # 0.0015 < 0.05 → clipped up to 0.05. Inside.
+        result = assign_trees_by_curved_cylinder(
+            xyz, [track], radius_factor=1.5,
+            radius_min=0.05, radius_max=0.50,
+        )
+        assert int(result.tree_ids[0]) == 0
+
+        # With a huge a but capped radius_max=0.10, a point at 0.2 m
+        # falls outside the cap → unassigned.
+        track_big = _track_full(
+            z_values=[1.0, 2.0], xc=0.0, yc=0.0, a=10.0, b=10.0,
+        )
+        xyz2 = np.array([[0.2, 0.0, 1.5]])
+        result2 = assign_trees_by_curved_cylinder(
+            xyz2, [track_big], radius_factor=1.5,
+            radius_min=0.01, radius_max=0.10,
+        )
+        assert int(result2.tree_ids[0]) == -1
+
+
+class TestOrchestratorAssignmentMethodSwitch:
+
+    def test_default_is_curved_cylinder(self):
+        cfg = TrackingAssignmentConfig()
+        assert cfg.assignment_method == "curved_cylinder"
+
+    def test_dbscan_membership_path_still_works(self):
+        # Tiny end-to-end to confirm the legacy assignment branch is
+        # still callable via config.
+        xyz = _tall_cylinder(radius=0.15, height=8.0)
+        cfg = TrackingAssignmentConfig(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+            assignment_method="dbscan_membership",
+        )
+        result = assign_trees_by_tracking(xyz, cfg)
+        assert isinstance(result, TrackingAssignmentResult)
+
+    def test_curved_cylinder_assigns_more_than_dbscan_membership(self):
+        # Same data, two methods: the curved cylinder must label
+        # at least as many points as DBSCAN membership (it's a strict
+        # superset on a well-formed track).
+        xyz = _tall_cylinder(radius=0.15, height=8.0, n_per_m=200)
+        common_kwargs = dict(
+            basal_stripe_z_low=0.0,
+            basal_stripe_z_high=1.5,
+        )
+        r_dbscan = assign_trees_by_tracking(
+            xyz, TrackingAssignmentConfig(
+                assignment_method="dbscan_membership", **common_kwargs,
+            ),
+        )
+        r_curved = assign_trees_by_tracking(
+            xyz, TrackingAssignmentConfig(
+                assignment_method="curved_cylinder", **common_kwargs,
+            ),
+        )
+        n_dbscan = int((r_dbscan.tree_ids >= 0).sum())
+        n_curved = int((r_curved.tree_ids >= 0).sum())
+        # Curved cylinder must label at least as many; on a real pillar
+        # it usually labels MORE because it recovers points that DBSCAN
+        # fragmented or dropped at slab boundaries.
+        assert n_curved >= n_dbscan
+
+    def test_unknown_method_raises(self):
+        xyz = np.zeros((10, 3))
+        cfg = TrackingAssignmentConfig()
+        # Hack: bypass the Literal type via __setattr__-like trick.
+        # dataclasses are frozen=False on TrackingAssignmentConfig.
+        object.__setattr__(cfg, "assignment_method", "bogus")
+        with pytest.raises(ValueError):
+            assign_trees_by_tracking(xyz, cfg)
