@@ -306,30 +306,177 @@ per-zone would always read each zone as monotonic. **S has no maximum
 length** under the Interpine convention — a 10 m back-and-forth stays
 `S`. F1.4 noise-floor minimums still apply in step 6.
 
-**F1.5b (DONE)** — `W` and `K` detection wired in:
-- `W` upgrade in step 5: a back-and-forth verdict (`n_bows ≥ 2`)
-  with `max_abs_offset_m > 5 cm` (absolute, not SED-fraction) becomes
-  `W` instead of `S`. Reported in the `Sw` column at the same level
-  as `8 / L / S / 3 / 1 / X`.
-- `K` detection in step 3.5: per-segment XY turn-angle scan; nodes
-  whose adjacent segments meet at > 15° (default) get their codes
-  overridden to `K` within ± 0.25 m → ~ 0.5 m K zones after coalesce
-  (matches the quickcard's "Max 0.5 m" reference).
+**F1.5b (DONE, current revision F1.5b.4)** — `W` and `K` detection
+wired in. The revision history below traces the evolution of the W
+upgrade rule as real-plot data exposed each previous formulation's
+blind spots; the current state at the bottom is what
+`classify_sweep_zones` step 5 implements today.
+
+- `K` detection in step 3.5: per-segment 3D turn-angle scan with a
+  ~ 0.5 m stencil; nodes whose adjacent stencil segments meet at
+  > 15° (default) get their codes overridden to `K` within
+  ± 0.25 m → ~ 0.5 m K zones after coalesce + non-maximum suppression
+  (matches the quickcard's "Max 0.5 m" reference). `X` precedence:
+  a node already classified as `X` keeps that code.
 - Severity ordering (Jorge's quickcard mapping): sawmill quality
   `8 < L = S < 3` above the "Generally Pulp Quality" line; pulp
   quality `W = K < 1 < X` below.
-- Min zone lengths: `W: 2 m` (defect-flag short min — not the
-  quickcard's 4 m observational window). `K` and `X` exempt from
-  the length floor (intrinsic short defect flags, always treated as
-  stable in `_is_stable`).
 
-### Known limitations (F1.5a + F1.5b)
+#### F1.5b W upgrade — revision history
 
-The global `n_bows` per centerline assumes one direction character
-per tree. A real tree with a consistent lower-trunk lean AND an
-upper-trunk wobble would be labelled `S` (or `W`) everywhere. In
-plantation radiata pine this single-character assumption holds in
-practice; revisit if real-data shows mixed patterns.
+**F1.5b.1 (global verdict, replaced)**: a back-and-forth verdict
+(`n_bows ≥ 2`) computed globally over the whole centerline plus
+`max_abs_offset_m > 5 cm` (max 3D perpendicular norm from chord)
+upgraded **every** LS zone to W. Real-plot run on T460298B/05
+collapsed S as a category (0 / 75 zones), with 16 W zones because
+any single ≥ 5 cm bow anywhere in the stem flipped the whole tree.
+Field grading evaluates each 4-6 m log independently — global
+verdict over-applies the W code.
+
+**F1.5b.2 (per-zone scope, replaced)**: localised the W upgrade to
+each LS zone (W only fires on a specific LS zone whose local bow
+peak > 5 cm), keeping the global `n_bows` back-and-forth gate.
+Also switched the amplitude metric from the 3D perpendicular norm
+to the **PCA-projected per-bow peak** (`max_bow_peak_m` from
+`_extract_bow_peaks`), so off-axis jitter no longer inflates the
+amplitude. Brought S back (4 / 62 zones) but introduced a
+mathematical impossibility: LS amplitudes are bounded by SED/5
+(≤ 4 cm for typical SED ≈ 0.20 m), so the 5 cm absolute floor was
+unreachable on LS zones. W disappeared entirely (0 / 62 zones)
+because wobble at moderate amplitude was leaking into the "3" zones
+that the W rule never touched.
+
+**F1.5b.3 (2-axis model, replaced)**: extended the W upgrade to
+also re-classify `3` zones — a 2-axis model where amplitude bin
+(LS / 3) crosses with direction (consistent / back-and-forth +
+≥ 5 cm absolute peak) to produce the final code. Quickcard support:
+"3" is described as "4 m of Moderate Sweep (SED/3)" — a single
+moderate bow — while "W" is "Wobble Movement Back and Forth > 5 cm"
+— back-and-forth at moderate-or-higher amplitude. Brought W back
+(22 / 67 zones in the T460298B/05 simulation) with S also present.
+Still used the **global** `n_bows` gate (only the per-zone amplitude
+was local), which over-applied W on zones that are visually a
+single big consistent bow within a globally back-and-forth stem.
+
+**F1.5b.4 (per-zone n_bows + W max length, current)**: makes the
+back-and-forth gate **fully per-zone** and adds a length cap on W:
+
+1. **Per-zone `n_bows`**: each LS or 3 zone computes its own local
+   `n_bows` from the slice of the signed offset profile inside its
+   z-range. The F1.5a "monotonic by construction" argument that
+   justified the global gate held when LS zones were short flanks
+   of a single bow; after F1.4 absorption, real-plot LS zones span
+   10 m+ continuous regions that can contain multiple direction
+   reversals, so per-zone `n_bows` is computable and meaningful.
+   Visual observation by Jorge on T460298B/05: zones flagged W
+   under F1.5b.3 looked like single consistent bows because the
+   global gate fired on a back-and-forth pattern in a different
+   part of the stem.
+
+2. **W length cap at 4 m** (`w_max_length_m = 4.0`): W is treated as
+   a **defect-flag with intrinsic bounded extent**, analogous to `X`
+   (0.3-1 m severe) and `K` (~ 0.5 m sharp). All three pulp-quality
+   defect codes have an upper length bound by their definition.
+   Justification sources for the W max length:
+
+   a. **Quickcard W panel** (`external_references/interpine/HQP
+      Quickcard LiDAR pt 1.pdf`, sheet 1): the W illustration is
+      drawn over **a 4 m vertical extent** with the explicit label
+      "Wobble Movement Back and Forth > 5 cm". The 4 m is the
+      observational window the field cruiser uses to identify the
+      defect. Beyond 4 m the cruiser would call the section
+      something else (a moderate sweep "3" if amplitude is moderate
+      and sustained, or "1" if excessive).
+
+   b. **Analogy with `X` and `K`**: the quickcard's "Generally
+      Pulp Quality" row groups `W / K / 1 / X` together. Within
+      that row, `K` is explicitly defined as a 0.5 m sharp event
+      and `X` as 0.3-1 m severe. Treating `W` as bounded at 4 m
+      is the consistent rule across the entire pulp-defect row:
+      defect codes carry their own length bound by definition,
+      while sawmill-quality codes (`8 / L / S / 3`) extend to
+      arbitrary length under the merchantable-log assumption.
+
+   c. **Operational reading**: a sweep that extends > 4 m with
+      back-and-forth pattern and > 5 cm peak is no longer a
+      "localised pulp defect" but a **sustained characteristic of
+      the log itself**. Operationally it maps to its amplitude bin
+      (3 = moderate sweep at SED/3; 1 = excessive at SED/1) — the
+      log grades down for amplitude, not for the wobble pattern.
+
+   d. **MPI absence**: MPI grades (Pruned, Pruned Peeler,
+      Structural, Industrial) do not codify a "W" category. W is
+      not a log-grade — it's an Interpine defect-flag for the
+      stem-tally schema. Defect-flags by convention are bounded;
+      log-grades extend to operative log lengths.
+
+   Bow-concentration corollary (derived, not directly cited): in
+   plantation radiata pine, multi-reversal wobble at > 5 cm
+   amplitude is overwhelmingly a juvenile-core or wind-stress event
+   concentrated in 2-4 m bands of the lower bole — Cown et al.
+   (1984) §3 reports that sweep severity peaks below 5 m in the
+   pruned-butt log studies, and Ivković et al. (2007) frames
+   sweep:diameter ratio as a per-log property whose worst case
+   sits at the butt. Neither paper publishes a "wobble wavelength"
+   metric, so this is an inferred reading rather than a direct
+   citation. The 4 m cap is operationally derived from the
+   quickcard primary source; the radiata-pine field-frequency
+   argument supports the cap but is not its load-bearing
+   justification.
+
+3. **Three-tier classification** combining (i) global back-and-forth
+   verdict, (ii) per-zone amplitude bin, (iii) **wobble-region**
+   length cap with a **post-absorption enforcement pass**:
+
+   The wobble region is the contiguous span of LS and 3 zones (in
+   the amplitude bin sense, after step 4 coalesce) joined over short
+   non-LS-3 gaps (`LS_REGION_GAP_MAX_M = 1.0 m`). The cap applies
+   to this REGION length, not to individual zone lengths — a
+   high-frequency wobble fragments into many short LS / 3 / 8 zones
+   each carrying one bow, but the defect's extent is the total span
+   of the wobble pattern.
+
+   Classification table (the `Sw` code emitted for each LS or 3
+   zone, given the global `is_back_and_forth = (n_bows ≥ 2)` and
+   the zone's parent wobble region peak / length):
+
+   | Amplitude bin | not back-and-forth | back-and-forth, region peak < 5 cm | back-and-forth, region peak ≥ 5 cm, region ≤ 4 m | back-and-forth, region peak ≥ 5 cm, region > 4 m |
+   |---|---|---|---|---|
+   | LS | L | S | **W** | S |
+   | 3  | 3 | 3 (edge) | **W** | 3 |
+   | 1, 8, X | unchanged | unchanged | unchanged | unchanged |
+
+   The rightmost column captures the F1.5b.4 length cap: a
+   back-and-forth pattern at ≥ 5 cm peak extending > 4 m falls back
+   to the amplitude-driven code (S for LS bin, 3 for moderate bin)
+   rather than W. This is the "sustained characteristic of the log"
+   semantic from (c) above.
+
+4. **Post-absorption W length cap (step 7)**: step 6's
+   worst-neighbour-wins absorption may grow a W zone beyond 4 m by
+   absorbing adjacent short "8" zones (sev 0) into a stable W
+   anchor (sev 3), or by coalescing adjacent W zones generated in
+   step 5. The W length cap is a hard invariant, not just a
+   creation threshold — a final W zone exceeding 4 m is no longer
+   a localised pulp defect-flag. Step 7 walks the post-absorption
+   zones, coalesces same-code neighbours, and reclassifies any
+   W > 4 m by sampling the max per-node amplitude in the zone:
+   peak in moderate bin (> SED/5) → `3` (moderate sustained sweep);
+   peak in LS bin (≤ SED/5) → `S` (gentle sustained back-and-forth).
+   This guarantees the final output respects the defect-flag
+   bounded-extent invariant for W under all absorption outcomes.
+
+- Min zone lengths: `W: 0.5 m` (defect-flag short min — the F1.5b.4
+  length cap is the **max**; this is the min). `K` and `X` exempt
+  from the length floor (intrinsic short defect flags, always
+  treated as stable in `_is_stable`).
+
+### Known limitations (F1.5a + F1.5b.4)
+
+The per-zone `n_bows` (F1.5b.4) replaces the global single-character
+assumption of F1.5a — a tree with a consistent lower-trunk lean AND
+an upper-trunk wobble now produces L for the lean zone and S/W for
+the wobble zone correctly. Earlier limitation resolved.
 
 The sub-operational alternating `S/3/S/3/S` cluster on tree 11 of
 T460298B (2 m of back-and-forth fragmented into S and 3 sub-zones)

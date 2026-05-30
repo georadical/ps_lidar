@@ -339,6 +339,77 @@ def _count_swings(s: np.ndarray, deadband: float) -> int:
     return swings
 
 
+def _extract_bow_peaks(s: np.ndarray, deadband: float) -> list:
+    """Extract absolute peak values at each detected bow extremum.
+
+    Mirrors the walk of :func:`_count_swings`. Each registered swing
+    corresponds to one bow peak — the running extreme of the current
+    direction right before the retracement that flipped it. The final
+    running extreme (the open final bow, not confirmed by retracement)
+    is also included when a direction was determined: geometrically,
+    ``n_bows`` direction reversals define ``n_bows + 1`` monotonic
+    segments, and each monotonic segment has its own peak.
+
+    Used by :func:`_polyline_direction_metrics` to expose per-bow
+    amplitude statistics (``max_bow_peak_m``) for F1.5b W detection.
+
+    The semantic motivation: ``max_abs_offset_m`` is a **global** max
+    perpendicular distance from the base-top chord — a single localized
+    excursion (or accumulated wandering) inflates it even when every
+    individual bow is gentle. Per-bow peaks are the right unit for the
+    Interpine W/S distinction, which characterises each bow as either
+    gentle (S) or > 5 cm deflection (W).
+
+    Parameters
+    ----------
+    s : array_like
+        1D signed profile (same input as :func:`_count_swings`).
+    deadband : float
+        Prominence floor for direction reversals (same units as ``s``).
+
+    Returns
+    -------
+    list of float
+        Absolute peak values at each bow extremum, in walk order.
+        Empty list if no direction was determined (all values within
+        deadband of the starting pivot).
+    """
+    s = np.asarray(s, dtype=np.float64).ravel()
+    if s.size < 3:
+        return []
+    peaks: list = []
+    direction = 0  # +1 rising, -1 falling, 0 undetermined
+    pivot = float(s[0])
+    for v_arr in s[1:]:
+        v = float(v_arr)
+        if direction == 0:
+            if v - pivot >= deadband:
+                direction = 1
+                pivot = v
+            elif pivot - v >= deadband:
+                direction = -1
+                pivot = v
+        elif direction == 1:  # rising
+            if v > pivot:
+                pivot = v  # new high
+            elif pivot - v >= deadband:
+                peaks.append(abs(pivot))  # peak of completed rising bow
+                direction = -1
+                pivot = v
+        else:  # direction == -1, falling
+            if v < pivot:
+                pivot = v  # new low
+            elif v - pivot >= deadband:
+                peaks.append(abs(pivot))  # peak of completed falling bow
+                direction = 1
+                pivot = v
+    # Include the final running extreme (open last bow): a direction was
+    # determined but the bow never retraced. Geometrically still a bow peak.
+    if direction != 0:
+        peaks.append(abs(pivot))
+    return peaks
+
+
 def _max_turn_angle_deg(centerline: np.ndarray) -> float:
     """Largest turn angle (degrees) between consecutive **3D** polyline
     segments.
@@ -370,6 +441,75 @@ def _max_turn_angle_deg(centerline: np.ndarray) -> float:
     return max_ang
 
 
+def _signed_offset_profile(centerline: np.ndarray) -> tuple:
+    """Compute the PCA-projected signed perpendicular offset profile.
+
+    Used by :func:`_polyline_direction_metrics` for the global summary
+    and by :func:`classify_sweep_zones` step 5 for **per-zone** W
+    evaluation: a single LS zone needs to know its own local bow peak
+    (max ``|signed|`` within its z-range), not the tree-wide max.
+
+    Algorithm:
+
+    1. Sort the polyline by z (defensive).
+    2. Compute each node's 3-D perpendicular offset from the base-top
+       chord (lies in the plane ⊥ to the chord direction).
+    3. Reduce to a signed scalar by projecting onto the dominant sweep
+       direction (first right-singular vector of the offsets matrix —
+       i.e. the PCA principal axis of the 2-D-ish offset cloud). When
+       the polyline is near-straight (max offset < 1 pm) the signed
+       profile is zeros and the SVD step is skipped.
+
+    Parameters
+    ----------
+    centerline : ndarray of shape (M, 3)
+        Polyline nodes ``(x, y, z)``.
+
+    Returns
+    -------
+    tuple
+        ``(z_sorted, signed, max_abs_offset_m)`` where ``z_sorted`` is
+        the z values in ascending order, ``signed`` is the PCA-projected
+        signed offset per node (same indexing as ``z_sorted``), and
+        ``max_abs_offset_m`` is the max 3-D perpendicular norm. Returns
+        empty arrays and ``0.0`` for degenerate inputs (< 3 nodes or
+        coincident base-top endpoints).
+    """
+    cl = np.asarray(centerline, dtype=np.float64)
+    if cl.ndim != 2 or cl.shape[1] != 3 or cl.shape[0] < 3:
+        return np.array([]), np.array([]), 0.0
+
+    order = np.argsort(cl[:, 2])
+    cl = cl[order]
+
+    p0 = cl[0]
+    p1 = cl[-1]
+    axis = p1 - p0
+    axis_len_sq = float(np.dot(axis, axis))
+    if axis_len_sq < 1e-18:
+        return cl[:, 2].copy(), np.zeros(cl.shape[0]), 0.0
+
+    rel = cl - p0
+    t = (rel @ axis) / axis_len_sq
+    closest = p0 + t[:, None] * axis
+    offsets = cl - closest  # (M, 3); each row ⊥ to axis
+
+    offset_norms = np.linalg.norm(offsets, axis=1)
+    max_abs_offset_m = float(offset_norms.max())
+
+    # Signed scalar via PCA dominant direction. For a near-straight
+    # polyline (all offsets ≈ 0) the SVD direction is meaningless but
+    # the projected values are tiny → swing counter returns 0.
+    if max_abs_offset_m < 1e-12:
+        signed = np.zeros(cl.shape[0])
+    else:
+        _, _, vt = np.linalg.svd(offsets, full_matrices=False)
+        u_dir = vt[0]
+        signed = offsets @ u_dir
+
+    return cl[:, 2], signed, max_abs_offset_m
+
+
 def _polyline_direction_metrics(
     centerline: np.ndarray,
     deadband_m: float = 0.01,
@@ -391,9 +531,17 @@ def _polyline_direction_metrics(
        2-D-ish offset cloud).
     4. ``n_bows`` = number of swings in that signed profile via
        :func:`_count_swings` with a prominence ``deadband_m``.
-    5. ``max_abs_offset_m`` = max |perpendicular offset| (m), the
-       absolute amplitude — used by F1.5b W detection (`> 5 cm`).
-    6. ``max_turn_deg`` = max turn angle between consecutive XY
+    5. ``max_abs_offset_m`` = max |perpendicular offset| (m) — a
+       **global** amplitude measure (single localized excursion or
+       accumulated wandering both inflate it). Kept in the returned
+       dict for diagnostic / backward-compat purposes.
+    6. ``max_bow_peak_m`` = max per-bow peak amplitude (m), via
+       :func:`_extract_bow_peaks`. This is the **per-bow** counterpart
+       to ``max_abs_offset_m`` and is what F1.5b uses for W detection:
+       a tree triggers W only if at least one individual bow's peak
+       exceeds 5 cm, matching the Interpine S/W distinction (gentle
+       per-bow vs > 5 cm per-bow deflection from the chord).
+    7. ``max_turn_deg`` = max turn angle between consecutive 3D
        segments — used by F1.5b K detection.
 
     Returns a dict; safe to call on degenerate polylines (returns
@@ -411,47 +559,33 @@ def _polyline_direction_metrics(
     Returns
     -------
     dict
-        ``{"n_bows": int, "max_abs_offset_m": float, "max_turn_deg": float}``.
+        ``{"n_bows": int, "max_abs_offset_m": float,
+        "max_bow_peak_m": float, "max_turn_deg": float}``.
     """
-    zero = {"n_bows": 0, "max_abs_offset_m": 0.0, "max_turn_deg": 0.0}
+    zero = {
+        "n_bows": 0,
+        "max_abs_offset_m": 0.0,
+        "max_bow_peak_m": 0.0,
+        "max_turn_deg": 0.0,
+    }
+    z_sorted, signed, max_abs_offset_m = _signed_offset_profile(centerline)
+    if z_sorted.size < 3:
+        return zero
+
+    # Sort centerline by z for the 3D turn-angle computation (same order
+    # as the signed profile, so indices are aligned).
     cl = np.asarray(centerline, dtype=np.float64)
-    if cl.ndim != 2 or cl.shape[1] != 3 or cl.shape[0] < 3:
-        return zero
-
-    order = np.argsort(cl[:, 2])
-    cl = cl[order]
-
-    p0 = cl[0]
-    p1 = cl[-1]
-    axis = p1 - p0
-    axis_len_sq = float(np.dot(axis, axis))
-    if axis_len_sq < 1e-18:
-        return zero
-
-    rel = cl - p0
-    t = (rel @ axis) / axis_len_sq
-    closest = p0 + t[:, None] * axis
-    offsets = cl - closest  # (M, 3); each row ⊥ to axis
-
-    offset_norms = np.linalg.norm(offsets, axis=1)
-    max_abs_offset_m = float(offset_norms.max())
-
-    # Signed scalar via PCA dominant direction. For a near-straight
-    # polyline (all offsets ≈ 0) the SVD direction is meaningless but
-    # the projected values are tiny → swing counter returns 0.
-    if max_abs_offset_m < 1e-12:
-        signed = np.zeros(cl.shape[0])
-    else:
-        _, _, vt = np.linalg.svd(offsets, full_matrices=False)
-        u_dir = vt[0]
-        signed = offsets @ u_dir
+    cl = cl[np.argsort(cl[:, 2])]
 
     n_bows = _count_swings(signed, deadband_m)
+    bow_peaks = _extract_bow_peaks(signed, deadband_m)
+    max_bow_peak_m = float(max(bow_peaks)) if bow_peaks else 0.0
     max_turn_deg = _max_turn_angle_deg(cl)
 
     return {
         "n_bows": n_bows,
         "max_abs_offset_m": max_abs_offset_m,
+        "max_bow_peak_m": max_bow_peak_m,
         "max_turn_deg": max_turn_deg,
     }
 
@@ -462,6 +596,7 @@ def classify_sweep_zones(
     min_zone_length_by_code: Optional[dict] = None,
     direction_deadband_m: float = 0.01,
     w_amplitude_floor_m: float = 0.05,
+    w_max_length_m: float = 4.0,
     k_angle_threshold_deg: float = 15.0,
     k_zone_half_width_m: float = 0.25,
     k_stencil_m: float = 0.5,
@@ -607,15 +742,27 @@ def classify_sweep_zones(
         stencil. Consecutive over-threshold candidates within one
         stencil width are grouped via non-maximum suppression so each
         real kink fires exactly one ~ 0.5 m K zone.
+    w_max_length_m : float, default 4.0 (m)
+        **W length cap** (F1.5b.4) — a back-and-forth zone with peak
+        ≥ ``w_amplitude_floor_m`` is only labelled ``W`` if its length
+        is ≤ this cap. Beyond 4 m the pattern is treated as a sustained
+        characteristic of the log (``S`` for LS bin, ``3`` for moderate
+        bin) rather than a localised defect-flag. Justification: the
+        quickcard's W panel illustrates the defect over a 4 m vertical
+        extent; X (0.3-1 m) and K (~ 0.5 m) are also defect-flags with
+        intrinsic length bounds — W is the consistent treatment within
+        the "Generally Pulp Quality" row. See
+        ``external_references/interpine/sweep_classification_literature_review.md``
+        §7 F1.5b.4 for the full source rationale.
     min_zone_length_by_code : dict, optional
         Per-code operative minimum zone length (m) for the absorption
         pass. Defaults to ``{"8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0,
-        "W": 2.0, "K": 0.0, "1": 2.0}``. ``"X"`` is intentionally
+        "W": 0.5, "K": 0.0, "1": 2.0}``. ``"X"`` is intentionally
         absent (min 0). ``X`` and ``K`` are defect-flag codes and are
         always treated as stable (never absorbed for being short).
-        ``W`` carries a short defect-flag minimum (2 m, not the
-        quickcard's 4 m observational window) per the user-confirmed
-        treatment of W as a pulp-quality flag.
+        ``W`` is also a defect-flag (pulp quality) with a short min
+        (0.5 m, matching the K/X defect-flag scale) and a max cap of
+        ``w_max_length_m`` applied **before** the absorption pass.
 
     Returns
     -------
@@ -626,9 +773,11 @@ def classify_sweep_zones(
     if min_zone_length_by_code is None:
         min_zone_length_by_code = {
             "8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0,
-            # W is a defect flag (pulp quality); user spec — short min
-            # (2 m), not the 4 m observational window of the quickcard.
-            "W": 2.0,
+            # W is a defect flag (pulp quality). F1.5b.4 treatment:
+            # short min (0.5 m, matching K/X defect-flag scale) AND a
+            # max cap at w_max_length_m (4 m default) applied before
+            # absorption — see step 5 below.
+            "W": 0.5,
             # K is a point-defect flag (quickcard "Max 0.5 m"); exempt
             # from the length floor like X.
             "K": 0.0,
@@ -778,28 +927,140 @@ def classify_sweep_zones(
     # distinction. Length is no longer the L/S criterion (it was a
     # proxy in F1.2-F1.4); the F1.4 noise-floor min still applies in
     # step 6. S has no maximum length under the Interpine convention.
+    # F1.5b.4 (global n_bows gate + per-zone amp + W length cap):
+    #
+    # The Interpine Sw codes form a 2-axis grading: amplitude bin
+    # (8 / LS / 3 / 1 / X by SED fraction) × direction character
+    # (consistent vs back-and-forth + ≥ 5 cm absolute peak +
+    # ≤ 4 m extent). The full table:
+    #
+    #     global n_bows ≤ 1: LS → L; 3 → 3; others unchanged.
+    #     global n_bows ≥ 2:
+    #         LS + peak < 5 cm                       → S
+    #         LS + peak ≥ 5 cm + len ≤ 4 m           → W
+    #         LS + peak ≥ 5 cm + len > 4 m           → S (sustained)
+    #         3  + peak ≥ 5 cm + len ≤ 4 m           → W
+    #         3  + peak ≥ 5 cm + len > 4 m           → 3 (sustained)
+    #         3  + peak < 5 cm                       → 3 (edge)
+    #         1, 8, X                                → unchanged
+    #
+    # Design notes on the global vs per-zone n_bows choice:
+    #
+    # The back-and-forth gate is computed **once globally** over the
+    # whole centerline (n_bows ≥ 2 anywhere in the tree). An earlier
+    # attempt to localise it per-zone (F1.5b.3-pre-revision) failed
+    # because LS zones produced by step 1's amplitude classification
+    # are **plateau-shaped at the bow's amplitude bin**: each LS zone
+    # is a contiguous run of nodes whose perpendicular norm sits in
+    # the SED/8 < r ≤ SED/5 band, and the direction reversals of an
+    # S-curve happen at the chord crossings AT THE BOUNDARIES of the
+    # zone (where the polyline transitions through r ≤ SED/8 into the
+    # "8" bin), not inside it. Per-zone n_bows reads 0 on a plateau;
+    # only the global computation sees the boundary reversals.
+    #
+    # The W length cap (F1.5b.4 new feature) addresses Jorge's visual
+    # observation (2026-05-30) that long zones flagged W under the
+    # previous logic looked like single big bows, not wobble defects.
+    # Quickcard W is illustrated over a 4 m vertical extent; W is
+    # grouped with K (~ 0.5 m) and X (0.3-1 m) in the
+    # "Generally Pulp Quality" row — all three are **defect-flags
+    # with intrinsic length bounds**, distinct from sawmill codes
+    # (8 / L / S / 3) that extend to arbitrary log lengths. A
+    # back-and-forth pattern extending > 4 m is no longer a localised
+    # pulp defect but a sustained characteristic of the log →
+    # operationally it grades to its amplitude bin (S for LS,
+    # 3 for moderate). Full justification with sources (MPI grades,
+    # Interpine 2013, quickcard) in
+    # external_references/interpine/sweep_classification_literature_review.md
+    # §7 F1.5b.4.
+    #
+    # Known limitation (carried from F1.5a, not fixed by this
+    # revision): the global gate applies one direction verdict to all
+    # LS / 3 zones in the tree. A stem with a consistent lower-trunk
+    # lean AND an upper-trunk wobble gets back-and-forth applied
+    # everywhere; the lean zone is labelled S (or W if peak ≥ 5 cm
+    # and length ≤ 4 m) when it should be L. Per-zone localisation
+    # requires either reordering step 6 before step 5 (architectural
+    # change) or a region-merging primitive (F1.5c, future) that
+    # spans LS zones across short non-LS gaps for the n_bows
+    # computation.
     global_dir = _polyline_direction_metrics(
         cl, deadband_m=direction_deadband_m,
     )
     is_back_and_forth = global_dir["n_bows"] >= 2
-    is_high_amp = global_dir["max_abs_offset_m"] > w_amplitude_floor_m
-    # F1.5b: W upgrade. A back-and-forth pattern with absolute amplitude
-    # above 5 cm (default) is a Wobble (pulp quality), not gentle S.
-    # `W` is reported in the Sw column at the same level as 8/L/S/3/1/X
-    # per Jorge's quickcard mapping (severity placed between 3 and 1 —
-    # see step 6 severity dict). The amplitude threshold is **absolute
-    # centimetres**, distinct from the SED-fraction amplitudes used for
-    # 8/L/S/3/1/X.
-    if is_back_and_forth and is_high_amp:
-        ls_target = "W"
-    elif is_back_and_forth:
-        ls_target = "S"
-    else:
-        ls_target = "L"
-    zones = [
-        (s, e, ls_target if c == "LS" else c)
-        for (s, e, c) in zones
-    ]
+
+    z_sorted, signed_profile, _ = _signed_offset_profile(cl)
+    abs_signed = np.abs(signed_profile)
+
+    # F1.5b.4: build **logical wobble regions** by grouping adjacent
+    # LS / 3 zones together over short "8" gaps. The W length cap is
+    # applied to the **region**, not to each individual zone — a
+    # high-frequency wobble fragments into many short LS / 3 zones
+    # (each with one bow), but the defect's extent is the total span
+    # of the wobble pattern. If the region extends > 4 m, the wobble
+    # is too sustained to be a defect-flag and falls back to the
+    # amplitude-driven code (S for LS, 3 for moderate).
+    #
+    # The "short gap" threshold is the sub-operational gap length
+    # below which a non-LS-3 zone is considered a brief recovery
+    # between bows, not a region break. 1 m is the default — wide
+    # enough to bridge an axis-crossing "8" zone, narrow enough that
+    # a sustained "8" region (≥ 1 m of true gun-barrel-straight)
+    # splits the wobble regions.
+    LS_REGION_GAP_MAX_M = 1.0
+    regions: List[tuple] = []  # (z_start, z_end, [zone_idx])
+    current_indices: List[int] = []
+    current_gap = 0.0
+    for idx, (s, e, c) in enumerate(zones):
+        if c in ("LS", "3"):
+            if current_indices and current_gap > LS_REGION_GAP_MAX_M:
+                # Long gap closed the previous region.
+                r_s = zones[current_indices[0]][0]
+                r_e = zones[current_indices[-1]][1]
+                regions.append((r_s, r_e, current_indices))
+                current_indices = []
+            current_indices.append(idx)
+            current_gap = 0.0
+        else:
+            if current_indices:
+                current_gap += (e - s)
+    if current_indices:
+        r_s = zones[current_indices[0]][0]
+        r_e = zones[current_indices[-1]][1]
+        regions.append((r_s, r_e, current_indices))
+
+    # Map each LS / 3 zone idx to its region's (length, peak).
+    region_info_by_idx: dict = {}
+    for r_s, r_e, r_indices in regions:
+        region_length = r_e - r_s
+        in_region = (z_sorted >= r_s) & (z_sorted <= r_e)
+        region_peak = (
+            float(abs_signed[in_region].max()) if in_region.any() else 0.0
+        )
+        for idx in r_indices:
+            region_info_by_idx[idx] = (region_length, region_peak)
+
+    new_zones: List[tuple] = []
+    for idx, (s, e, c) in enumerate(zones):
+        if c not in ("LS", "3"):
+            # 8, 1, X unaffected by direction-based re-classification.
+            new_zones.append((s, e, c))
+            continue
+        region_length, region_peak = region_info_by_idx.get(idx, (0.0, 0.0))
+        is_w_eligible = (
+            is_back_and_forth
+            and region_peak >= w_amplitude_floor_m
+            and region_length <= w_max_length_m
+        )
+        if c == "LS":
+            if is_back_and_forth:
+                target = "W" if is_w_eligible else "S"
+            else:
+                target = "L"
+        else:  # c == "3"
+            target = "W" if is_w_eligible else "3"
+        new_zones.append((s, e, target))
+    zones = new_zones
 
     # 6. Minimum-zone-length enforcement (F1.4 cluster-aware noise floor)
     # Any non-X zone shorter than its code's minimum length is "short".
@@ -874,9 +1135,46 @@ def classify_sweep_zones(
         new_zones.append((run_start, run_end, target))
         k = j
 
-    # Final coalesce of adjacent same-code zones.
-    coalesced: List[tuple] = []
+    # First coalesce (post step 6) — adjacent same-code zones from
+    # absorption become a single zone so step 7 sees the true zone
+    # length (W zones may have been generated as multiple adjacent
+    # singletons in step 5; they need to be merged before the cap).
+    pre_capped: List[tuple] = []
     for (s, e, c) in new_zones:
+        if pre_capped and pre_capped[-1][2] == c:
+            s0, _, _ = pre_capped[-1]
+            pre_capped[-1] = (s0, e, c)
+        else:
+            pre_capped.append((s, e, c))
+
+    # 7. F1.5b.4 — post-absorption W length cap enforcement.
+    # Step 6's worst-neighbour-wins absorption may grow a W zone
+    # beyond its 4 m defect-flag cap when short "8" zones (sev 0)
+    # adjacent to W (sev 3) absorb into it, or when adjacent W zones
+    # generated in step 5 coalesce. The W length cap is a hard
+    # invariant — a W zone exceeding it is no longer a localised
+    # pulp defect-flag but a sustained back-and-forth pattern.
+    # Reclassify by max per-node amplitude in the zone:
+    # peak in moderate bin (> SED/5) → "3" (moderate sustained);
+    # peak in LS bin (≤ SED/5) → "S" (gentle sustained back-and-forth).
+    capped: List[tuple] = []
+    for (s, e, c) in pre_capped:
+        if c == "W" and (e - s) > w_max_length_m:
+            in_zone = (z >= s) & (z <= e)
+            if in_zone.any():
+                max_amp_in_zone = float(local_amp[in_zone].max())
+                target = "3" if (max_amp_in_zone * inv_sed) > (1.0 / 5.0) else "S"
+            else:
+                target = "S"
+            capped.append((s, e, target))
+        else:
+            capped.append((s, e, c))
+
+    # Final coalesce — post-cap reclassification may have created new
+    # adjacent same-code zones (e.g., a capped W → S now adjacent to
+    # a real S).
+    coalesced: List[tuple] = []
+    for (s, e, c) in capped:
         if coalesced and coalesced[-1][2] == c:
             s0, _, _ = coalesced[-1]
             coalesced[-1] = (s0, e, c)

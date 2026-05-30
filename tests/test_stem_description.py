@@ -18,6 +18,7 @@ from src.core.dendrometry import TreeMetrics
 from src.core.stem_description import (
     CoverageMetrics,
     _count_swings,
+    _extract_bow_peaks,
     _max_deviation_from_baseline,
     _max_turn_angle_deg,
     _polyline_direction_metrics,
@@ -362,6 +363,47 @@ class TestCountSwings:
         assert _count_swings(np.array([1.0, 2.0]), deadband=0.01) == 0
 
 
+class TestExtractBowPeaks:
+    """Per-bow peak extraction (F1.5b primitive for W detection)."""
+
+    def test_straight_profile_no_peaks(self):
+        # No direction determined → empty peaks list.
+        assert _extract_bow_peaks(np.zeros(20), deadband=0.01) == []
+
+    def test_single_bow_one_peak(self):
+        # 0 → 9 → 0 has 1 swing (peak at 9) and 1 final open peak (0).
+        # But the second monotonic segment (the descent to 0) ends at
+        # the start value, so its running extreme has |abs| ≤ |9|. Both
+        # peaks reported; max = 9.
+        s = np.array([0.0, 3.0, 6.0, 9.0, 6.0, 3.0, 0.0])
+        peaks = _extract_bow_peaks(s, deadband=0.01)
+        assert len(peaks) == 2  # n_bows=1 swing + 1 open final bow
+        assert max(peaks) == pytest.approx(9.0)
+
+    def test_s_curve_two_peaks(self):
+        # 0 → 5 → 0 → −5 → 0: two swings → 3 bow segments → 3 peaks.
+        # Peaks (absolute values): 5, 5, 0 (final descent back to 0
+        # has running extreme of 0 from the new low pivot).
+        s = np.array([0.0, 5.0, 0.0, -5.0, 0.0])
+        peaks = _extract_bow_peaks(s, deadband=0.01)
+        assert len(peaks) == 3
+        # Both reversal-confirmed bows had |peak| = 5.
+        assert max(peaks) == pytest.approx(5.0)
+
+    def test_deadband_filters_small_peaks(self):
+        # A tiny wobble below deadband doesn't create a bow.
+        s = np.array([0.0, 0.5, 0.0, 0.4, 0.0])  # all < deadband 1.0
+        peaks = _extract_bow_peaks(s, deadband=1.0)
+        assert peaks == []
+
+    def test_asymmetric_bows(self):
+        # 0 → 2 → 0 → 8 → 0: small bow then big bow. The peak of each
+        # bow is captured independently; max = 8.
+        s = np.array([0.0, 2.0, 0.0, 8.0, 0.0])
+        peaks = _extract_bow_peaks(s, deadband=0.01)
+        assert max(peaks) == pytest.approx(8.0)
+
+
 class TestPolylineDirectionMetrics:
 
     def test_straight_polyline_zero_metrics(self):
@@ -399,6 +441,32 @@ class TestPolylineDirectionMetrics:
         cl = np.array([[0.0, 0.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0, 1.0]])
         m = _polyline_direction_metrics(cl)
         assert m["n_bows"] == 0
+
+    def test_max_bow_peak_isolates_pca_axis_amplitude(self):
+        # F1.5b regression: ``max_abs_offset_m`` is the global max
+        # 3-D perpendicular norm — it includes off-axis components and
+        # so over-flags W on trees with gentle per-bow amplitude plus
+        # off-axis jitter. ``max_bow_peak_m`` is computed from the
+        # PCA-projected signed profile and so isolates the dominant
+        # sweep direction's per-bow amplitude.
+        # Build: ±3 cm bows in x (PCA dominant axis) plus one 5 cm
+        # outlier in y at a node between bows.
+        z = np.linspace(0.0, 12.0, 121)
+        x = np.zeros_like(z)
+        x[(z >= 1.0) & (z <= 4.0)] = 0.03      # +3 cm bow
+        x[(z >= 7.0) & (z <= 10.0)] = -0.03    # −3 cm bow
+        y = np.zeros_like(z)
+        # Off-axis perpendicular outlier at z = 6 (where x = 0).
+        idx_outlier = int(np.argmin(np.abs(z - 6.0)))
+        y[idx_outlier] = 0.05
+        cl = np.column_stack([x, y, z])
+        m = _polyline_direction_metrics(cl)
+        # Global norm at the outlier is 5 cm — triggers the old W rule.
+        assert m["max_abs_offset_m"] >= 0.045
+        # PCA-projected per-bow peak stays at ≈ 3 cm — gentle, not W.
+        assert m["max_bow_peak_m"] < 0.04
+        # Back-and-forth pattern still registers (2+ bows in x).
+        assert m["n_bows"] >= 2
 
 
 class TestMaxTurnAngleDeg:
@@ -541,19 +609,38 @@ class TestClassifySweepZones:
         assert "L" not in codes
 
     def test_back_and_forth_high_amplitude_is_W(self):
-        # F1.5b: back-and-forth + max amplitude > 5 cm absolute → W
-        # (pulp quality), not S. Uses SED=0.30 so that an absolute
-        # amplitude of 5.5 cm still falls in the SED/5 bin (ratio
-        # 0.183 < 1/5), letting the W upgrade fire on LS zones.
-        z = np.linspace(0.0, 12.0, 241)
-        x = np.zeros_like(z)
-        x[(z >= 1.0) & (z < 5.0)] = 0.055      # 5.5 cm +x bow
-        x[(z >= 6.0) & (z <= 11.0)] = -0.055   # 5.5 cm −x bow
+        # F1.5b.4: W requires back-and-forth + peak ≥ 5 cm absolute +
+        # **wobble region length ≤ 4 m**. The wobble region is the
+        # contiguous span of LS / 3 zones (bridging short "8" gaps).
+        # Use a 4 m sine polyline with multiple bows — fragments into
+        # short alternating LS / 8 zones but the wobble region spans
+        # ~ 4 m, eligible for W. SED=0.30 keeps peaks (5.5 cm) in LS
+        # bin (ratio 0.183 < 1/5).
+        z = np.linspace(0.0, 4.0, 81)
+        x = 0.055 * np.sin(2 * np.pi * z / 2.0)  # 2-period sine: 4 bows
         cl = np.column_stack([x, np.zeros_like(z), z])
         zones = classify_sweep_zones(cl, sed_obs_m=0.30)
         codes = [c for (_, _, c) in zones]
         assert "W" in codes
         assert "S" not in codes
+
+    def test_long_high_amplitude_back_and_forth_is_S_not_W(self):
+        # F1.5b.4 length cap: a back-and-forth pattern with peak ≥ 5 cm
+        # but **wobble region > 4 m** falls back to S (sustained
+        # extended pattern, not a localised defect-flag). Quickcard
+        # W is illustrated over 4 m extent; longer spans are sweepy
+        # stem characteristic, not pulp defect-puntual.
+        z = np.linspace(0.0, 12.0, 241)
+        x = np.zeros_like(z)
+        # Two 4 m bows separated by 1 m gap → wobble region ≈ 9 m > 4 m.
+        x[(z >= 1.0) & (z < 5.0)] = 0.055
+        x[(z >= 6.0) & (z < 10.0)] = -0.055
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.30)
+        codes = [c for (_, _, c) in zones]
+        # Wobble region too long to be W → falls back to S.
+        assert "W" not in codes
+        assert "S" in codes
 
     def test_back_and_forth_low_amplitude_stays_S(self):
         # F1.5b: back-and-forth but max amplitude ≤ 5 cm → S (not W).
@@ -710,10 +797,14 @@ class TestClassifySweepZones:
         # A short cluster between an "8" (left, stable) and a "1" (right,
         # stable) absorbs into the worse anchor "1". Endpoints return to
         # the axis (x=0) so the base-top chord stays vertical.
+        # Note: F1.5b.4 detects W on short back-and-forth clusters with
+        # peak ≥ 5 cm. To keep this test focused on the cluster-absorption
+        # logic (not W detection), the middle amplitude is set to 4.5 cm
+        # — still in the SED/3 ("3") bin but below the 5 cm W threshold.
         z = np.linspace(0.0, 20.0, 401)
         x = np.zeros_like(z)
-        # Short cluster z 8-10 (S/3 alternation).
-        for lo, hi, amp in [(8.0, 8.6, 0.035), (8.6, 9.2, 0.055),
+        # Short cluster z 8-10 (S/3 alternation, peak below W floor).
+        for lo, hi, amp in [(8.0, 8.6, 0.035), (8.6, 9.2, 0.045),
                             (9.2, 10.0, 0.035)]:
             x[(z >= lo) & (z < hi)] = amp
         # Stable "1" body z 10-16 (6 m ≥ 2 m min), back to axis by z=16.
@@ -726,6 +817,29 @@ class TestClassifySweepZones:
         # The cluster (8-10) absorbed into "1": the 1 zone starts at ~8, not 10
         assert zones[1][2] == "1"
         assert zones[1][0] == pytest.approx(8.0, abs=0.2)
+
+    def test_fragmented_short_W_captured(self):
+        # F1.5b.4: a short cluster with a moderate-amp middle (peak
+        # ≥ 5 cm) and back-and-forth global pattern produces a W zone
+        # in the middle (defect-flag) — fragmented sub-operational
+        # W detection that the previous F1.4 absorption would have
+        # folded into the surrounding "1" (textbook W case per
+        # literature review §7 known limitation, now captured).
+        z = np.linspace(0.0, 20.0, 401)
+        x = np.zeros_like(z)
+        # Cluster z 8-10: amp 5.5 cm → "3" bin, ≥ 5 cm peak.
+        for lo, hi, amp in [(8.0, 8.6, 0.035), (8.6, 9.2, 0.055),
+                            (9.2, 10.0, 0.035)]:
+            x[(z >= lo) & (z < hi)] = amp
+        # Stable "1" body z 10-16, back to axis by z=16.
+        x[(z >= 10.0) & (z < 16.0)] = 0.12
+        cl = np.column_stack([x, np.zeros_like(z), z])
+        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        codes = [c for (_, _, c) in zones]
+        # The middle "3" (0.6 m, peak 5.5 cm, global back-and-forth)
+        # upgrades to W; W is stable above its 0.5 m min, so the
+        # cluster splits around the W instead of fully absorbing.
+        assert "W" in codes
 
     def test_zones_cover_polyline_contiguously(self):
         cl = self._straight_polyline(z_top=15.0, n=76)
