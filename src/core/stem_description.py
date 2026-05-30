@@ -340,16 +340,23 @@ def _count_swings(s: np.ndarray, deadband: float) -> int:
 
 
 def _max_turn_angle_deg(centerline: np.ndarray) -> float:
-    """Largest turn angle (degrees) between consecutive XY-projected
-    polyline segments.
+    """Largest turn angle (degrees) between consecutive **3D** polyline
+    segments.
 
     Used by :func:`_polyline_direction_metrics` to expose ``max_turn_deg``
-    for future ``K`` (kink) detection in F1.5b.
+    for ``K`` (kink) detection in F1.5b.
+
+    The angle is computed in **3D**, not on the XY projection: for a
+    near-vertical stem with mm-scale XY jitter between sections, XY-only
+    angles between consecutive ~ 0.2 m segments are dominated by that
+    jitter (median angles in the tens of degrees on real data). The 3D
+    angle is naturally robust because the z component dominates each
+    segment direction; a true kink (e.g. a 30° tilt off vertical) still
+    registers ~30° in 3D, while mm-scale XY jitter produces ≪ 1° in 3D.
     """
     if centerline.ndim != 2 or centerline.shape[0] < 3:
         return 0.0
-    xy = centerline[:, :2]
-    segs = np.diff(xy, axis=0)
+    segs = np.diff(centerline, axis=0)  # 3D
     seg_len = np.linalg.norm(segs, axis=1)
     max_ang = 0.0
     for i in range(len(segs) - 1):
@@ -457,6 +464,7 @@ def classify_sweep_zones(
     w_amplitude_floor_m: float = 0.05,
     k_angle_threshold_deg: float = 15.0,
     k_zone_half_width_m: float = 0.25,
+    k_stencil_m: float = 0.5,
 ) -> List[tuple]:
     """Decompose a centerline polyline into Interpine sweep zones via a
     per-node global-chord amplitude classifier (F1.1) with per-code
@@ -587,6 +595,18 @@ def classify_sweep_zones(
         Half-width (m) of the K override window centred on a detected
         kink — resulting K zones are ~ 2 × this value (~ 0.5 m by
         default), matching the quickcard's "Max 0.5 m" reference.
+    k_stencil_m : float, default 0.5
+        Half-stencil distance (m) for K angle computation. At each
+        interior node ``i``, the K angle is measured between
+        ``cl[i] - cl[i-W]`` and ``cl[i+W] - cl[i]`` where ``W`` is
+        chosen so the stencil spans ~ ``k_stencil_m`` of stem on each
+        side. Wider than a single segment for noise robustness — a
+        real-data check on T460298B tree 0 measured per-segment XY
+        angles at a 26° median (dominated by mm-scale centroid
+        jitter) vs ~ 1° in 3D and even smaller with the 0.5 m
+        stencil. Consecutive over-threshold candidates within one
+        stencil width are grouped via non-maximum suppression so each
+        real kink fires exactly one ~ 0.5 m K zone.
     min_zone_length_by_code : dict, optional
         Per-code operative minimum zone length (m) for the absorption
         pass. Defaults to ``{"8": 4.0, "L": 4.0, "S": 4.0, "3": 3.0,
@@ -656,32 +676,75 @@ def classify_sweep_zones(
         else:
             codes_per_node.append("X")
 
-    # 3.5. K detection (F1.5b): per-segment XY turn-angle scan. For each
-    # interior node where the angle between the incoming and outgoing
-    # segments exceeds ``k_angle_threshold_deg``, override the codes of
-    # nodes within ±``k_zone_half_width_m`` of that z to ``"K"``. The
-    # subsequent coalesce will materialise these as ~0.5 m K zones.
+    # 3.5. K detection (F1.5b): **wider-stencil 3D** turn-angle scan
+    # with non-maximum suppression and X precedence.
+    #
+    # At each interior node i, compare the 3D direction ``cl[i] −
+    # cl[i−W]`` (incoming over ~ ``k_stencil_m`` of stem) against
+    # ``cl[i+W] − cl[i]`` (outgoing). The stencil is wider than a
+    # single segment for noise robustness: a real-data check on tree
+    # 0 of T460298B measured the per-segment XY angle at a 26° median
+    # vs 0.9° in 3D — the z component dominates near-vertical stems.
+    # A ~ 0.5 m stencil averages mm-scale per-section jitter while
+    # preserving sustained direction changes.
+    #
+    # All interior nodes whose angle exceeds ``k_angle_threshold_deg``
+    # are candidates. Consecutive candidates within one stencil width
+    # are grouped (a single sharp kink fires the angle test at all
+    # indices whose stencil straddles it); the **highest-angle index
+    # per group** is chosen as the kink centre. Only that index's
+    # neighbourhood (± ``k_zone_half_width_m``) is overridden to
+    # ``"K"`` — giving one ~ 0.5 m K zone per real kink, not one per
+    # node that detected it.
+    #
+    # **X precedence**: a node whose amplitude already classified it
+    # as ``"X"`` (severe sweep, severity 5) keeps that code. X is more
+    # severe than K and shouldn't be downgraded — a zigzag with
+    # > SED/1 amplitude is reported as X.
     if (
         k_angle_threshold_deg > 0.0
         and k_zone_half_width_m > 0.0
+        and k_stencil_m > 0.0
         and n >= 3
     ):
-        xy = cl[:, :2]
-        segs = np.diff(xy, axis=0)
-        seg_len = np.linalg.norm(segs, axis=1)
-        for i in range(1, n - 1):
-            la = float(seg_len[i - 1])
-            lb = float(seg_len[i])
+        z_diffs = np.diff(z)
+        z_spacing = float(np.median(z_diffs)) if z_diffs.size > 0 else 0.2
+        if z_spacing < 1e-9:
+            z_spacing = 0.2
+        W = max(1, int(round(k_stencil_m / z_spacing)))
+
+        k_angles = np.zeros(n, dtype=np.float64)
+        for i in range(W, n - W):
+            a = cl[i] - cl[i - W]
+            b = cl[i + W] - cl[i]
+            la = float(np.linalg.norm(a))
+            lb = float(np.linalg.norm(b))
             if la < 1e-9 or lb < 1e-9:
                 continue
-            cos_ang = float(np.clip(
-                np.dot(segs[i - 1], segs[i]) / (la * lb), -1.0, 1.0,
-            ))
-            ang_deg = float(np.degrees(np.arccos(cos_ang)))
-            if ang_deg > k_angle_threshold_deg:
-                z_kink = float(z[i])
-                for j in range(n):
-                    if abs(float(z[j]) - z_kink) <= k_zone_half_width_m:
+            cos_ang = float(np.clip(np.dot(a, b) / (la * lb), -1.0, 1.0))
+            k_angles[i] = float(np.degrees(np.arccos(cos_ang)))
+
+        # Non-maximum suppression: group consecutive over-threshold
+        # indices (within one stencil width) and pick the local max.
+        candidates = np.where(k_angles > k_angle_threshold_deg)[0]
+        groups: List[List[int]] = []
+        if candidates.size > 0:
+            cur_group = [int(candidates[0])]
+            for idx in candidates[1:]:
+                if int(idx) - cur_group[-1] <= W:
+                    cur_group.append(int(idx))
+                else:
+                    groups.append(cur_group)
+                    cur_group = [int(idx)]
+            groups.append(cur_group)
+
+        for group in groups:
+            best_i = max(group, key=lambda j: k_angles[j])
+            z_kink = float(z[best_i])
+            for j in range(n):
+                if abs(float(z[j]) - z_kink) <= k_zone_half_width_m:
+                    # X precedence: do not downgrade severe sweep.
+                    if codes_per_node[j] != "X":
                         codes_per_node[j] = "K"
 
     # 4. Coalesce consecutive same-code nodes into zones

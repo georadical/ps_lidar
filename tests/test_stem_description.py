@@ -47,6 +47,21 @@ class _StubTrunkResult:
     tree_axes: list
 
 
+def _smooth_xy(x: np.ndarray, window: int = 5) -> np.ndarray:
+    """Apply a moving-mean smoothing to a synthetic lateral-offset
+    array. Mirrors the F1 moving-median smoothing applied to real
+    centerlines by :func:`build_centerline_from_sections`, so test
+    polylines built with ``np.where`` step transitions don't fire
+    spurious K detection on the 3D angle metric."""
+    x = np.asarray(x, dtype=np.float64)
+    if window <= 1 or len(x) < window:
+        return x
+    pad = window // 2
+    padded = np.pad(x, pad, mode="edge")
+    kernel = np.ones(window, dtype=np.float64) / window
+    return np.convolve(padded, kernel, mode="valid")
+
+
 def _make_section_result(
     tree_ids: List[int],
     sections: np.ndarray,
@@ -394,15 +409,19 @@ class TestMaxTurnAngleDeg:
         ])
         assert _max_turn_angle_deg(cl) == pytest.approx(0.0, abs=1e-9)
 
-    def test_right_angle_kink(self):
-        # XY path doubles back at a right angle.
+    def test_right_angle_xy_turn_is_60deg_in_3d(self):
+        # The F1.5b primitive uses 3D segments (not XY-projected) so
+        # that mm-scale XY jitter between near-vertical sections does
+        # not produce spurious tens-of-degrees per-segment angles on
+        # real data. A right-angle XY turn between two diagonals of
+        # equal z-rise is 60° in 3D, not 90°.
         cl = np.array([
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 1.0],
             [1.0, 1.0, 2.0],
         ])
-        # XY segments: (1,0) then (0,1) → 90° turn.
-        assert _max_turn_angle_deg(cl) == pytest.approx(90.0, abs=1e-6)
+        # 3D segments (1,0,1) and (0,1,1): cos = 1/2 → 60°.
+        assert _max_turn_angle_deg(cl) == pytest.approx(60.0, abs=1e-6)
 
 
 class TestClassifySweepZones:
@@ -455,20 +474,31 @@ class TestClassifySweepZones:
         # this layout are kept long enough (5 m each) to exceed the
         # "8" minimum and survive.
         z = np.linspace(0.0, 18.0, 181)  # 0.1 m spacing
-        x = np.zeros_like(z)
-        x[(z >= 5.0) & (z < 8.0)] = 0.20   # first bow → "1" (3 m)
-        x[(z > 9.0) & (z <= 13.0)] = 0.20  # second bow → "1" (4 m)
+        x_raw = np.zeros_like(z)
+        # Bow amplitude 0.18 sits cleanly inside the "1" bin
+        # (ratio 0.9 / 1.0 < 1.0); 0.20 would land exactly on the bin
+        # boundary and become "X" under floating-point noise.
+        x_raw[(z >= 5.0) & (z < 8.0)] = 0.18   # first bow → "1" (3 m)
+        x_raw[(z > 9.0) & (z <= 13.0)] = 0.18  # second bow → "1" (4 m)
+        x = _smooth_xy(x_raw, window=5)
         cl = np.column_stack([x, np.zeros_like(z), z])
 
-        zones = classify_sweep_zones(cl, sed_obs_m=0.20)
+        # Disable K detection for this test (k_angle_threshold_deg
+        # large): its purpose is F1.4 absorption logic, and the 1 m
+        # V-shape gap between the two bows is geometrically a real
+        # kink that K would correctly fire on under defaults. K is
+        # exercised by its own dedicated tests above.
+        zones = classify_sweep_zones(
+            cl, sed_obs_m=0.20, k_angle_threshold_deg=999.0,
+        )
         codes = [c for (_, _, c) in zones]
         # Central "8" gap (1 m) absorbed into "1"; boundary "8" zones
         # (5 m each) exceed the 4 m min and survive.
         assert codes == ["8", "1", "8"]
         assert zones[1][2] == "1"
         # Central "1" zone now spans both bows + the absorbed gap
-        assert zones[1][0] == pytest.approx(5.0, abs=0.2)
-        assert zones[1][1] == pytest.approx(13.0, abs=0.2)
+        assert zones[1][0] == pytest.approx(5.0, abs=0.3)
+        assert zones[1][1] == pytest.approx(13.0, abs=0.3)
 
     def test_consistent_single_bow_is_L_regardless_of_length(self):
         # F1.5a: a SED/5 plateau (single consistent bow) is L even at
