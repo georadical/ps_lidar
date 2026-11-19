@@ -34,6 +34,10 @@ import numpy as np
 from src.core.trunk_extraction import TrunkExtractionResult
 from src.core.trunk_validation import SectionResult
 from src.core.dendrometry import TreeMetrics
+from src.core.sweep_windowed import WindowedSweepConfig, classify_sweep_zones_windowed
+
+#: Sweep classifiers selectable in :func:`build_stem_description_rows`.
+SWEEP_METHODS = ("global_chord", "windowed")
 
 
 # ===========================================================================
@@ -1268,12 +1272,27 @@ def classify_sweep(
 # Stem_Description sheet (Interpine PlotSafe CSV schema)
 # ===========================================================================
 
+def _tree_diameter_profile(section_result: SectionResult, i: int):
+    """``(z, d)`` of the valid sections of tree ``i`` (equivalent diameter, m)."""
+    r_row = np.asarray(section_result.R[i], dtype=np.float64)
+    valid = r_row > 0.0
+    z = np.asarray(section_result.sections, dtype=np.float64)[valid]
+    if section_result.a is not None and section_result.b is not None:
+        ab = np.asarray(section_result.a[i])[valid] * np.asarray(section_result.b[i])[valid]
+        d = 2.0 * np.sqrt(np.maximum(ab, 0.0))
+    else:
+        d = 2.0 * r_row[valid]
+    return z, d
+
+
 def build_stem_description_rows(
     plot_id: str,
     tree_metrics: Sequence[TreeMetrics],
     coverage_metrics: Sequence[CoverageMetrics],
     section_result: SectionResult,
     tree_centerlines: Sequence[Optional[np.ndarray]],
+    sweep_method: str = "global_chord",
+    windowed_config: Optional[WindowedSweepConfig] = None,
 ) -> List[dict]:
     """Build the rows that will land in the ``Stem_Description`` xlsx
     sheet, in the same order as Interpine's ``StemDescription.csv``.
@@ -1330,6 +1349,16 @@ def build_stem_description_rows(
         Per-tree polylines from
         :func:`src.core.trunk_validation.build_centerline_from_sections`,
         aligned 1:1 with ``tree_metrics``.
+    sweep_method : {"global_chord", "windowed"}, default "global_chord"
+        ``"global_chord"`` keeps :func:`classify_sweep_zones` (F1.x: one
+        base–top chord and the topmost-section SED for the whole stem).
+        ``"windowed"`` uses
+        :func:`src.core.sweep_windowed.classify_sweep_zones_windowed`
+        (F2: PlotSafe-manual window tests, each judged against the
+        diameter at its own top end taken from ``section_result``).
+    windowed_config : WindowedSweepConfig, optional
+        Parameters for the windowed method (dictionary preset, butt
+        exclusion, 150 mm top, bark, ...). Ignored for ``global_chord``.
 
     Returns
     -------
@@ -1346,6 +1375,10 @@ def build_stem_description_rows(
         raise ValueError(
             "tree_metrics and tree_centerlines must have the same length; "
             f"got {len(tree_metrics)} and {len(tree_centerlines)}"
+        )
+    if sweep_method not in SWEEP_METHODS:
+        raise ValueError(
+            f"sweep_method must be one of {SWEEP_METHODS}; got {sweep_method!r}"
         )
 
     rows: List[dict] = []
@@ -1378,14 +1411,20 @@ def build_stem_description_rows(
             dbh_row["Diameter"] = round(float(tm.dbh) * 1000.0, 1)
             rows.append(dbh_row)
 
-        # 3. Sweep zones via the sliding-window classifier (F1.1). Emits
-        # one row per detected zone, with Position at the zone's z_end.
-        # When the classifier returns a single zone covering the whole
-        # stem, this collapses to the previous single-row behaviour.
-        zones = classify_sweep_zones(
-            tree_centerlines[i],
-            sed_obs_m=(cov.sed_obs_cm / 100.0) if cov.valid_sed else 0.0,
-        )
+        # 3. Sweep zones: one row per zone, Position at the zone's top
+        # (z_end), as in PlotSafe. "global_chord" is the F1.x per-node
+        # amplitude against the base–top chord; "windowed" is the F2
+        # PlotSafe-manual window classifier.
+        sed_m = (cov.sed_obs_cm / 100.0) if cov.valid_sed else 0.0
+        if sweep_method == "windowed":
+            zones = classify_sweep_zones_windowed(
+                tree_centerlines[i],
+                diameter_profile=_tree_diameter_profile(section_result, i),
+                sed_m=sed_m if sed_m > 0.0 else None,
+                config=windowed_config,
+            )
+        else:
+            zones = classify_sweep_zones(tree_centerlines[i], sed_obs_m=sed_m)
         for (_z_start, z_end, code) in zones:
             sw_row = empty_row(tree_number)
             sw_row["Position"] = round(float(z_end), 3)
